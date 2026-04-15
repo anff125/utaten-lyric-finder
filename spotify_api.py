@@ -1,5 +1,6 @@
 import os
 import time
+from typing import Any
 
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
@@ -55,12 +56,15 @@ def get_spotify_authorize_url():
     return oauth.get_authorize_url()
 
 
-def exchange_callback_url_for_token(callback_url: str):
+def exchange_callback_url_for_token(callback_url: str) -> dict[str, Any]:
     oauth = _build_oauth_manager()
     code = oauth.parse_response_code(callback_url)
     if not code:
         raise ValueError("無法從 callback URL 取得授權 code")
-    return oauth.get_access_token(code, as_dict=True)
+    token_info = oauth.get_access_token(code, as_dict=True)
+    if not isinstance(token_info, dict):
+        raise RuntimeError("Spotify token 回傳格式異常")
+    return token_info
 
 
 def save_last_callback_url(callback_url: str):

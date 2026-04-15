@@ -1,6 +1,7 @@
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import cast
 from urllib.parse import urlparse
 import customtkinter as ctk
 
@@ -18,7 +19,7 @@ from spotify_api import (
 
 class _CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        server = self.server
+        server = cast("_SpotifyCallbackServer", self.server)
         if self.path.startswith(server.callback_path):
             full_url = f"http://{server.callback_host}:{server.server_port}{self.path}"
             server.callback_url = full_url
@@ -38,14 +39,29 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         return
 
 
+class _SpotifyCallbackServer(HTTPServer):
+    callback_path: str
+    callback_host: str
+    callback_url: str | None
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Utaten with Spotify Tool")
-        self.geometry("720x680")
+        self.geometry("860x780")
 
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("green")
+
+        try:
+            config.set_ui_scale(config.load_ui_scale(config.UI_SCALE))
+        except Exception:
+            config.set_ui_scale(1.2)
+
+        self.scale_options = ["90%", "100%", "110%", "120%", "130%", "140%", "150%"]
+        self.ui_scale_var = ctk.StringVar(value=self._scale_to_label(config.UI_SCALE))
+        self._apply_ui_scale(config.UI_SCALE)
 
         self.worker_thread = None
         self.stop_event = threading.Event()
@@ -123,7 +139,7 @@ class App(ctk.CTk):
         ).pack(side="left", padx=6)
         ctk.CTkRadioButton(
             source_frame,
-            text="System Media",
+            text="System Media (SMTC/MPRIS)",
             variable=self.source_var,
             value="system_media",
             command=self.on_source_changed,
@@ -147,6 +163,19 @@ class App(ctk.CTk):
             command=self.on_asr_changed,
         )
         asr_checkbox.grid(row=row, column=1, padx=8, pady=6, sticky="w")
+
+        row += 1
+        ctk.CTkLabel(container, text="UI Scale").grid(
+            row=row, column=0, padx=8, pady=6, sticky="w"
+        )
+        self.scale_menu = ctk.CTkOptionMenu(
+            container,
+            values=self.scale_options,
+            variable=self.ui_scale_var,
+            command=self.on_ui_scale_changed,
+            width=140,
+        )
+        self.scale_menu.grid(row=row, column=1, padx=8, pady=6, sticky="w")
 
         row += 1
         run_frame = ctk.CTkFrame(container)
@@ -211,6 +240,28 @@ class App(ctk.CTk):
             row=row, column=0, columnspan=2, padx=8, pady=6, sticky="w"
         )
 
+        row += 1
+        self.asr_progress_label = ctk.CTkLabel(
+            container,
+            text="",
+            anchor="w",
+        )
+        self.asr_progress_label.grid(
+            row=row, column=0, columnspan=2, padx=8, pady=(2, 2), sticky="ew"
+        )
+
+        row += 1
+        self.asr_progress_bar = ctk.CTkProgressBar(
+            container,
+            mode="determinate",
+        )
+        self.asr_progress_bar.grid(
+            row=row, column=0, columnspan=2, padx=8, pady=(0, 6), sticky="ew"
+        )
+        self.asr_progress_bar.set(0)
+        self.asr_progress_label.grid_remove()
+        self.asr_progress_bar.grid_remove()
+
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _load_defaults(self):
@@ -223,6 +274,7 @@ class App(ctk.CTk):
         self.source_var.set(config.AUDIO_SOURCE_MODE)
         self.debug_var.set(config.DEBUG)
         self.asr_var.set(config.ASR_ENABLED)
+        self.ui_scale_var.set(self._scale_to_label(config.UI_SCALE))
 
     def _sync_config_from_ui(self):
         config.set_spotify_credentials(
@@ -233,9 +285,74 @@ class App(ctk.CTk):
         config.set_audio_source_mode(self.source_var.get())
         config.set_debug(self.debug_var.get())
         config.set_asr_enabled(self.asr_var.get())
+        config.set_ui_scale(self._label_to_scale(self.ui_scale_var.get()))
+
+    def _scale_to_label(self, scale):
+        percent = int(round(float(scale) * 100))
+        return f"{percent}%"
+
+    def _label_to_scale(self, label):
+        text = (label or "").strip().replace("%", "")
+        return float(text) / 100.0
+
+    def _apply_ui_scale(self, scale):
+        ctk.set_widget_scaling(scale)
+        # Keep window scaling at 1.0 to avoid blurred/jagged rendering on some Linux setups.
+        ctk.set_window_scaling(1.0)
 
     def set_status(self, text):
         self.status_label.configure(text=text)
+
+    def _set_asr_progress_visible(self, visible):
+        if visible:
+            self.asr_progress_label.grid()
+            self.asr_progress_bar.grid()
+            return
+        self.asr_progress_bar.stop()
+        self.asr_progress_label.grid_remove()
+        self.asr_progress_bar.grid_remove()
+
+    def _on_asr_status_from_worker(self, payload):
+        self.after(0, lambda p=payload: self._render_asr_status(p))
+
+    def _render_asr_status(self, payload):
+        if not isinstance(payload, dict):
+            return
+
+        stage = payload.get("stage", "")
+        text = payload.get("text", "")
+        progress = payload.get("progress")
+        indeterminate = bool(payload.get("indeterminate", False))
+
+        if stage in {"downloading", "loading"}:
+            self._set_asr_progress_visible(True)
+            if text:
+                self.asr_progress_label.configure(text=text)
+
+            if indeterminate or progress is None:
+                self.asr_progress_bar.configure(mode="indeterminate")
+                self.asr_progress_bar.start()
+            else:
+                self.asr_progress_bar.stop()
+                self.asr_progress_bar.configure(mode="determinate")
+                self.asr_progress_bar.set(max(0.0, min(1.0, float(progress))))
+            return
+
+        if stage == "error":
+            self._set_asr_progress_visible(False)
+            if text:
+                self.set_status(text)
+            return
+
+        if stage == "ready":
+            self._set_asr_progress_visible(False)
+            if text:
+                self.set_status(text)
+            return
+
+        if stage == "cached":
+            self._set_asr_progress_visible(False)
+            return
 
     def _on_track_update_from_worker(self, payload):
         self.after(0, lambda p=payload: self._render_track_update(p))
@@ -329,6 +446,16 @@ class App(ctk.CTk):
         else:
             self.set_status("Auto-scroll ASR: OFF (GPU load reduced)")
 
+    def on_ui_scale_changed(self, value):
+        try:
+            scale = self._label_to_scale(value)
+            config.set_ui_scale(scale)
+            config.save_ui_scale(config.UI_SCALE)
+            self._apply_ui_scale(config.UI_SCALE)
+            self.set_status(f"UI scale: {value}")
+        except Exception as e:
+            self.set_status(f"UI scale change failed: {e}")
+
     def start_spotify_auth(self):
         try:
             self._sync_config_from_ui()
@@ -337,10 +464,13 @@ class App(ctk.CTk):
                 return
 
             parsed = urlparse(config.REDIRECT_URI)
+            host = parsed.hostname
+            port = parsed.port
+            callback_path = parsed.path or "/"
             if (
                 not parsed.scheme.startswith("http")
-                or not parsed.hostname
-                or not parsed.port
+                or host is None
+                or port is None
             ):
                 raise ValueError("Redirect URI 必須是 http(s)://host:port/path")
 
@@ -350,11 +480,9 @@ class App(ctk.CTk):
 
             def listen_callback():
                 try:
-                    server = HTTPServer(
-                        (parsed.hostname, parsed.port), _CallbackHandler
-                    )
-                    server.callback_path = parsed.path or "/"
-                    server.callback_host = parsed.hostname
+                    server = _SpotifyCallbackServer((host, port), _CallbackHandler)
+                    server.callback_path = callback_path
+                    server.callback_host = host
                     server.callback_url = None
                     server.timeout = 180
                     server.handle_request()
@@ -418,6 +546,7 @@ class App(ctk.CTk):
                 run_auto_lyrics(
                     stop_event=self.stop_event,
                     on_track_update=self._on_track_update_from_worker,
+                    on_asr_status=self._on_asr_status_from_worker,
                 )
 
             self.worker_thread = threading.Thread(target=_run, daemon=True)

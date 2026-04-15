@@ -14,3 +14,4 @@ lyrics_browser_profile/
 *test*
 debug_audio_chunks/
 song_cache.json
+.cache/

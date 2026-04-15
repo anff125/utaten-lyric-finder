@@ -6,7 +6,7 @@ UtaTen Lyric Finder 是一個自動化的歌詞獲取與同步工具。它能夠
 
 ## **✨ 核心功能 (Features)**
 
-- **自動偵測當前歌曲**：支援透過 Windows 系統媒體控制 (SMTC) (system_media.py) 或 Spotify API (spotify_api.py) 獲取正在播放的曲目資訊。
+- **自動偵測當前歌曲**：支援 Spotify API，或系統媒體來源：Windows 使用 SMTC、Linux (Ubuntu) 使用 MPRIS/playerctl (system_media.py)。
 - **UtaTen 歌詞爬蟲**：自動搜尋並解析 UtaTen 網站的歌詞 (web_scraper.py)，特別適合獲取日文流行音樂 (J-Pop) 歌詞。
 - **AI 語音辨識與對齊**：內建 Whisper 模型 (asr.py) 分析音檔，並透過文字匹配演算法 (matching.py) 自動校準時間軸，生成精準的 .lrc 動態歌詞。
 - **圖形化介面 (GUI)**：提供友善的使用者介面 (gui_app.py & lyrics_browser.py)，方便瀏覽歌詞與操作設定。
@@ -46,8 +46,21 @@ UtaTen Lyric Finder 是一個自動化的歌詞獲取與同步工具。它能夠
      ```powershell
      winget install ffmpeg
      ```
+   - **Ubuntu**:
+     ```bash
+     sudo apt update
+     sudo apt install -y ffmpeg playerctl
+     ```
 
-4. **環境變數與設定 (Configuration)**  
+4. **Linux 系統媒體來源說明 (Ubuntu)**
+   - 若在 GUI 選擇 `System Media`，Ubuntu 會透過 MPRIS (`playerctl`) 讀取目前播放曲目。
+   - 建議播放器需支援 MPRIS (例如 Spotify、Chrome/Chromium/Firefox 網頁播放器、VLC 等)。
+   - 可用以下指令先確認系統是否有可讀取的媒體資訊：
+     ```bash
+     playerctl --all-players metadata --format "{{playerName}} | {{status}} | {{artist}} - {{title}}"
+     ```
+
+5. **環境變數與設定 (Configuration)**  
    若需要使用 Spotify API，請在 config.py 或 .env 檔案中填寫您的 SPOTIPY_CLIENT_ID 與 SPOTIPY_CLIENT_SECRET。
 
 ## **🚀 使用說明 (Usage)**

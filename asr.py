@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+import time
 import math  # 新增
 import scipy.io.wavfile as wavfile
 from scipy.signal import resample_poly  # 新增
@@ -18,6 +19,13 @@ from config import (
 try:
     import numpy as np
     from faster_whisper import WhisperModel
+    import huggingface_hub
+    from tqdm.auto import tqdm
+
+    try:
+        from faster_whisper.utils import _MODELS as _FASTER_WHISPER_MODELS
+    except Exception:
+        _FASTER_WHISPER_MODELS = {}
 
     ASR_CORE_DEPS_AVAILABLE = True
     ASR_DEPS_ERROR = ""
@@ -44,6 +52,121 @@ except Exception:
 _asr_thread = None
 _asr_started = False
 _asr_disabled_logged = False
+
+_MODEL_ALLOW_PATTERNS = [
+    "config.json",
+    "preprocessor_config.json",
+    "model.bin",
+    "tokenizer.json",
+    "vocabulary.*",
+]
+
+
+def _notify_status(on_asr_status, payload):
+    if not on_asr_status:
+        return
+    try:
+        on_asr_status(payload)
+    except Exception:
+        # UI callback 失敗不應中斷 ASR worker
+        pass
+
+
+def _resolve_model_repo_id(size_or_id):
+    if "/" in size_or_id:
+        return size_or_id
+    return _FASTER_WHISPER_MODELS.get(size_or_id)
+
+
+def _ensure_model_downloaded(model_size, on_asr_status=None):
+    """Ensure model files exist locally and report download progress when needed."""
+    repo_id = _resolve_model_repo_id(model_size)
+    if repo_id is None:
+        return model_size
+
+    try:
+        cached_path = huggingface_hub.snapshot_download(
+            repo_id,
+            local_files_only=True,
+            allow_patterns=_MODEL_ALLOW_PATTERNS,
+        )
+        _notify_status(
+            on_asr_status,
+            {
+                "stage": "cached",
+                "text": f"ASR 模型已存在本機快取 ({model_size})",
+            },
+        )
+        return cached_path
+    except Exception:
+        pass
+
+    _notify_status(
+        on_asr_status,
+        {
+            "stage": "downloading",
+            "text": f"正在下載 ASR 模型: {model_size}",
+            "progress": 0.0,
+            "indeterminate": True,
+        },
+    )
+
+    last_emit_at = 0.0
+
+    class _DownloadProgressTqdm(tqdm):
+        def update(self, n=1):
+            nonlocal last_emit_at
+            ret = super().update(n)
+            now = time.monotonic()
+            if now - last_emit_at < 0.1:
+                return ret
+            last_emit_at = now
+            total = getattr(self, "total", None)
+            current = getattr(self, "n", 0)
+            if total:
+                progress = max(0.0, min(1.0, float(current) / float(total)))
+                _notify_status(
+                    on_asr_status,
+                    {
+                        "stage": "downloading",
+                        "text": f"正在下載 ASR 模型: {model_size} ({int(progress * 100)}%)",
+                        "progress": progress,
+                        "indeterminate": False,
+                    },
+                )
+            else:
+                _notify_status(
+                    on_asr_status,
+                    {
+                        "stage": "downloading",
+                        "text": f"正在下載 ASR 模型: {model_size}",
+                        "progress": 0.0,
+                        "indeterminate": True,
+                    },
+                )
+            return ret
+
+        def close(self):
+            try:
+                total = getattr(self, "total", None)
+                if total:
+                    _notify_status(
+                        on_asr_status,
+                        {
+                            "stage": "downloading",
+                            "text": f"正在下載 ASR 模型: {model_size} (100%)",
+                            "progress": 1.0,
+                            "indeterminate": False,
+                        },
+                    )
+            finally:
+                super().close()
+
+    return huggingface_hub.snapshot_download(
+        repo_id,
+        allow_patterns=_MODEL_ALLOW_PATTERNS,
+        tqdm_class=_DownloadProgressTqdm,
+    )
 
 
 def _prepare_windows_cuda_dll_paths():
@@ -78,7 +201,7 @@ def _prepare_windows_cuda_dll_paths():
             print(f"⚠️ 無法加入 DLL 目錄 {dll_dir}: {e}")
 
 
-def _asr_worker_loop(on_recognized_text):
+def _asr_worker_loop(on_recognized_text, on_asr_status=None):
     global _asr_disabled_logged
 
     print("ℹ️  ASR worker 啟動中...")
@@ -94,13 +217,30 @@ def _asr_worker_loop(on_recognized_text):
         return
 
     print(f"🎧 正在加載 Whisper-{ASR_MODEL_SIZE} 模型...")
+    model_source = ASR_MODEL_SIZE
     try:
+        model_source = _ensure_model_downloaded(ASR_MODEL_SIZE, on_asr_status)
+        _notify_status(
+            on_asr_status,
+            {
+                "stage": "loading",
+                "text": f"正在載入 ASR 模型: {ASR_MODEL_SIZE}",
+                "indeterminate": True,
+            },
+        )
         model = WhisperModel(
-            model_size_or_path=ASR_MODEL_SIZE,
+            model_size_or_path=model_source,
             device=ASR_DEVICE,
             compute_type=ASR_COMPUTE_TYPE,
         )
         print(f"✅ Whisper-{ASR_MODEL_SIZE} 模型已加載")
+        _notify_status(
+            on_asr_status,
+            {
+                "stage": "ready",
+                "text": f"ASR 模型就緒: {ASR_MODEL_SIZE}",
+            },
+        )
     except Exception as e:
         error_text = str(e)
         # If CUDA runtime/DLL is not available, retry once on CPU to keep ASR usable.
@@ -113,16 +253,37 @@ def _asr_worker_loop(on_recognized_text):
             print(f"⚠️ GPU 載入失敗，改用 CPU 模式重試: {e}")
             try:
                 model = WhisperModel(
-                    model_size_or_path=ASR_MODEL_SIZE,
+                    model_size_or_path=model_source,
                     device="cpu",
                     compute_type="int8",
                 )
                 print(f"✅ Whisper-{ASR_MODEL_SIZE} 已以 CPU 模式加載")
+                _notify_status(
+                    on_asr_status,
+                    {
+                        "stage": "ready",
+                        "text": f"ASR 模型就緒 (CPU): {ASR_MODEL_SIZE}",
+                    },
+                )
             except Exception as cpu_e:
                 print(f"❌ CPU 模式也無法加載 Whisper 模型: {cpu_e}")
+                _notify_status(
+                    on_asr_status,
+                    {
+                        "stage": "error",
+                        "text": f"ASR 模型載入失敗: {cpu_e}",
+                    },
+                )
                 return
         else:
             print(f"❌ 無法加載 Whisper 模型: {e}")
+            _notify_status(
+                on_asr_status,
+                {
+                    "stage": "error",
+                    "text": f"ASR 模型載入失敗: {e}",
+                },
+            )
             return
 
     def _resample_if_needed(samples, in_rate, out_rate):
@@ -293,7 +454,7 @@ def _asr_worker_loop(on_recognized_text):
             _process_audio_chunk(data.astype(np.float32))
 
 
-def ensure_asr_worker_started(on_recognized_text):
+def ensure_asr_worker_started(on_recognized_text, on_asr_status=None):
     global _asr_thread, _asr_started
 
     if not config.ASR_ENABLED or _asr_started:
@@ -301,7 +462,7 @@ def ensure_asr_worker_started(on_recognized_text):
 
     _asr_thread = threading.Thread(
         target=_asr_worker_loop,
-        args=(on_recognized_text,),
+        args=(on_recognized_text, on_asr_status),
         daemon=True,
     )
     _asr_thread.start()

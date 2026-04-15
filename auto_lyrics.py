@@ -27,7 +27,7 @@ def debug_log(msg):
         print(f"[{now_time}] [DEBUG-Main] {msg}")
 
 
-def main(stop_event=None, on_track_update=None):
+def main(stop_event=None, on_track_update=None, on_asr_status=None):
     sp = None
     last_source_mode = None
     last_played_song_id = None
@@ -42,7 +42,10 @@ def main(stop_event=None, on_track_update=None):
             debug_log(f"track update callback 發生錯誤: {e}")
 
     try:
-        ensure_asr_worker_started(queue_scroll_when_next_line_matches)
+        ensure_asr_worker_started(
+            queue_scroll_when_next_line_matches,
+            on_asr_status=on_asr_status,
+        )
 
         print("🚀 開始監聽播放狀態... (按 Ctrl+C 停止)")
         if config.DEBUG:
@@ -114,7 +117,7 @@ def main(stop_event=None, on_track_update=None):
                                 "id": virtual_id,
                                 "song_name": sys_media["title"],
                                 "artist_name": sys_media["artist"],
-                                "source": "系統媒體 (YouTube)",
+                                "source": "系統媒體",
                             }
                             debug_log(
                                 f"-> 命中系統媒體: {current_track_info['song_name']}"

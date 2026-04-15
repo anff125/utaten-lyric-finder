@@ -1,7 +1,9 @@
 # system_media.py
 import asyncio
-import re
 import concurrent.futures
+import platform
+import re
+import subprocess
 
 # 👇 除錯模式開關
 DEBUG = False
@@ -20,7 +22,33 @@ try:
     WINRT_AVAILABLE = True
 except ImportError:
     WINRT_AVAILABLE = False
-    print("⚠️ 找不到 winrt 套件，無法讀取系統媒體 (YouTube) 資訊。")
+    if platform.system() == "Windows":
+        print("⚠️ 找不到 winrt 套件，無法讀取系統媒體 (SMTC) 資訊。")
+
+
+LINUX_PLAYERCTL_WARNING_SHOWN = False
+LINUX_PLAYERCTL_ACCESS_DENIED_WARNING_SHOWN = False
+
+
+def _is_access_denied_error(message):
+    text = (message or "").lower()
+    return (
+        "accessdenied" in text
+        or "access denied" in text
+        or "apparmor" in text
+        or "org.freedesktop.dbus.error.accessdenied" in text
+    )
+
+
+def _warn_linux_playerctl_access_denied_once():
+    global LINUX_PLAYERCTL_ACCESS_DENIED_WARNING_SHOWN
+    if LINUX_PLAYERCTL_ACCESS_DENIED_WARNING_SHOWN:
+        return
+
+    print("⚠️ 偵測到 Linux 媒體權限被拒絕 (AppArmor/snap)。")
+    print("   目前無法讀取 Firefox/Spotify 的 MPRIS 資訊。")
+    print("   建議改用非 snap 版本的播放器，或改用 Spotify API 模式。")
+    LINUX_PLAYERCTL_ACCESS_DENIED_WARNING_SHOWN = True
 
 
 def clean_youtube_title(title):
@@ -98,6 +126,131 @@ async def _get_media_info_async():
     return None
 
 
+def _get_linux_media_info():
+    """使用 playerctl 讀取 Linux (MPRIS) 正在播放的媒體資訊。"""
+    global LINUX_PLAYERCTL_WARNING_SHOWN
+
+    try:
+        players_result = subprocess.run(
+            ["playerctl", "--list-all"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        if not LINUX_PLAYERCTL_WARNING_SHOWN:
+            print(
+                "⚠️ 找不到 playerctl，Linux 系統媒體模式需要先安裝: sudo apt install playerctl"
+            )
+            LINUX_PLAYERCTL_WARNING_SHOWN = True
+        return None
+    except Exception as e:
+        debug_log(f"Linux playerctl 執行失敗: {e}")
+        return None
+
+    if players_result.returncode != 0:
+        stderr_msg = (players_result.stderr or "").strip()
+        if stderr_msg:
+            debug_log(f"playerctl --list-all 回傳非 0: {stderr_msg}")
+        return None
+
+    players = []
+    seen = set()
+    for line in (players_result.stdout or "").splitlines():
+        player = (line or "").strip()
+        if not player or player in seen:
+            continue
+        seen.add(player)
+        players.append(player)
+
+    if not players:
+        return None
+
+    # 優先挑選 Playing，找不到就回退第一筆可用資料。
+    chosen = None
+    fallback = None
+    access_denied_detected = False
+
+    for player_name in players:
+        status_result = subprocess.run(
+            ["playerctl", "-p", player_name, "status"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status_result.returncode != 0:
+            status_err = (status_result.stderr or "").strip()
+            if status_err:
+                debug_log(f"player '{player_name}' status 失敗: {status_err}")
+            if _is_access_denied_error(status_err):
+                access_denied_detected = True
+            continue
+
+        metadata_result = subprocess.run(
+            [
+                "playerctl",
+                "-p",
+                player_name,
+                "metadata",
+                "--format",
+                "{{artist}}|||{{title}}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if metadata_result.returncode != 0:
+            metadata_err = (metadata_result.stderr or "").strip()
+            if metadata_err:
+                debug_log(f"player '{player_name}' metadata 失敗: {metadata_err}")
+            if _is_access_denied_error(metadata_err):
+                access_denied_detected = True
+            continue
+
+        metadata_text = (metadata_result.stdout or "").strip()
+        parts = metadata_text.split("|||", 1)
+        if len(parts) < 2:
+            continue
+
+        artist, title = parts
+        title = clean_youtube_title(title)
+        artist = clean_artist_name(artist)
+        status = (status_result.stdout or "").strip()
+        status_norm = (status or "").strip().lower()
+
+        if not title:
+            continue
+
+        info = {
+            "player": (player_name or "").strip(),
+            "status": status_norm,
+            "artist": artist if artist else "Unknown",
+            "title": title,
+        }
+
+        if _looks_like_lyrics_page(info["title"], info["artist"]):
+            return {"ignored": True, "reason": "lyrics_page"}
+
+        if fallback is None:
+            fallback = info
+        if status_norm == "playing":
+            chosen = info
+            break
+
+    selected = chosen or fallback
+    if not selected:
+        if access_denied_detected:
+            _warn_linux_playerctl_access_denied_once()
+        return None
+
+    if chosen is None and selected.get("status") != "playing":
+        debug_log(
+            f"Linux 未找到 Playing 狀態，回退使用 {selected.get('player', 'unknown')} 的最後一筆媒體資訊。"
+        )
+
+    return {"title": selected["title"], "artist": selected["artist"]}
+
+
 def _sync_runner():
     """在獨立的執行緒中建立全新的 Event Loop，避免與 Playwright 衝突"""
     loop = asyncio.new_event_loop()
@@ -110,6 +263,14 @@ def _sync_runner():
 
 def get_system_media_info():
     """同步封裝，供主迴圈直接呼叫"""
+    current_os = platform.system()
+
+    if current_os == "Linux":
+        return _get_linux_media_info()
+
+    if current_os != "Windows":
+        return None
+
     try:
         # 使用 ThreadPoolExecutor 將非同步任務放到獨立執行緒執行
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
