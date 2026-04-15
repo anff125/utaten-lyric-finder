@@ -2,7 +2,6 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .build/
-*cache*
 build/
 dist/
 venv/
@@ -14,3 +13,4 @@ lyrics_browser_profile/
 .github/
 *test*
 debug_audio_chunks/
+song_cache.json
