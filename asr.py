@@ -6,15 +6,6 @@ import scipy.io.wavfile as wavfile
 from scipy.signal import resample_poly  # 新增
 import config
 
-from config import (
-    ASR_BLOCK_SECONDS,
-    ASR_COMPUTE_TYPE,
-    ASR_DEVICE,
-    ASR_LANGUAGE,
-    ASR_MODEL_SIZE,
-    ASR_SAMPLE_RATE,
-)
-
 try:
     import numpy as np
     from faster_whisper import WhisperModel
@@ -93,14 +84,20 @@ def _asr_worker_loop(on_recognized_text):
         print("ℹ️ 未啟用 ASR：需要 pyaudiowpatch 或 soundcard 其中之一")
         return
 
-    print(f"🎧 正在加載 Whisper-{ASR_MODEL_SIZE} 模型...")
+    print(f"🎧 正在加載 Whisper-{config.ASR_MODEL_SIZE} 模型...")
     try:
+        # 開啟 faster-whisper 的下載進度條
+        import faster_whisper.utils
+        from tqdm.auto import tqdm
+
+        faster_whisper.utils.disabled_tqdm = tqdm
+
         model = WhisperModel(
-            model_size_or_path=ASR_MODEL_SIZE,
-            device=ASR_DEVICE,
-            compute_type=ASR_COMPUTE_TYPE,
+            model_size_or_path=config.ASR_MODEL_SIZE,
+            device=config.ASR_DEVICE,
+            compute_type=config.ASR_COMPUTE_TYPE,
         )
-        print(f"✅ Whisper-{ASR_MODEL_SIZE} 模型已加載")
+        print(f"✅ Whisper-{config.ASR_MODEL_SIZE} 模型已加載")
     except Exception as e:
         error_text = str(e)
         # If CUDA runtime/DLL is not available, retry once on CPU to keep ASR usable.
@@ -113,11 +110,11 @@ def _asr_worker_loop(on_recognized_text):
             print(f"⚠️ GPU 載入失敗，改用 CPU 模式重試: {e}")
             try:
                 model = WhisperModel(
-                    model_size_or_path=ASR_MODEL_SIZE,
+                    model_size_or_path=config.ASR_MODEL_SIZE,
                     device="cpu",
                     compute_type="int8",
                 )
-                print(f"✅ Whisper-{ASR_MODEL_SIZE} 已以 CPU 模式加載")
+                print(f"✅ Whisper-{config.ASR_MODEL_SIZE} 已以 CPU 模式加載")
             except Exception as cpu_e:
                 print(f"❌ CPU 模式也無法加載 Whisper 模型: {cpu_e}")
                 return
@@ -143,7 +140,7 @@ def _asr_worker_loop(on_recognized_text):
         return resampled_audio.astype(np.float32)
 
     source_name = ""
-    blocksize = int(ASR_SAMPLE_RATE * ASR_BLOCK_SECONDS)
+    blocksize = int(config.ASR_SAMPLE_RATE * config.ASR_BLOCK_SECONDS)
     recognition_count = 0
     chunk_counter = 0  # 1. 新增：用來為音訊片段檔名標號的計數器
 
@@ -176,13 +173,13 @@ def _asr_worker_loop(on_recognized_text):
         # # 檔名格式例如：audio_chunk_0001.wav
         # file_path = os.path.join(debug_dir, f"audio_chunk_{chunk_counter:04d}.wav")
         # # 存檔 (audio_data 是 float32 格式，scipy wavfile 可以直接支援)
-        # wavfile.write(file_path, ASR_SAMPLE_RATE, audio_data)
+        # wavfile.write(file_path, config.ASR_SAMPLE_RATE, audio_data)
         # # ==============================================================
 
         try:
             segments, _ = model.transcribe(
                 audio_data,
-                language=ASR_LANGUAGE,
+                language=config.ASR_LANGUAGE,
                 vad_filter=False,
                 beam_size=10,  # 增加搜尋寬度
                 # initial_prompt="Lyrics, Songs, Japanese",  # 引導模型
@@ -228,7 +225,7 @@ def _asr_worker_loop(on_recognized_text):
 
             device_rate = int(device["defaultSampleRate"])
             device_channels = max(1, min(2, int(device.get("maxInputChannels", 1))))
-            frames_per_buffer = max(512, int(device_rate * ASR_BLOCK_SECONDS))
+            frames_per_buffer = max(512, int(device_rate * config.ASR_BLOCK_SECONDS))
             source_name = device["name"]
 
             stream = pa.open(
@@ -241,7 +238,7 @@ def _asr_worker_loop(on_recognized_text):
             )
 
             print(f"🎙️ ASR 已啟動，來源: {source_name}")
-            print(f"🔊 開始錄音，每 {ASR_BLOCK_SECONDS}s 處理一個區塊...")
+            print(f"🔊 開始錄音，每 {config.ASR_BLOCK_SECONDS}s 處理一個區塊...")
 
             while True:
                 raw = stream.read(frames_per_buffer, exception_on_overflow=False)
@@ -249,7 +246,7 @@ def _asr_worker_loop(on_recognized_text):
                 if device_channels > 1:
                     data = data.reshape(-1, device_channels)[:, 0]
 
-                mono = _resample_if_needed(data, device_rate, ASR_SAMPLE_RATE)
+                mono = _resample_if_needed(data, device_rate, config.ASR_SAMPLE_RATE)
                 _process_audio_chunk(mono)
         finally:
             if stream is not None:
@@ -281,11 +278,11 @@ def _asr_worker_loop(on_recognized_text):
 
     print(f"🎙️ ASR 已啟動，來源: {speaker.name}")
     with loopback_mic.recorder(
-        samplerate=ASR_SAMPLE_RATE,
+        samplerate=config.ASR_SAMPLE_RATE,
         channels=1,
         blocksize=blocksize,
     ) as recorder:
-        print(f"🔊 開始錄音，每 {ASR_BLOCK_SECONDS}s 處理一個區塊...")
+        print(f"🔊 開始錄音，每 {config.ASR_BLOCK_SECONDS}s 處理一個區塊...")
         while True:
             data = recorder.record(numframes=blocksize)
             if data.ndim > 1:

@@ -149,6 +149,32 @@ class App(ctk.CTk):
         asr_checkbox.grid(row=row, column=1, padx=8, pady=6, sticky="w")
 
         row += 1
+        ctk.CTkLabel(container, text="ASR Model").grid(
+            row=row, column=0, padx=8, pady=6, sticky="w"
+        )
+        self.asr_model_var = ctk.StringVar(value="large-v3")
+        self.asr_model_combo = ctk.CTkComboBox(
+            container,
+            variable=self.asr_model_var,
+            values=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+            command=self.on_asr_config_changed,
+        )
+        self.asr_model_combo.grid(row=row, column=1, padx=8, pady=6, sticky="ew")
+
+        row += 1
+        ctk.CTkLabel(container, text="ASR Device").grid(
+            row=row, column=0, padx=8, pady=6, sticky="w"
+        )
+        self.asr_device_var = ctk.StringVar(value="auto")
+        self.asr_device_combo = ctk.CTkComboBox(
+            container,
+            variable=self.asr_device_var,
+            values=["auto", "cuda", "cpu"],
+            command=self.on_asr_config_changed,
+        )
+        self.asr_device_combo.grid(row=row, column=1, padx=8, pady=6, sticky="ew")
+
+        row += 1
         run_frame = ctk.CTkFrame(container)
         run_frame.grid(row=row, column=0, columnspan=2, padx=8, pady=12, sticky="ew")
 
@@ -223,6 +249,8 @@ class App(ctk.CTk):
         self.source_var.set(config.AUDIO_SOURCE_MODE)
         self.debug_var.set(config.DEBUG)
         self.asr_var.set(config.ASR_ENABLED)
+        self.asr_model_var.set(config.ASR_MODEL_SIZE)
+        self.asr_device_var.set(config.ASR_DEVICE)
 
     def _sync_config_from_ui(self):
         config.set_spotify_credentials(
@@ -233,6 +261,8 @@ class App(ctk.CTk):
         config.set_audio_source_mode(self.source_var.get())
         config.set_debug(self.debug_var.get())
         config.set_asr_enabled(self.asr_var.get())
+        config.set_asr_model_size(self.asr_model_var.get())
+        config.set_asr_device(self.asr_device_var.get())
 
     def set_status(self, text):
         self.status_label.configure(text=text)
@@ -328,6 +358,13 @@ class App(ctk.CTk):
             self.set_status("Auto-scroll ASR: ON")
         else:
             self.set_status("Auto-scroll ASR: OFF (GPU load reduced)")
+
+    def on_asr_config_changed(self, _=None):
+        config.set_asr_model_size(self.asr_model_var.get())
+        config.set_asr_device(self.asr_device_var.get())
+        self.set_status(
+            f"ASR Config updated: Model={config.ASR_MODEL_SIZE}, Device={config.ASR_DEVICE} (Applies on next Start)"
+        )
 
     def start_spotify_auth(self):
         try:

@@ -3,6 +3,7 @@ import urllib.parse
 from urllib.parse import urlparse
 
 import requests
+import jaconv
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
@@ -79,9 +80,30 @@ def verify_utaten_page(url, target_artist, target_song):
             is_song_match = (target_song_lower in page_title_lower) or (
                 page_title_lower in target_song_lower
             )
+
+            # 若英/羅馬字拼音歌曲未完全吻合，嘗試轉換為片假名再度比對
+            if not is_song_match:
+                target_song_kana_lower = _normalize_compare_text(
+                    jaconv.alphabet2kata(target_song.lower())
+                )
+                if target_song_kana_lower:
+                    is_song_match = (target_song_kana_lower in page_title_lower) or (
+                        page_title_lower in target_song_kana_lower
+                    )
+
             is_artist_match = (target_artist_lower in page_artist_lower) or (
                 page_artist_lower in target_artist_lower
             )
+
+            # 若英/羅馬字拼音藝人未完全吻合，嘗試轉換為片假名再度比對 (如 YORUSHIKA -> ヨルシカ)
+            if not is_artist_match:
+                target_artist_kana_lower = _normalize_compare_text(
+                    jaconv.alphabet2kata(target_artist.lower())
+                )
+                if target_artist_kana_lower:
+                    is_artist_match = (
+                        target_artist_kana_lower in page_artist_lower
+                    ) or (page_artist_lower in target_artist_kana_lower)
 
             if is_song_match and is_artist_match:
                 return True, page_artist, page_title

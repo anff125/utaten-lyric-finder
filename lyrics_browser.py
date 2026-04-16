@@ -104,9 +104,9 @@ def _get_or_create_playwright_page():
 
     pages = _browser_context.pages
     _browser_page = pages[0] if pages else _browser_context.new_page()
-    print(
-        f"✅ 頁面已準備 (total_pages={len(_browser_context.pages)}, closed={_browser_page.is_closed()})"
-    )
+    # print(
+    #     f"✅ 頁面已準備 (total_pages={len(_browser_context.pages)}, closed={_browser_page.is_closed()})"
+    # )
     return _browser_page
 
 
@@ -224,7 +224,7 @@ def open_in_dedicated_window(url):
         url = normalize_utaten_url(url)
         page = _get_or_create_playwright_page()
 
-        print(f"📄 正在導航至: {url}")
+        # print(f"📄 正在導航至: {url}")
         try:
             page.goto(
                 url,
@@ -241,7 +241,7 @@ def open_in_dedicated_window(url):
                 wait_until="domcontentloaded",
                 timeout=PLAYWRIGHT_NAV_TIMEOUT_MS,
             )
-        print(f"✅ 頁面已加載，URL: {page.url}")
+        # print(f"✅ 頁面已加載，URL: {page.url}")
 
         if is_utaten_lyric_detail_url(url):
             try:
@@ -256,10 +256,10 @@ def open_in_dedicated_window(url):
                 _latest_lyrics = extract_lyrics_from_current_page(page)
                 _current_lyric_index = -1
                 _pending_scroll_targets = []
-            print(f"📝 已解析歌詞行數: {len(_latest_lyrics)}")
+            # print(f"📝 已解析歌詞行數: {len(_latest_lyrics)}")
             if _latest_lyrics:
                 preview = " | ".join(line["original"] for line in _latest_lyrics[:3])
-                print(f"📝 歌詞預覽(前三行): {preview}")
+                # print(f"📝 歌詞預覽(前三行): {preview}")
                 first_line_scrolled = scroll_to_lyric_locator(page, 0)
                 if first_line_scrolled:
                     print("🎯 已自動定位到第一句歌詞")

@@ -39,6 +39,16 @@ def set_asr_enabled(enabled: bool) -> None:
     ASR_ENABLED = bool(enabled)
 
 
+def set_asr_model_size(size: str) -> None:
+    global ASR_MODEL_SIZE
+    ASR_MODEL_SIZE = size.strip()
+
+
+def set_asr_device(device: str) -> None:
+    global ASR_DEVICE
+    ASR_DEVICE = device.strip()
+
+
 def set_audio_source_mode(mode: str) -> None:
     global AUDIO_SOURCE_MODE
     normalized = (mode or "").strip().lower()
