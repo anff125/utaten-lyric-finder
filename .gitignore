@@ -1,17 +1,32 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+
+# Build artifacts
 .build/
 build/
 dist/
+
+# Virtual environments
 venv/
 .venv/
+
+# Environment files
 .env
 .env.*
+
+# Editor / IDE
 .vscode/
+
+# Project-specific generated data
 lyrics_browser_profile/
-.github/
+.github/agents/
 *test*
-debug_audio_chunks/
-song_cache.json
-.cache/
+*cache*
+
+# Keep this source file tracked even with *cache* ignore rule
+!song_cache.py
+
+# PyInstaller spec
+auto_lyrics.spec

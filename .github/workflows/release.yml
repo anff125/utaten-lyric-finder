@@ -1,0 +1,45 @@
+name: Release Portable Package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-release-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-release-
+
+      - name: Cache Portable Python Environment
+        id: cache-env
+        uses: actions/cache@v4
+        with:
+          path: build/portable/utaten-lyric-finder/python_env
+          key: ${{ runner.os }}-portable-env-${{ hashFiles('**/requirements.txt', 'build_portable.ps1') }}
+
+      - name: Build portable package
+        shell: pwsh
+        run: |
+          # 判斷是否命中快取
+          $skip = if ('${{ steps.cache-env.outputs.cache-hit }}' -eq 'true') { $true } else { $false }
+          ./build_portable.ps1 -SkipEnvBuild $skip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/portable/utaten-lyric-finder.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

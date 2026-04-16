@@ -2,7 +2,7 @@ import os
 import sys
 import threading
 import math  # 新增
-import scipy.io.wavfile as wavfile
+from typing import Any, cast
 from scipy.signal import resample_poly  # 新增
 import config
 
@@ -45,7 +45,8 @@ def _prepare_windows_cuda_dll_paths():
     # 判斷是否為 PyInstaller 打包後的環境
     if getattr(sys, "frozen", False):
         # 執行檔模式：路徑為 PyInstaller 解壓縮的暫存目錄
-        base = os.path.join(sys._MEIPASS, "nvidia")
+        meipass = getattr(sys, "_MEIPASS", "")
+        base = os.path.join(meipass, "nvidia")
     else:
         # 開發模式：路徑為你的虛擬環境
         base = os.path.join(
@@ -211,10 +212,13 @@ def _asr_worker_loop(on_recognized_text):
             print(f"⚠️ Whisper 辨識發生內部錯誤: {e}")
 
     if PYAUDIO_LOOPBACK_AVAILABLE:
-        pa = pyaudio.PyAudio()
+        if pyaudio is None:
+            return
+        pyaudio_mod = cast(Any, pyaudio)
+        pa = pyaudio_mod.PyAudio()
         stream = None
         try:
-            wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+            wasapi_info = pa.get_host_api_info_by_type(pyaudio_mod.paWASAPI)
             device = pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
 
             if not device.get("isLoopbackDevice", False):
@@ -229,7 +233,7 @@ def _asr_worker_loop(on_recognized_text):
             source_name = device["name"]
 
             stream = pa.open(
-                format=pyaudio.paFloat32,
+                format=pyaudio_mod.paFloat32,
                 channels=device_channels,
                 rate=device_rate,
                 input=True,
@@ -253,6 +257,9 @@ def _asr_worker_loop(on_recognized_text):
                 stream.stop_stream()
                 stream.close()
             pa.terminate()
+        return
+
+    if sc is None:
         return
 
     speaker = sc.default_speaker()

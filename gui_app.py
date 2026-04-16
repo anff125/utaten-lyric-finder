@@ -1,6 +1,7 @@
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import cast
 from urllib.parse import urlparse
 import customtkinter as ctk
 
@@ -16,9 +17,15 @@ from spotify_api import (
 )
 
 
+class _CallbackHTTPServer(HTTPServer):
+    callback_path: str
+    callback_host: str
+    callback_url: str | None
+
+
 class _CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        server = self.server
+        server = cast(_CallbackHTTPServer, self.server)
         if self.path.startswith(server.callback_path):
             full_url = f"http://{server.callback_host}:{server.server_port}{self.path}"
             server.callback_url = full_url
@@ -381,17 +388,21 @@ class App(ctk.CTk):
             ):
                 raise ValueError("Redirect URI 必須是 http(s)://host:port/path")
 
+            callback_host = parsed.hostname
+            callback_port = parsed.port
+            callback_path = parsed.path or "/"
+
             authorize_url = get_spotify_authorize_url()
             self.set_status("Auth URL generated, opening browser...")
             webbrowser.open(authorize_url)
 
             def listen_callback():
                 try:
-                    server = HTTPServer(
-                        (parsed.hostname, parsed.port), _CallbackHandler
+                    server = _CallbackHTTPServer(
+                        (callback_host, callback_port), _CallbackHandler
                     )
-                    server.callback_path = parsed.path or "/"
-                    server.callback_host = parsed.hostname
+                    server.callback_path = callback_path
+                    server.callback_host = callback_host
                     server.callback_url = None
                     server.timeout = 180
                     server.handle_request()
@@ -405,7 +416,10 @@ class App(ctk.CTk):
                         )
                 except Exception as e:
                     self.after(
-                        0, lambda: self.set_status(f"Callback listener failed: {e}")
+                        0,
+                        lambda err=e: self.set_status(
+                            f"Callback listener failed: {err}"
+                        ),
                     )
 
             threading.Thread(target=listen_callback, daemon=True).start()
@@ -420,6 +434,8 @@ class App(ctk.CTk):
         try:
             self._sync_config_from_ui()
             token_info = exchange_callback_url_for_token(callback_url)
+            if not token_info:
+                raise ValueError("Token exchange returned empty result")
             expires_in = token_info.get("expires_in", "?")
             self.set_status(
                 f"Callback received and token saved. expires_in={expires_in}s"
@@ -437,6 +453,8 @@ class App(ctk.CTk):
             self._sync_config_from_ui()
             save_last_callback_url(callback_url)
             token_info = exchange_callback_url_for_token(callback_url)
+            if not token_info:
+                raise ValueError("Token exchange returned empty result")
             expires_in = token_info.get("expires_in", "?")
             self.set_status(f"Spotify token saved. expires_in={expires_in}s")
         except Exception as e:

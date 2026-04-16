@@ -258,7 +258,7 @@ def open_in_dedicated_window(url):
                 _pending_scroll_targets = []
             # print(f"📝 已解析歌詞行數: {len(_latest_lyrics)}")
             if _latest_lyrics:
-                preview = " | ".join(line["original"] for line in _latest_lyrics[:3])
+                # preview = " | ".join(line["original"] for line in _latest_lyrics[:3])
                 # print(f"📝 歌詞預覽(前三行): {preview}")
                 first_line_scrolled = scroll_to_lyric_locator(page, 0)
                 if first_line_scrolled:
