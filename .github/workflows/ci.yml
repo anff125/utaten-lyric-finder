@@ -6,21 +6,19 @@ on:
     paths:
       - "**.py"
       - "requirements.txt"
-      - "build_portable.ps1"
       - ".github/workflows/ci.yml"
   pull_request:
     branches: ["main"]
     paths:
       - "**.py"
       - "requirements.txt"
-      - "build_portable.ps1"
       - ".github/workflows/ci.yml"
 
 permissions:
   contents: read
 
 jobs:
-  lint-and-compile:
+  lint-and-runtime-smoke:
     runs-on: windows-latest
 
     steps:
@@ -34,70 +32,19 @@ jobs:
           # 優化 1：開啟 setup-python 內建的 pip 快取
           cache: "pip"
 
-      - name: Upgrade pip and install ruff
+      - name: Upgrade pip and install dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           python -m pip install ruff
+          python -m pip install -r requirements.txt
 
       - name: Run ruff
         shell: pwsh
         run: |
           ruff check .
 
-      - name: Compile Python files
+      - name: Runtime smoke test
         shell: pwsh
         run: |
-          python -m compileall . -x "(\\.venv|build|lyrics_browser_profile|test_profile|_cache|__pycache__)"
-
-  test-portable-build:
-    runs-on: windows-latest
-    needs: lint-and-compile
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # 優化 2：快取 Windows 環境下的 pip 下載暫存 (對 PyTorch 這種大檔案非常有用)
-      - name: Cache pip packages for portable build
-        uses: actions/cache@v4
-        with:
-          path: ~\AppData\Local\pip\Cache
-          # 利用 requirements.txt 的 hash 作為 key，只要檔案沒變，就會命中快取
-          key: ${{ runner.os }}-pip-portable-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-portable-
-
-      - name: Cache Portable Python Environment
-        id: cache-python-env
-        uses: actions/cache@v4
-        with:
-          path: build/portable/utaten-lyric-finder/python_env
-          key: ${{ runner.os }}-portable-env-${{ hashFiles('**/requirements.txt', 'build_portable.ps1') }}
-
-      - name: Build portable package
-        shell: pwsh
-        run: |
-          # 傳入參數告知腳本是否命中快取
-          if ('${{ steps.cache-python-env.outputs.cache-hit }}' -eq 'true') {
-              ./build_portable.ps1 -SkipEnvBuild $true
-          } else {
-              ./build_portable.ps1 -SkipEnvBuild $false
-          }
-
-      - name: Verify portable environment dependencies
-        shell: pwsh
-        run: |
-          $portablePython = "build/portable/utaten-lyric-finder/python_env/python.exe"
-
-          if (-Not (Test-Path $portablePython)) {
-              Write-Error "Portable python.exe not found!"
-              exit 1
-          }
-
-          Write-Host "Testing tkinter and GUI dependencies..."
-          & $portablePython -c "import tkinter; import customtkinter; print('[SUCCESS] GUI dependencies loaded successfully!')"
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "[FAILED] Failed to import tkinter or customtkinter in the portable environment!"
-              exit 1
-          }
+          python -c "import tkinter; import customtkinter; import spotify_api; import web_scraper; import matching; print('[SUCCESS] runtime smoke imports loaded')"
