@@ -37,6 +37,23 @@ jobs:
           $skip = if ('${{ steps.cache-env.outputs.cache-hit }}' -eq 'true') { $true } else { $false }
           ./build_portable.ps1 -SkipEnvBuild $skip
 
+      - name: Verify release package - CUDA DLL loading
+        shell: pwsh
+        run: |
+          $portablePython = "build/portable/utaten-lyric-finder/python_env/python.exe"
+
+          if (-Not (Test-Path $portablePython)) {
+              Write-Error "Portable python.exe not found!"
+              exit 1
+          }
+
+          Write-Host "Verifying CUDA DLL loading in release build..."
+          & $portablePython -c "import asr; from faster_whisper import WhisperModel; print('[SUCCESS] CUDA DLL paths registered and faster_whisper loaded in release build!')"
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "[FAILED] CUDA DLL loading failed in release package - aborting release!"
+              exit 1
+          }
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:

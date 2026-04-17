@@ -1,10 +1,43 @@
 import os
 import sys
 import threading
-import math  # 新增
+import math
 from typing import Any, cast
-from scipy.signal import resample_poly  # 新增
+from scipy.signal import resample_poly
 import config
+
+
+def _prepare_windows_cuda_dll_paths():
+    """Register pip-installed NVIDIA DLL folders so Windows loader can resolve them."""
+    if os.name != "nt":
+        return
+
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", "")
+        base = os.path.join(meipass, "nvidia")
+    else:
+        base = os.path.join(
+            os.path.dirname(__file__), ".venv", "Lib", "site-packages", "nvidia"
+        )
+
+    dll_dirs = [
+        os.path.join(base, "cublas", "bin"),
+        os.path.join(base, "cudnn", "bin"),
+        os.path.join(base, "cuda_runtime", "bin"),
+        os.path.join(base, "cufft", "bin"),
+        os.path.join(base, "curand", "bin"),
+    ]
+
+    for dll_dir in dll_dirs:
+        if not os.path.isdir(dll_dir):
+            continue
+        try:
+            os.add_dll_directory(dll_dir)
+        except Exception as e:
+            print(f"⚠️ 無法加入 DLL 目錄 {dll_dir}: {e}")
+
+
+_prepare_windows_cuda_dll_paths()
 
 try:
     import numpy as np
@@ -36,38 +69,39 @@ _asr_thread = None
 _asr_started = False
 _asr_disabled_logged = False
 
+_HALLUCINATION_PHRASES = (
+    "ご視聴ありがとうございました",
+    "視聴ありがとうございました",
+    "チャンネル登録",
+    "高評価",
+    "よろしくお願いします",
+)
 
-def _prepare_windows_cuda_dll_paths():
-    """Register pip-installed NVIDIA DLL folders so Windows loader can resolve them."""
-    if os.name != "nt":
-        return
+_CUDA_LOAD_ERROR_KEYWORDS = (
+    "cublas64_12.dll",
+    "cudnn",
+    "cannot be loaded",
+    "loadlibrary",
+)
 
-    # 判斷是否為 PyInstaller 打包後的環境
-    if getattr(sys, "frozen", False):
-        # 執行檔模式：路徑為 PyInstaller 解壓縮的暫存目錄
-        meipass = getattr(sys, "_MEIPASS", "")
-        base = os.path.join(meipass, "nvidia")
-    else:
-        # 開發模式：路徑為你的虛擬環境
-        base = os.path.join(
-            os.path.dirname(__file__), ".venv", "Lib", "site-packages", "nvidia"
-        )
 
-    dll_dirs = [
-        os.path.join(base, "cublas", "bin"),
-        os.path.join(base, "cudnn", "bin"),
-        os.path.join(base, "cuda_runtime", "bin"),
-        os.path.join(base, "cufft", "bin"),
-        os.path.join(base, "curand", "bin"),
-    ]
+def _is_cuda_load_error(error_text: str) -> bool:
+    error_lower = error_text.lower()
+    return any(keyword in error_lower for keyword in _CUDA_LOAD_ERROR_KEYWORDS)
 
-    for dll_dir in dll_dirs:
-        if not os.path.isdir(dll_dir):
-            continue
-        try:
-            os.add_dll_directory(dll_dir)
-        except Exception as e:
-            print(f"⚠️ 無法加入 DLL 目錄 {dll_dir}: {e}")
+
+def _resample_if_needed(samples, in_rate, out_rate):
+    if in_rate == out_rate:
+        return samples
+    if samples.size == 0:
+        return samples
+
+    gcd_val = math.gcd(in_rate, out_rate)
+    up = out_rate // gcd_val
+    down = in_rate // gcd_val
+
+    resampled_audio = resample_poly(samples, up, down)
+    return resampled_audio.astype(np.float32)
 
 
 def _asr_worker_loop(on_recognized_text):
@@ -87,7 +121,6 @@ def _asr_worker_loop(on_recognized_text):
 
     print(f"🎧 正在加載 Whisper-{config.ASR_MODEL_SIZE} 模型...")
     try:
-        # 開啟 faster-whisper 的下載進度條
         import faster_whisper.utils
         from tqdm.auto import tqdm
 
@@ -101,13 +134,7 @@ def _asr_worker_loop(on_recognized_text):
         print(f"✅ Whisper-{config.ASR_MODEL_SIZE} 模型已加載")
     except Exception as e:
         error_text = str(e)
-        # If CUDA runtime/DLL is not available, retry once on CPU to keep ASR usable.
-        if (
-            "cublas64_12.dll" in error_text
-            or "cudnn" in error_text.lower()
-            or "cannot be loaded" in error_text.lower()
-            or "loadlibrary" in error_text.lower()
-        ):
+        if _is_cuda_load_error(error_text):
             print(f"⚠️ GPU 載入失敗，改用 CPU 模式重試: {e}")
             try:
                 model = WhisperModel(
@@ -123,30 +150,11 @@ def _asr_worker_loop(on_recognized_text):
             print(f"❌ 無法加載 Whisper 模型: {e}")
             return
 
-    def _resample_if_needed(samples, in_rate, out_rate):
-        if in_rate == out_rate:
-            return samples
-        if samples.size == 0:
-            return samples
-
-        # 找出輸入與輸出頻率的最大公因數 (GCD)，用來化簡比例
-        # 例如 96000 轉 16000 -> up=1, down=6
-        gcd_val = math.gcd(in_rate, out_rate)
-        up = out_rate // gcd_val
-        down = in_rate // gcd_val
-
-        # 使用多相濾波重採樣 (Polyphase filtering)，音質遠勝線性插值
-        resampled_audio = resample_poly(samples, up, down)
-
-        return resampled_audio.astype(np.float32)
-
-    source_name = ""
     blocksize = int(config.ASR_SAMPLE_RATE * config.ASR_BLOCK_SECONDS)
     recognition_count = 0
-    chunk_counter = 0  # 1. 新增：用來為音訊片段檔名標號的計數器
 
     def _process_audio_chunk(mono_float32):
-        nonlocal recognition_count, chunk_counter
+        nonlocal recognition_count
         global _asr_disabled_logged
 
         if not config.ASR_ENABLED:
@@ -163,42 +171,18 @@ def _asr_worker_loop(on_recognized_text):
         if volume < 0.0001:
             print("🔇 [系統偵測] 收到的音訊完全沒聲音，可能抓到錯誤的音效裝置！")
 
-        # ==============================================================
-        # 3. 新增：將音訊儲存到 debug_audio_chunks 資料夾底下
-        # ==============================================================
-        # chunk_counter += 1
-        # debug_dir = "debug_audio_chunks"
-        # if not os.path.exists(debug_dir):
-        #     os.makedirs(debug_dir)
-
-        # # 檔名格式例如：audio_chunk_0001.wav
-        # file_path = os.path.join(debug_dir, f"audio_chunk_{chunk_counter:04d}.wav")
-        # # 存檔 (audio_data 是 float32 格式，scipy wavfile 可以直接支援)
-        # wavfile.write(file_path, config.ASR_SAMPLE_RATE, audio_data)
-        # # ==============================================================
-
         try:
             segments, _ = model.transcribe(
                 audio_data,
                 language=config.ASR_LANGUAGE,
                 vad_filter=False,
-                beam_size=10,  # 增加搜尋寬度
-                # initial_prompt="Lyrics, Songs, Japanese",  # 引導模型
-                # condition_on_previous_text=True,  # 利用上下文
-                best_of=5,  # 從多個候選中選最好的
+                beam_size=10,
+                best_of=5,
             )
 
             result_text = "".join(segment.text for segment in segments).strip()
 
-            # 新增：過濾常見的 Whisper 幻覺字眼
-            hallucinations = [
-                "ご視聴ありがとうございました",
-                "視聴ありがとうございました",
-                "チャンネル登録",
-                "高評価",
-                "よろしくお願いします",
-            ]
-            for h in hallucinations:
+            for h in _HALLUCINATION_PHRASES:
                 result_text = result_text.replace(h, "")
             result_text = result_text.strip()
 
@@ -230,7 +214,6 @@ def _asr_worker_loop(on_recognized_text):
             device_rate = int(device["defaultSampleRate"])
             device_channels = max(1, min(2, int(device.get("maxInputChannels", 1))))
             frames_per_buffer = max(512, int(device_rate * config.ASR_BLOCK_SECONDS))
-            source_name = device["name"]
 
             stream = pa.open(
                 format=pyaudio_mod.paFloat32,
@@ -241,7 +224,7 @@ def _asr_worker_loop(on_recognized_text):
                 input_device_index=int(device["index"]),
             )
 
-            print(f"🎙️ ASR 已啟動，來源: {source_name}")
+            print(f"🎙️ ASR 已啟動，來源: {device['name']}")
             print(f"🔊 開始錄音，每 {config.ASR_BLOCK_SECONDS}s 處理一個區塊...")
 
             while True:

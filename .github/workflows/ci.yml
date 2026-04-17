@@ -101,3 +101,10 @@ jobs:
               Write-Error "[FAILED] Failed to import tkinter or customtkinter in the portable environment!"
               exit 1
           }
+
+          Write-Host "Testing CUDA DLL loading and faster_whisper..."
+          & $portablePython -c "import asr; from faster_whisper import WhisperModel; print('[SUCCESS] CUDA DLL paths registered and faster_whisper loaded!')"
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "[FAILED] CUDA DLL loading or faster_whisper import failed in the portable environment!"
+              exit 1
+          }
