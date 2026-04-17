@@ -2,22 +2,22 @@
 
 # **UtaTen Lyric Finder 🎶**
 
-UtaTen Lyric Finder 是一個自動化的歌詞獲取與同步工具。它能夠自動偵測您系統或 Spotify 當前正在播放的歌曲，從 [UtaTen](https://utaten.com/) 網站精準抓取日文歌詞，並結合 Whisper 語音辨識 (ASR) 技術，自動將歌詞與音軌對齊，生成帶有時間軸的動態歌詞檔 (.lrc)。
+UtaTen Lyric Finder 是一個自動化的歌詞獲取工具。它能夠自動偵測您系統或 Spotify 當前正在播放的歌曲，從 [UtaTen](https://utaten.com/) 網站抓取日文歌詞，並結合 Whisper 語音辨識 (ASR) 與文字匹配流程，在 UtaTen 頁面自動捲動到對應歌詞位置。
 
 ## **✨ 核心功能 (Features)**
 
 - **自動偵測當前歌曲**：支援透過 Windows 系統媒體控制 (SMTC) (system_media.py) 或 Spotify API (spotify_api.py) 獲取正在播放的曲目資訊。
 - **UtaTen 歌詞爬蟲**：自動搜尋並解析 UtaTen 網站的歌詞 (web_scraper.py)，特別適合獲取日文流行音樂 (J-Pop) 歌詞。
-- **AI 語音辨識與對齊**：內建 Whisper 模型 (asr.py) 分析音檔，並透過文字匹配演算法 (matching.py) 自動校準時間軸，生成精準的 .lrc 動態歌詞。
+- **AI 語音辨識與自動捲動**：內建 Whisper 模型 (asr.py) 分析音檔，並搭配文字匹配演算法 (matching.py)，在 UtaTen 頁面自動捲動到目前對應的歌詞位置。
 - **圖形化介面 (GUI)**：提供友善的使用者介面 (gui_app.py & lyrics_browser.py)，方便瀏覽歌詞與操作設定。
-- **智慧快取機制**：內建快取系統 (song_cache.py)，已處理過的歌曲無須重複下載與辨識，大幅提升效率。
+- **智慧快取機制**：內建快取系統 (song_cache.py)，已處理過的歌曲無須重複下載與辨識，提升處理效率。
 
 ## **📁 專案架構 (Project Structure)**
 
 - gui_app.py：圖形化主程式進入點。
 - auto_lyrics.py：自動化歌詞處理的核心邏輯與工作流程。
 - asr.py：負責音訊處理與 Whisper 語音辨識。
-- matching.py：負責將爬取的文本歌詞與 ASR 識別出的時間軸進行對齊與匹配。
+- matching.py：負責文本歌詞與辨識結果的匹配處理。
 - web_scraper.py：UtaTen 網站歌詞爬蟲模組。
 - spotify_api.py / system_media.py：獲取當前播放媒體資訊的介面。
 - lyrics_browser.py：用於在 GUI 中顯示與瀏覽歌詞的元件。
@@ -62,7 +62,7 @@ python gui_app.py
 
 ### **啟動核心命令列腳本 (CLI 模式)**
 
-若您想直接測試自動抓取與對齊流程，可以執行：
+若您想直接測試自動抓取流程，可以執行：
 
 ```bash
 python auto_lyrics.py

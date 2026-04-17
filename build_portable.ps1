@@ -125,7 +125,8 @@ _add_dll_directories()
         "-r",
         (Join-Path $repoRoot "requirements.txt")
     )
-} else {
+}
+else {
     Write-Section "Using cached python_env, skipping environment build"
     # 確保舊的壓縮檔被刪除，以免發生衝突
     if (Test-Path $zipPath) {
@@ -170,6 +171,9 @@ $startBatContent = @'
 @echo off
 setlocal
 cd /d "%~dp0"
+:: 設定 CUDA DLL 路徑
+set "PYTHON_ENV_SITE=%~dp0python_env\Lib\site-packages"
+set "PATH=%PYTHON_ENV_SITE%\nvidia\cublas\bin;%PYTHON_ENV_SITE%\nvidia\cudnn\bin;%PATH%"
 set "PYTHONUTF8=1"
 set "PYTHONNOUSERSITE=1"
 "%~dp0python_env\python.exe" "%~dp0gui_app.py"
