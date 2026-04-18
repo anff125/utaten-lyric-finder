@@ -21,7 +21,8 @@ venv/
 
 # Project-specific generated data
 lyrics_browser_profile/
-.github/agents/
+.github/*
+!.github/workflows/
 *test*
 *cache*
 

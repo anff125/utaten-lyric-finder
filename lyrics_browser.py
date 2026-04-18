@@ -24,9 +24,238 @@ _browser_page = None
 _latest_lyrics: List[Dict[str, Any]] = []
 _current_lyric_index = -1
 _pending_scroll_targets: List[int] = []
+_pending_highlight_index = -1
 _state_lock = threading.Lock()
 
 LYRIC_ROOT_SELECTOR = ".lyricBody .hiragana, .lyricBody"
+LYRIC_LINE_SELECTOR = ".lyricBody .hiragana > p, .lyricBody > p, .lyricBody .hiragana span.lyric-line, .lyricBody span.lyric-line"
+LYRIC_STYLE_ELEMENT_ID = "utaten-lyric-sync-style"
+
+
+def _inject_lyrics_ui(page, lyrics_lines):
+    lyric_locator_indices = [line["locator_index"] for line in lyrics_lines]
+    try:
+        page.evaluate(
+            """(payload) => {
+            const lineSelector = payload.lineSelector;
+            const styleId = payload.styleId;
+            const lyricLocatorIndices = payload.locatorIndices || [];
+            const lineNodes = Array.from(document.querySelectorAll(lineSelector));
+            window.__pendingManualLyricJump = null;
+
+            if (!document.getElementById(styleId)) {
+                const style = document.createElement('style');
+                style.id = styleId;
+                style.textContent = `
+${lineSelector} {
+  position: relative;
+  padding-left: 1.6em;
+  transition: color 120ms ease, text-shadow 120ms ease;
+}
+.manual-lyric-jump {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1.2em;
+  height: 1.2em;
+  border-radius: 999px;
+  border: 1px solid #7ca5ff;
+  background: #ffffff;
+  color: #1d5fff;
+  font-size: 0.68em;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.9;
+  padding: 0;
+}
+.manual-lyric-jump:hover {
+  opacity: 1;
+  transform: translateY(-50%) scale(1.08);
+}
+.active-lyric {
+  color: #1f63ff !important;
+  font-weight: 700 !important;
+  text-shadow: 0 0 0.45em rgba(31, 99, 255, 0.36);
+}
+`;
+                document.head.appendChild(style);
+            }
+
+            lineNodes.forEach((node) => {
+                node.classList.remove('active-lyric');
+                delete node.dataset.lyricIndex;
+                node.querySelectorAll('.manual-lyric-jump').forEach((btn) => btn.remove());
+            });
+
+            lyricLocatorIndices.forEach((locatorIndex, lyricIndex) => {
+                const lineNode = lineNodes[locatorIndex];
+                if (!lineNode) {
+                    return;
+                }
+
+                lineNode.dataset.lyricIndex = String(lyricIndex);
+
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'manual-lyric-jump';
+                btn.title = '手動定位到這句歌詞';
+                btn.textContent = '●';
+                btn.addEventListener('click', (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+
+                    if (typeof window.__setActiveLyric === 'function') {
+                        window.__setActiveLyric(lyricIndex);
+                    }
+
+                    lineNode.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    window.__pendingManualLyricJump = { lyricIndex };
+                });
+
+                lineNode.insertBefore(btn, lineNode.firstChild);
+            });
+
+            window.__setActiveLyric = (lyricIndex) => {
+                const indexToActivate = Number(lyricIndex);
+                lineNodes.forEach((node) => node.classList.remove('active-lyric'));
+                if (Number.isNaN(indexToActivate) || indexToActivate < 0) {
+                    return false;
+                }
+                const activeNode = lineNodes.find(
+                    (node) => Number(node.dataset.lyricIndex) === indexToActivate
+                );
+                if (!activeNode) {
+                    return false;
+                }
+                activeNode.classList.add('active-lyric');
+                return true;
+            };
+        }""",
+            {
+                "lineSelector": LYRIC_LINE_SELECTOR,
+                "styleId": LYRIC_STYLE_ELEMENT_ID,
+                "locatorIndices": lyric_locator_indices,
+            },
+        )
+    except Exception as e:
+        print(f"⚠️ 注入歌詞 UI 失敗: {e}")
+
+
+def update_highlight_in_browser(index):
+    page = _browser_page
+    if page is None:
+        return
+
+    try:
+        if page.is_closed():
+            return
+    except Exception:
+        return
+
+    locator_index = -1
+    with _state_lock:
+        if 0 <= index < len(_latest_lyrics):
+            locator_index = _latest_lyrics[index]["locator_index"]
+
+    try:
+        page.evaluate(
+            """(payload) => {
+            const lineNodes = Array.from(document.querySelectorAll(payload.lineSelector));
+            lineNodes.forEach((node) => node.classList.remove('active-lyric'));
+
+            const lyricIndex = Number(payload.lyricIndex);
+            if (Number.isNaN(lyricIndex) || lyricIndex < 0) {
+                return;
+            }
+
+            let activeNode = lineNodes.find(
+                (node) => Number(node.dataset.lyricIndex) === lyricIndex
+            );
+
+            if (!activeNode) {
+                const fallbackLocatorIndex = Number(payload.locatorIndex);
+                if (!Number.isNaN(fallbackLocatorIndex) && fallbackLocatorIndex >= 0) {
+                    activeNode = lineNodes[fallbackLocatorIndex];
+                }
+            }
+
+            if (activeNode) {
+                activeNode.classList.add('active-lyric');
+            }
+        }""",
+            {
+                "lineSelector": LYRIC_LINE_SELECTOR,
+                "lyricIndex": int(index),
+                "locatorIndex": locator_index,
+            },
+        )
+    except Exception as e:
+        print(f"⚠️ 更新高亮失敗: {e}")
+
+
+def _consume_manual_jump_from_browser(page):
+    try:
+        result = page.evaluate(
+            """() => {
+            const payload = window.__pendingManualLyricJump;
+            window.__pendingManualLyricJump = null;
+            if (!payload) {
+                return null;
+            }
+            const lyricIndex = Number(payload.lyricIndex);
+            if (Number.isNaN(lyricIndex) || lyricIndex < 0) {
+                return null;
+            }
+            return lyricIndex;
+        }"""
+        )
+    except Exception:
+        return None
+
+    try:
+        return int(result)
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_manual_jump_if_needed(page):
+    global _current_lyric_index, _pending_scroll_targets, _pending_highlight_index
+
+    lyric_index = _consume_manual_jump_from_browser(page)
+    if lyric_index is None:
+        return
+
+    current_line_no = None
+    current_line_text = ""
+    next_line_no = None
+    next_line_text = ""
+
+    with _state_lock:
+        if lyric_index < 0 or lyric_index >= len(_latest_lyrics):
+            return
+
+        _current_lyric_index = lyric_index
+        _pending_scroll_targets = []
+        _pending_highlight_index = lyric_index
+
+        current_line_no = lyric_index + 1
+        current_line_text = _latest_lyrics[lyric_index]["original"]
+        next_compare_index = lyric_index + 1
+        if next_compare_index < len(_latest_lyrics):
+            next_line_no = next_compare_index + 1
+            next_line_text = _latest_lyrics[next_compare_index]["original"]
+
+    if current_line_no is None:
+        return
+
+    print(f"🖱️ [手動定位] 目前定位到第 {current_line_no} 行: '{current_line_text}'")
+    if next_line_no is not None:
+        print(
+            f"🔎 [比對起點] 下一次語音將從第 {next_line_no} 行開始比對: '{next_line_text}'"
+        )
+    else:
+        print("🔎 [比對起點] 已在最後一行，後續語音不會再往下比對")
 
 
 def _reset_playwright_state():
@@ -169,8 +398,8 @@ def extract_lyrics_from_current_page(page):
             line_text = p.evaluate(
                 """(el) => {
                 let clone = el.cloneNode(true);
-                let rts = clone.querySelectorAll('.rt');
-                rts.forEach(rt => rt.remove());
+                let removableNodes = clone.querySelectorAll('.rt, .manual-lyric-jump');
+                removableNodes.forEach(node => node.remove());
                 return clone.textContent || "";
             }"""
             )
@@ -188,6 +417,7 @@ def extract_lyrics_from_current_page(page):
                         "locator_index": idx,
                     }
                 )
+        _inject_lyrics_ui(page, lines)
         return lines
 
     # 最壞情況的 Fallback
@@ -201,14 +431,13 @@ def extract_lyrics_from_current_page(page):
                 "locator_index": idx,
             }
         )
+    _inject_lyrics_ui(page, lines)
     return lines
 
 
 def scroll_to_lyric_locator(page, locator_index):
     # 同時支援原生的 <p> 以及我們剛才動態注入的 <span class="lyric-line">
-    target = page.locator(
-        ".lyricBody .hiragana > p, .lyricBody > p, .lyricBody .hiragana span.lyric-line, .lyricBody span.lyric-line"
-    ).nth(locator_index)
+    target = page.locator(LYRIC_LINE_SELECTOR).nth(locator_index)
     if target.count() == 0:
         return False
 
@@ -218,7 +447,7 @@ def scroll_to_lyric_locator(page, locator_index):
 
 
 def open_in_dedicated_window(url):
-    global _latest_lyrics, _current_lyric_index, _pending_scroll_targets
+    global _latest_lyrics, _current_lyric_index, _pending_scroll_targets, _pending_highlight_index
 
     try:
         url = normalize_utaten_url(url)
@@ -252,10 +481,13 @@ def open_in_dedicated_window(url):
                 print(f"⚠️ 歌詞區塊等待逾時，略過自動捲動初始化: {wait_error}")
                 return
 
+            extracted_lyrics = extract_lyrics_from_current_page(page)
+
             with _state_lock:
-                _latest_lyrics = extract_lyrics_from_current_page(page)
+                _latest_lyrics = extracted_lyrics
                 _current_lyric_index = -1
                 _pending_scroll_targets = []
+                _pending_highlight_index = -1
             # print(f"📝 已解析歌詞行數: {len(_latest_lyrics)}")
             if _latest_lyrics:
                 # preview = " | ".join(line["original"] for line in _latest_lyrics[:3])
@@ -272,7 +504,7 @@ def open_in_dedicated_window(url):
 
 
 def queue_scroll_when_next_line_matches(recognized_text):
-    global _current_lyric_index, _pending_scroll_targets
+    global _current_lyric_index, _pending_scroll_targets, _pending_highlight_index
 
     recognized_text = (recognized_text or "").strip()
     if not recognized_text:
@@ -354,29 +586,45 @@ def queue_scroll_when_next_line_matches(recognized_text):
         if is_recovery:
             print(f"⚠️ [迷失恢復] 成功跨越較大段落，重新定位到第 {best_index + 1} 行")
 
-        start_queue_index = max(0, _current_lyric_index + 1)
-        for idx in range(start_queue_index, best_index + 1):
-            _pending_scroll_targets.append(_latest_lyrics[idx]["locator_index"])
+        # 顯示邏輯改為「比對到的下一句」：畫面置中與高亮都以 next_display_index 為主。
+        next_display_index = min(best_index + 1, len(_latest_lyrics) - 1)
+        _pending_scroll_targets.append(
+            _latest_lyrics[next_display_index]["locator_index"]
+        )
+        _pending_highlight_index = next_display_index
         _current_lyric_index = best_index
 
 
 def flush_pending_scroll():
-    global _pending_scroll_targets
+    global _pending_scroll_targets, _pending_highlight_index
+
+    page = _browser_page
+    with _state_lock:
+        has_pending_work = (
+            bool(_pending_scroll_targets) or _pending_highlight_index >= 0
+        )
+
+    if page is None:
+        if has_pending_work:
+            print("⚠️ 頁面對象為 None，無法捲動")
+        return
+
+    if page.is_closed():
+        if has_pending_work:
+            print("⚠️ 頁面已關閉 (page.is_closed()=True)，無法捲動")
+        return
+
+    _apply_manual_jump_if_needed(page)
 
     with _state_lock:
         target_indices = list(_pending_scroll_targets)
         _pending_scroll_targets = []
+        highlight_index = _pending_highlight_index
+        _pending_highlight_index = -1
+        if highlight_index < 0 and target_indices:
+            highlight_index = _current_lyric_index
 
-    if not target_indices:
-        return
-
-    page = _browser_page
-    if page is None:
-        print("⚠️ 頁面對象為 None，無法捲動")
-        return
-
-    if page.is_closed():
-        print("⚠️ 頁面已關閉 (page.is_closed()=True)，無法捲動")
+    if not target_indices and highlight_index < 0:
         return
 
     try:
@@ -384,6 +632,9 @@ def flush_pending_scroll():
             scrolled = scroll_to_lyric_locator(page, locator_index)
             if not scrolled:
                 print(f"⚠️ 找不到對應歌詞定位 locator_index={locator_index}")
+
+        if highlight_index >= 0:
+            update_highlight_in_browser(highlight_index)
     except Exception as e:
         print(f"⚠️ 捲動失敗: {e}")
 
