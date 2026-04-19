@@ -181,6 +181,23 @@ if errorlevel 1 pause
 '@
 Set-Content -LiteralPath (Join-Path $outputRoot "start.bat") -Value $startBatContent -Encoding ASCII
 
+Write-Section "Creating update.bat"
+$updateBatContent = @'
+@echo off
+chcp 65001 >nul
+setlocal
+cd /d "%~dp0"
+echo 正在從 GitHub 同步最新的程式碼...
+
+:: 使用自帶的 Python 下載 main 分支的最新檔案
+"%~dp0python_env\python.exe" -c "import urllib.request, os; repo='https://raw.githubusercontent.com/anff125/utaten-lyric-finder/main/'; files=['asr.py', 'auto_lyrics.py', 'config.py', 'gui_app.py', 'lyrics_browser.py', 'matching.py', 'song_cache.py', 'spotify_api.py', 'system_media.py', 'web_scraper.py']; [print(f'更新 {f} ...') or urllib.request.urlretrieve(repo+f, f) for f in files]"
+
+echo.
+echo 更新完成！請關閉此視窗並使用 start.bat 重新啟動程式。
+pause
+'@
+Set-Content -LiteralPath (Join-Path $outputRoot "update.bat") -Value $updateBatContent -Encoding UTF8
+
 Write-Section "Creating ZIP archive using 7-Zip"
 $7zArgs = @("a", "-tzip", "-mx=5", "-mmt", $zipPath, "$outputRoot\*")
 Invoke-CheckedCommand -FilePath "7z.exe" -ArgumentList $7zArgs
