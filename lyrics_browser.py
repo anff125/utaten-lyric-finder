@@ -196,8 +196,7 @@ def update_highlight_in_browser(index):
 
 def _consume_manual_jump_from_browser(page):
     try:
-        result = page.evaluate(
-            """() => {
+        result = page.evaluate("""() => {
             const payload = window.__pendingManualLyricJump;
             window.__pendingManualLyricJump = null;
             if (!payload) {
@@ -208,8 +207,7 @@ def _consume_manual_jump_from_browser(page):
                 return null;
             }
             return lyricIndex;
-        }"""
-        )
+        }""")
     except Exception:
         return None
 
@@ -374,15 +372,13 @@ def extract_lyrics_from_current_page(page):
     # 如果找不到 <p> 標籤，代表這是只有 <br> 換行的版型
     if paragraph_count == 0:
         # 動態注入 JS：將被 <br> 切開的文字片段包裝進 <span class="lyric-line"> 中
-        page.evaluate(
-            """() => {
+        page.evaluate("""() => {
             const root = document.querySelector('.lyricBody .hiragana') || document.querySelector('.lyricBody');
             if (root) {
                 const lines = root.innerHTML.split(/<br\\s*\\/?>/gi);
                 root.innerHTML = lines.map(line => `<span class="lyric-line">${line}</span>`).join('<br/>');
             }
-        }"""
-        )
+        }""")
         # 將定位器改為我們自己生成的 span
         paragraph_locator = page.locator(
             ".lyricBody .hiragana span.lyric-line, .lyricBody span.lyric-line"
@@ -395,14 +391,12 @@ def extract_lyrics_from_current_page(page):
 
             # 使用 JS 複製節點，拔除所有 rt (注音/羅馬音) 後取得純文字
             # 這樣可以確保不漏抓任何沒被 ruby 包住的字，同時也不會混入拼音
-            line_text = p.evaluate(
-                """(el) => {
+            line_text = p.evaluate("""(el) => {
                 let clone = el.cloneNode(true);
                 let removableNodes = clone.querySelectorAll('.rt, .manual-lyric-jump');
                 removableNodes.forEach(node => node.remove());
                 return clone.textContent || "";
-            }"""
-            )
+            }""")
 
             line_text = re.sub(r"\s+", "", line_text)
             if not line_text:

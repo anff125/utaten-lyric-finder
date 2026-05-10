@@ -187,13 +187,56 @@ $updateBatContent = @'
 chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
-echo 正在從 GitHub 同步最新的程式碼...
 
-:: 使用自帶的 Python 下載 main 分支的最新檔案
-"%~dp0python_env\python.exe" -c "import urllib.request, os; repo='https://raw.githubusercontent.com/anff125/utaten-lyric-finder/main/'; files=['asr.py', 'auto_lyrics.py', 'config.py', 'gui_app.py', 'lyrics_browser.py', 'matching.py', 'song_cache.py', 'spotify_api.py', 'system_media.py', 'web_scraper.py']; [print(f'更新 {f} ...') or urllib.request.urlretrieve(repo+f, f) for f in files]"
+echo [DEBUG] 開始執行腳本...
+echo [DEBUG] 目前目錄: "%CD%"
+
+:: 1. 檢查 Python 執行檔是否存在
+set "PY_PATH=%~dp0python_env\python.exe"
+echo [DEBUG] 檢查路徑: "%PY_PATH%"
+
+if not exist "%PY_PATH%" (
+    echo.
+    echo [ERROR] 找不到 Python 環境！
+    echo 請確認資料夾 "python_env" 就在此批次檔旁邊。
+    echo ---------------------------------------
+    pause
+    exit /b
+)
+
+echo [DEBUG] Python 環境確認成功，準備下載檔案...
+echo.
+
+:: 2. 建立多執行緒下載的暫存 Python 腳本 (避免縮排與特殊字元問題，採用前置重定向寫法)
+set "TEMP_PY=%~dp0temp_update.py"
+
+> "%TEMP_PY%" echo import urllib.request
+>> "%TEMP_PY%" echo import concurrent.futures
+>> "%TEMP_PY%" echo repo = 'https://raw.githubusercontent.com/anff125/utaten-lyric-finder/main/'
+>> "%TEMP_PY%" echo files = ['asr.py', 'auto_lyrics.py', 'config.py', 'gui_app.py', 'lyrics_browser.py', 'matching.py', 'song_cache.py', 'spotify_api.py', 'system_media.py', 'web_scraper.py']
+>> "%TEMP_PY%" echo def download(f):
+>> "%TEMP_PY%" echo     try:
+>> "%TEMP_PY%" echo         urllib.request.urlretrieve(repo+f, f)
+>> "%TEMP_PY%" echo         print(f'[INFO] 更新 {f:20} ... 成功')
+>> "%TEMP_PY%" echo     except Exception as e:
+>> "%TEMP_PY%" echo         print(f'[ERROR] 更新 {f:20} ... 失敗: {e}')
+>> "%TEMP_PY%" echo with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+>> "%TEMP_PY%" echo     executor.map(download, files)
+
+:: 3. 執行並行下載
+"%PY_PATH%" "%TEMP_PY%"
+if %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo [ERROR] Python 執行過程中發生錯誤。
+)
+
+:: 4. 清除暫存腳本
+if exist "%TEMP_PY%" del "%TEMP_PY%"
 
 echo.
-echo 更新完成！請關閉此視窗並使用 start.bat 重新啟動程式。
+echo ---------------------------------------
+echo 執行結束。
+echo ---------------------------------------
 pause
 '@
 Set-Content -LiteralPath (Join-Path $outputRoot "update.bat") -Value $updateBatContent -Encoding UTF8
