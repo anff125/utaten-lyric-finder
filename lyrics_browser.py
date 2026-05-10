@@ -14,8 +14,7 @@ from config import (
     RECOVERY_LOOKAHEAD_LINES,  # 新增
     RECOVERY_THRESHOLD,  # 新增
 )
-from matching import calculate_similarity, normalize_match_text, normalize_to_hiragana
-from matching import calculate_ratio_similarity
+from matching import LyricsAgent, normalize_match_text, normalize_to_hiragana
 from web_scraper import is_utaten_lyric_detail_url, normalize_utaten_url
 
 _playwright = None
@@ -26,6 +25,7 @@ _current_lyric_index = -1
 _pending_scroll_targets: List[int] = []
 _pending_highlight_index = -1
 _state_lock = threading.Lock()
+_lyrics_agent = LyricsAgent()
 
 LYRIC_ROOT_SELECTOR = ".lyricBody .hiragana, .lyricBody"
 LYRIC_LINE_SELECTOR = ".lyricBody .hiragana > p, .lyricBody > p, .lyricBody .hiragana span.lyric-line, .lyricBody span.lyric-line"
@@ -236,6 +236,7 @@ def _apply_manual_jump_if_needed(page):
         _current_lyric_index = lyric_index
         _pending_scroll_targets = []
         _pending_highlight_index = lyric_index
+        _lyrics_agent.reset()
 
         current_line_no = lyric_index + 1
         current_line_text = _latest_lyrics[lyric_index]["original"]
@@ -482,6 +483,7 @@ def open_in_dedicated_window(url):
                 _current_lyric_index = -1
                 _pending_scroll_targets = []
                 _pending_highlight_index = -1
+                _lyrics_agent.reset()
             # print(f"📝 已解析歌詞行數: {len(_latest_lyrics)}")
             if _latest_lyrics:
                 # preview = " | ".join(line["original"] for line in _latest_lyrics[:3])
@@ -516,6 +518,10 @@ def queue_scroll_when_next_line_matches(recognized_text):
         if start_index >= len(_latest_lyrics):
             return
 
+        _lyrics_agent.append(normalized_recognized)
+        target_length = len(_latest_lyrics[start_index]["normalized"])
+        _lyrics_agent.trim_if_needed(target_length)
+
         # ==========================================
         # 階段一：常規推進 (搜尋接下來的 4 行)
         # ==========================================
@@ -527,7 +533,7 @@ def queue_scroll_when_next_line_matches(recognized_text):
 
         for idx in range(start_index, end_index_phase1 + 1):
             target_normalized = _latest_lyrics[idx]["normalized"]
-            score = calculate_similarity(normalized_recognized, target_normalized)
+            score = _lyrics_agent.score(target_normalized)
 
             if score > best_score:
                 best_score = score
@@ -546,9 +552,7 @@ def queue_scroll_when_next_line_matches(recognized_text):
             if start_index_phase2 <= end_index_phase2:
                 for idx in range(start_index_phase2, end_index_phase2 + 1):
                     target_normalized = _latest_lyrics[idx]["normalized"]
-                    score = calculate_ratio_similarity(
-                        normalized_recognized, target_normalized
-                    )
+                    score = _lyrics_agent.ratio_score(target_normalized)
 
                     # 迷失恢復需要嚴格的匹配分數 (RECOVERY_THRESHOLD)
                     if score > best_score and score >= RECOVERY_THRESHOLD:
@@ -570,8 +574,9 @@ def queue_scroll_when_next_line_matches(recognized_text):
         target_original = _latest_lyrics[best_index]["original"]
         target_normalized = _latest_lyrics[best_index]["normalized"]
 
+        buffer_length = len(_lyrics_agent.asr_buffer)
         print(
-            f"\n🎤 [語音識別] 原句: '{recognized_text}' (正規化: '{normalized_recognized}')"
+            f"\n🎤 [語音識別] 最新片段: '{recognized_text}' (累積長度: {buffer_length})"
         )
         print(
             f"🎯 [比對成功] 歌詞: '{target_original}' (正規化: '{target_normalized}', 分數: {best_score:.2f})"
@@ -587,6 +592,7 @@ def queue_scroll_when_next_line_matches(recognized_text):
         )
         _pending_highlight_index = next_display_index
         _current_lyric_index = best_index
+        _lyrics_agent.reset()
 
 
 def flush_pending_scroll():

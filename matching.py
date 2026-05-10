@@ -38,14 +38,22 @@ def normalize_to_hiragana(text):
     return text
 
 
-def calculate_similarity(a, b):
-    na = normalize_match_text(a)
-    nb = normalize_match_text(b)
+def _length_coverage_ratio(source_text, target_text):
+    if not target_text:
+        return 0.0
+    return min(len(source_text) / len(target_text), 1.0)
+
+
+def calculate_similarity_normalized(na, nb, min_coverage_ratio=0.4):
     if not na or not nb:
         return 0.0
 
+    coverage = _length_coverage_ratio(na, nb)
+
     # 1. partial_ratio: 解決 Whisper 只聽到一半的問題 (例如只聽到「きみが」，歌詞是「きみがすきだよ」)
     partial_score = fuzz.partial_ratio(na, nb) / 100.0
+    if coverage < min_coverage_ratio:
+        partial_score *= coverage / min_coverage_ratio
 
     # 2. ratio: 解決 Whisper 聽錯少數假名的問題 (基於 Levenshtein 編輯距離)
     ratio_score = fuzz.ratio(na, nb) / 100.0
@@ -54,9 +62,13 @@ def calculate_similarity(a, b):
     return max(partial_score, ratio_score)
 
 
-def calculate_ratio_similarity(a, b):
+def calculate_similarity(a, b, min_coverage_ratio=0.4):
     na = normalize_match_text(a)
     nb = normalize_match_text(b)
+    return calculate_similarity_normalized(na, nb, min_coverage_ratio)
+
+
+def calculate_ratio_similarity_normalized(na, nb):
     if not na or not nb:
         return 0.0
 
@@ -65,67 +77,46 @@ def calculate_ratio_similarity(a, b):
     return ratio_score
 
 
-def find_best_match_line(transcribed_text, lyrics, last_line_index=-1):
-    """
-    Find the best matching line in the lyrics for the transcribed text.
-
-    Args:
-        transcribed_text (str): The text from speech-to-text.
-        lyrics (list): A list of lyric lines.
-        last_line_index (int): The index of the last matched line, to start searching from.
-
-    Returns:
-        tuple: (best_match_index, best_score) or (None, 0) if no good match is found.
-    """
-    best_score = 0
-    best_match_index = -1
-
-    # Start searching from the line after the last matched one
-    start_index = last_line_index + 1
-
-    # Use a higher threshold for better precision
-    match_threshold = 85
-
-    # Limit search to a window of lines to avoid jumping too far ahead
-    search_window = min(len(lyrics), start_index + 10)
-
-    for i in range(start_index, search_window):
-        line = lyrics[i]
-        # Use partial_ratio for better matching of substrings
-        score = fuzz.partial_ratio(transcribed_text, line)
-
-        if score > best_score:
-            best_score = score
-            best_match_index = i
-
-    if best_score >= match_threshold:
-        return best_match_index, best_score
-    else:
-        return None, 0
+def calculate_ratio_similarity(a, b):
+    na = normalize_match_text(a)
+    nb = normalize_match_text(b)
+    return calculate_ratio_similarity_normalized(na, nb)
 
 
-def find_best_match_line_with_lookahead(transcribed_text, lyrics, last_line_index=-1):
-    """
-    Find the best matching line in the lyrics for the transcribed text,
-    with a lookahead to consider the next line.
-    """
-    # First, find the best single-line match
-    best_match_index, best_score = find_best_match_line(
-        transcribed_text, lyrics, last_line_index
-    )
+class LyricsAgent:
+    def __init__(self, min_coverage_ratio=0.4, max_buffer_ratio=1.8):
+        self.min_coverage_ratio = min_coverage_ratio
+        self.max_buffer_ratio = max_buffer_ratio
+        self.asr_buffer = ""
 
-    if best_match_index is None:
-        return None, 0
+    def reset(self):
+        self.asr_buffer = ""
 
-    # Now, check if combining with the next line gives a better score
-    if best_match_index + 1 < len(lyrics):
-        combined_line = lyrics[best_match_index] + lyrics[best_match_index + 1]
-        combined_score = fuzz.partial_ratio(transcribed_text, combined_line)
+    def append(self, normalized_text):
+        if normalized_text:
+            self.asr_buffer += normalized_text
 
-        # If the combined score is significantly better, it might be a better match
-        # This helps with short transcribed phrases that span two lines.
-        if combined_score > best_score + 10:  # e.g., 10 points higher
-            # We still return the original line index to start from there
-            return best_match_index, combined_score
+    def trim_if_needed(self, target_length):
+        if target_length <= 0:
+            return False
 
-    return best_match_index, best_score
+        max_length = int(target_length * self.max_buffer_ratio)
+        if max_length <= 0:
+            return False
+
+        if len(self.asr_buffer) > max_length:
+            drop = len(self.asr_buffer) // 2
+            self.asr_buffer = self.asr_buffer[drop:]
+            return True
+
+        return False
+
+    def score(self, target_normalized):
+        return calculate_similarity_normalized(
+            self.asr_buffer,
+            target_normalized,
+            self.min_coverage_ratio,
+        )
+
+    def ratio_score(self, target_normalized):
+        return calculate_ratio_similarity_normalized(self.asr_buffer, target_normalized)

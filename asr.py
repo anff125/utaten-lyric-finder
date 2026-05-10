@@ -188,7 +188,20 @@ def _asr_worker_loop(on_recognized_text):
                 best_of=5,  # 從多個候選中選最好的
             )
 
-            result_text = "".join(segment.text for segment in segments).strip()
+            # 使用 try-except 包圍迭代過程，以捕捉並印出有問題的 segment
+            try:
+                result_text = "".join(
+                    segment.text for segment in segments if segment and segment.text
+                ).strip()
+            except Exception as e:
+                print(f"⚠️ Whisper 迭代 segment 時發生錯誤: {e}")
+                # 嘗試印出 segments 的內容以供偵錯
+                try:
+                    problematic_segments = list(segments)
+                    print(f"🕵️ 問題 segments 內容: {problematic_segments}")
+                except Exception as list_e:
+                    print(f"無法將 segments 轉換為列表: {list_e}")
+                result_text = ""
 
             # 新增：過濾常見的 Whisper 幻覺字眼
             hallucinations = [
