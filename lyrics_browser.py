@@ -1,6 +1,7 @@
 import os
 import re
 import threading
+import time
 import webbrowser
 from typing import Any, Dict, List
 
@@ -8,6 +9,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 from config import (
+    ASR_BLOCK_SECONDS,
     FUZZY_LOOKAHEAD_LINES,
     FUZZY_NEXT_LINE_THRESHOLD,
     PLAYWRIGHT_NAV_TIMEOUT_MS,
@@ -26,6 +28,11 @@ _pending_scroll_targets: List[int] = []
 _pending_highlight_index = -1
 _state_lock = threading.Lock()
 _lyrics_agent = LyricsAgent()
+_last_success_normalized = ""
+_last_success_at = 0.0
+
+# Ignore duplicate ASR chunks shortly after a successful match.
+DUPLICATE_RECOGNIZED_TTL_SECONDS = ASR_BLOCK_SECONDS / 2.0
 
 LYRIC_ROOT_SELECTOR = ".lyricBody .hiragana, .lyricBody"
 LYRIC_LINE_SELECTOR = ".lyricBody .hiragana > p, .lyricBody > p, .lyricBody .hiragana span.lyric-line, .lyricBody span.lyric-line"
@@ -219,6 +226,7 @@ def _consume_manual_jump_from_browser(page):
 
 def _apply_manual_jump_if_needed(page):
     global _current_lyric_index, _pending_scroll_targets, _pending_highlight_index
+    global _last_success_normalized, _last_success_at
 
     lyric_index = _consume_manual_jump_from_browser(page)
     if lyric_index is None:
@@ -237,6 +245,8 @@ def _apply_manual_jump_if_needed(page):
         _pending_scroll_targets = []
         _pending_highlight_index = lyric_index
         _lyrics_agent.reset()
+        _last_success_normalized = ""
+        _last_success_at = 0.0
 
         current_line_no = lyric_index + 1
         current_line_text = _latest_lyrics[lyric_index]["original"]
@@ -442,7 +452,13 @@ def scroll_to_lyric_locator(page, locator_index):
 
 
 def open_in_dedicated_window(url):
-    global _latest_lyrics, _current_lyric_index, _pending_scroll_targets, _pending_highlight_index
+    global \
+        _latest_lyrics, \
+        _current_lyric_index, \
+        _pending_scroll_targets, \
+        _pending_highlight_index, \
+        _last_success_normalized, \
+        _last_success_at
 
     try:
         url = normalize_utaten_url(url)
@@ -484,6 +500,8 @@ def open_in_dedicated_window(url):
                 _pending_scroll_targets = []
                 _pending_highlight_index = -1
                 _lyrics_agent.reset()
+                _last_success_normalized = ""
+                _last_success_at = 0.0
             # print(f"📝 已解析歌詞行數: {len(_latest_lyrics)}")
             if _latest_lyrics:
                 # preview = " | ".join(line["original"] for line in _latest_lyrics[:3])
@@ -501,6 +519,7 @@ def open_in_dedicated_window(url):
 
 def queue_scroll_when_next_line_matches(recognized_text):
     global _current_lyric_index, _pending_scroll_targets, _pending_highlight_index
+    global _last_success_normalized, _last_success_at
 
     recognized_text = (recognized_text or "").strip()
     if not recognized_text:
@@ -513,6 +532,13 @@ def queue_scroll_when_next_line_matches(recognized_text):
     with _state_lock:
         if not _latest_lyrics:
             return
+
+        if _last_success_normalized:
+            now = time.monotonic()
+            within_ttl = now - _last_success_at <= DUPLICATE_RECOGNIZED_TTL_SECONDS
+            is_duplicate = normalized_recognized in _last_success_normalized
+            if within_ttl and is_duplicate:
+                return
 
         start_index = _current_lyric_index + 1
         if start_index >= len(_latest_lyrics):
@@ -592,6 +618,8 @@ def queue_scroll_when_next_line_matches(recognized_text):
         )
         _pending_highlight_index = next_display_index
         _current_lyric_index = best_index
+        _last_success_normalized = _lyrics_agent.asr_buffer
+        _last_success_at = time.monotonic()
         _lyrics_agent.reset()
 
 

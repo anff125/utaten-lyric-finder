@@ -3,6 +3,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import cast
 from urllib.parse import urlparse
+
 import customtkinter as ctk
 
 import config

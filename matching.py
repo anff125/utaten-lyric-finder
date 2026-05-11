@@ -1,4 +1,5 @@
 import re
+
 from thefuzz import fuzz
 
 try:
@@ -44,6 +45,43 @@ def _length_coverage_ratio(source_text, target_text):
     return min(len(source_text) / len(target_text), 1.0)
 
 
+def merge_overlapped_text(existing_text, new_text, min_overlap=2, threshold=0.8):
+    """
+    比較現有字串的尾部與新字串的頭部，尋找重疊部分並進行合併去重。
+    包含精確比對與模糊容錯機制。
+    """
+    if not existing_text:
+        return new_text
+    if not new_text:
+        return existing_text
+
+    max_len = min(len(existing_text), len(new_text))
+
+    for overlap_len in range(max_len, min_overlap - 1, -1):
+        if existing_text[-overlap_len:] == new_text[:overlap_len]:
+            return existing_text + new_text[overlap_len:]
+
+    best_overlap_len = 0
+    best_score = 0
+    fuzzy_min = max(min_overlap, 3)
+
+    for overlap_len in range(max_len, fuzzy_min - 1, -1):
+        suffix = existing_text[-overlap_len:]
+        prefix = new_text[:overlap_len]
+        score = fuzz.ratio(suffix, prefix) / 100.0
+
+        if score >= threshold and score > best_score:
+            best_overlap_len = overlap_len
+            best_score = score
+            if score >= 0.95:
+                break
+
+    if best_overlap_len > 0:
+        return existing_text + new_text[best_overlap_len:]
+
+    return existing_text + new_text
+
+
 def calculate_similarity_normalized(na, nb, min_coverage_ratio=0.4):
     if not na or not nb:
         return 0.0
@@ -62,12 +100,6 @@ def calculate_similarity_normalized(na, nb, min_coverage_ratio=0.4):
     return max(partial_score, ratio_score)
 
 
-def calculate_similarity(a, b, min_coverage_ratio=0.4):
-    na = normalize_match_text(a)
-    nb = normalize_match_text(b)
-    return calculate_similarity_normalized(na, nb, min_coverage_ratio)
-
-
 def calculate_ratio_similarity_normalized(na, nb):
     if not na or not nb:
         return 0.0
@@ -75,12 +107,6 @@ def calculate_ratio_similarity_normalized(na, nb):
     # 迷失恢復模式僅使用 ratio，避免 partial_ratio 對片段誤命中過於寬鬆
     ratio_score = fuzz.ratio(na, nb) / 100.0
     return ratio_score
-
-
-def calculate_ratio_similarity(a, b):
-    na = normalize_match_text(a)
-    nb = normalize_match_text(b)
-    return calculate_ratio_similarity_normalized(na, nb)
 
 
 class LyricsAgent:
@@ -94,7 +120,7 @@ class LyricsAgent:
 
     def append(self, normalized_text):
         if normalized_text:
-            self.asr_buffer += normalized_text
+            self.asr_buffer = merge_overlapped_text(self.asr_buffer, normalized_text)
 
     def trim_if_needed(self, target_length):
         if target_length <= 0:

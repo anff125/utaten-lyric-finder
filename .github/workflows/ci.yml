@@ -6,12 +6,14 @@ on:
     paths:
       - "**/*.py"
       - "requirements.txt"
+      - "build_portable.ps1"
       - ".github/workflows/ci.yml"
   pull_request:
     branches: ["main"]
     paths:
       - "**/*.py"
       - "requirements.txt"
+      - "build_portable.ps1"
       - ".github/workflows/ci.yml"
 
 permissions:
@@ -44,7 +46,32 @@ jobs:
         run: |
           ruff check .
 
+      - name: Lint PowerShell scripts
+        shell: pwsh
+        run: |
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          Invoke-ScriptAnalyzer -Path ./build_portable.ps1 -EnableExit
+
       - name: Runtime smoke test
         shell: pwsh
         run: |
           python -c "import tkinter; import customtkinter; import spotify_api; import web_scraper; import matching; print('[SUCCESS] runtime smoke imports loaded')"
+
+      - name: Dry-run portable build script
+        shell: pwsh
+        run: |
+          Write-Host "開始驗證打包腳本 (Dry-run)..."
+
+          $OutputRoot = "build\portable\utaten-lyric-finder"
+          $PythonRoot = Join-Path $OutputRoot "python_env"
+          New-Item -ItemType Directory -Path $PythonRoot -Force | Out-Null
+
+          ./build_portable.ps1 -SkipEnvBuild $true
+
+          $ZipPath = "build\portable\utaten-lyric-finder.zip"
+          if (-Not (Test-Path $ZipPath)) {
+              Write-Error "[ERROR] Dry-run 失敗：找不到預期的壓縮檔 $ZipPath"
+              exit 1
+          }
+
+          Write-Host "[SUCCESS] 打包腳本執行無誤，產出物已成功生成！"

@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$PythonVersion = "3.11.9",
     [string]$PythonArch = "amd64",
     [string]$CudaIndexUrl = "https://download.pytorch.org/whl/cu121",
@@ -11,8 +11,8 @@ $ErrorActionPreference = "Stop"
 
 function Write-Section {
     param([string]$Message)
-    Write-Host ""
-    Write-Host "=== $Message ==="
+    Write-Output ""
+    Write-Output "=== $Message ==="
 }
 
 function Invoke-CheckedCommand {
@@ -245,6 +245,6 @@ Write-Section "Creating ZIP archive using 7-Zip"
 $7zArgs = @("a", "-tzip", "-mx=5", "-mmt", $zipPath, "$outputRoot\*")
 Invoke-CheckedCommand -FilePath "7z.exe" -ArgumentList $7zArgs
 
-Write-Host ""
-Write-Host "Portable package created: $zipPath"
-Write-Host "Unzip it, then run start.bat from the extracted folder."
+Write-Output ""
+Write-Output "Portable package created: $zipPath"
+Write-Output "Unzip it, then run start.bat from the extracted folder."

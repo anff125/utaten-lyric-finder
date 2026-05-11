@@ -15,10 +15,10 @@ from lyrics_browser import (
     open_in_dedicated_window,
     queue_scroll_when_next_line_matches,
 )
-from spotify_api import get_spotify_client
-from web_scraper import search_utaten
 from song_cache import get_cached_data, set_cached_data
+from spotify_api import get_spotify_client
 from system_media import get_system_media_info
+from web_scraper import search_utaten
 
 
 def debug_log(msg):
@@ -137,7 +137,9 @@ def main(stop_event=None, on_track_update=None):
                                 "song_id": song_id,
                                 "song_name": song_name,
                                 "artist_name": artist_name,
-                                "source": current_track_info["source"],
+                                "source": current_track_info.get("source", "")
+                                if current_track_info
+                                else "",
                                 "cache_status": "checking",
                                 "cache_url": "",
                             }
@@ -165,7 +167,9 @@ def main(stop_event=None, on_track_update=None):
                                     "song_id": song_id,
                                     "song_name": song_name,
                                     "artist_name": artist_name,
-                                    "source": current_track_info["source"],
+                                    "source": current_track_info.get("source", "")
+                                    if current_track_info
+                                    else "",
                                     "cache_status": cached_data.get(
                                         "status", "unknown"
                                     ),
@@ -188,7 +192,9 @@ def main(stop_event=None, on_track_update=None):
                                         "song_id": song_id,
                                         "song_name": song_name,
                                         "artist_name": artist_name,
-                                        "source": current_track_info["source"],
+                                        "source": current_track_info.get("source", "")
+                                        if current_track_info
+                                        else "",
                                         "cache_status": status,
                                         "cache_url": url,
                                     }

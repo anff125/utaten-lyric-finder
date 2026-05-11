@@ -1,9 +1,11 @@
+import math  # 新增
 import os
 import sys
 import threading
-import math  # 新增
 from typing import Any, cast
+
 from scipy.signal import resample_poly  # 新增
+
 import config
 
 try:
@@ -140,8 +142,32 @@ def _asr_worker_loop(on_recognized_text):
 
         return resampled_audio.astype(np.float32)
 
+    def _fit_audio_length(samples, target_length):
+        if target_length <= 0:
+            return samples[:0]
+        if samples.size == target_length:
+            return samples
+        if samples.size > target_length:
+            return samples[:target_length]
+
+        padded = np.zeros(target_length, dtype=np.float32)
+        padded[: samples.size] = samples
+        return padded
+
+    def _advance_sliding_window(audio_buffer, new_data, step_frames):
+        new_data = _fit_audio_length(
+            np.asarray(new_data, dtype=np.float32), step_frames
+        )
+        audio_buffer = np.roll(audio_buffer, -step_frames)
+        audio_buffer[-step_frames:] = new_data
+        return audio_buffer
+
     source_name = ""
-    blocksize = int(config.ASR_SAMPLE_RATE * config.ASR_BLOCK_SECONDS)
+    sample_rate = config.ASR_SAMPLE_RATE
+    block_seconds = config.ASR_BLOCK_SECONDS
+    step_seconds = block_seconds / 2
+    block_frames = int(block_seconds * sample_rate)
+    step_frames = int(step_seconds * sample_rate)
     recognition_count = 0
     chunk_counter = 0  # 1. 新增：用來為音訊片段檔名標號的計數器
 
@@ -163,39 +189,21 @@ def _asr_worker_loop(on_recognized_text):
         if volume < 0.0001:
             print("🔇 [系統偵測] 收到的音訊完全沒聲音，可能抓到錯誤的音效裝置！")
 
-        # ==============================================================
-        # 3. 新增：將音訊儲存到 debug_audio_chunks 資料夾底下
-        # ==============================================================
-        # chunk_counter += 1
-        # debug_dir = "debug_audio_chunks"
-        # if not os.path.exists(debug_dir):
-        #     os.makedirs(debug_dir)
-
-        # # 檔名格式例如：audio_chunk_0001.wav
-        # file_path = os.path.join(debug_dir, f"audio_chunk_{chunk_counter:04d}.wav")
-        # # 存檔 (audio_data 是 float32 格式，scipy wavfile 可以直接支援)
-        # wavfile.write(file_path, config.ASR_SAMPLE_RATE, audio_data)
-        # # ==============================================================
-
         try:
             segments, _ = model.transcribe(
                 audio_data,
                 language=config.ASR_LANGUAGE,
                 vad_filter=False,
-                beam_size=10,  # 增加搜尋寬度
-                # initial_prompt="Lyrics, Songs, Japanese",  # 引導模型
-                # condition_on_previous_text=True,  # 利用上下文
-                best_of=5,  # 從多個候選中選最好的
+                beam_size=10,
+                best_of=5,
             )
 
-            # 使用 try-except 包圍迭代過程，以捕捉並印出有問題的 segment
             try:
                 result_text = "".join(
                     segment.text for segment in segments if segment and segment.text
                 ).strip()
             except Exception as e:
                 print(f"⚠️ Whisper 迭代 segment 時發生錯誤: {e}")
-                # 嘗試印出 segments 的內容以供偵錯
                 try:
                     problematic_segments = list(segments)
                     print(f"🕵️ 問題 segments 內容: {problematic_segments}")
@@ -242,7 +250,7 @@ def _asr_worker_loop(on_recognized_text):
 
             device_rate = int(device["defaultSampleRate"])
             device_channels = max(1, min(2, int(device.get("maxInputChannels", 1))))
-            frames_per_buffer = max(512, int(device_rate * config.ASR_BLOCK_SECONDS))
+            frames_per_buffer = max(512, int(device_rate * step_seconds))
             source_name = device["name"]
 
             stream = pa.open(
@@ -255,7 +263,12 @@ def _asr_worker_loop(on_recognized_text):
             )
 
             print(f"🎙️ ASR 已啟動，來源: {source_name}")
-            print(f"🔊 開始錄音，每 {config.ASR_BLOCK_SECONDS}s 處理一個區塊...")
+            print(
+                f"🔊 開始錄音，使用滑動視窗 (大小: {block_seconds}s, 步進: {step_seconds}s)..."
+            )
+
+            audio_buffer = np.zeros(block_frames, dtype=np.float32)
+            buffered_frames = 0
 
             while True:
                 raw = stream.read(frames_per_buffer, exception_on_overflow=False)
@@ -263,8 +276,12 @@ def _asr_worker_loop(on_recognized_text):
                 if device_channels > 1:
                     data = data.reshape(-1, device_channels)[:, 0]
 
-                mono = _resample_if_needed(data, device_rate, config.ASR_SAMPLE_RATE)
-                _process_audio_chunk(mono)
+                mono = _resample_if_needed(data, device_rate, sample_rate)
+                audio_buffer = _advance_sliding_window(audio_buffer, mono, step_frames)
+                buffered_frames = min(block_frames, buffered_frames + step_frames)
+
+                if buffered_frames >= block_frames:
+                    _process_audio_chunk(audio_buffer.copy())
         finally:
             if stream is not None:
                 stream.stop_stream()
@@ -297,17 +314,26 @@ def _asr_worker_loop(on_recognized_text):
         return
 
     print(f"🎙️ ASR 已啟動，來源: {speaker.name}")
+    print(
+        f"🔊 開始錄音，使用滑動視窗 (大小: {block_seconds}s, 步進: {step_seconds}s)..."
+    )
+    audio_buffer = np.zeros(block_frames, dtype=np.float32)
+    buffered_frames = 0
     with loopback_mic.recorder(
-        samplerate=config.ASR_SAMPLE_RATE,
+        samplerate=sample_rate,
         channels=1,
-        blocksize=blocksize,
+        blocksize=step_frames,
     ) as recorder:
-        print(f"🔊 開始錄音，每 {config.ASR_BLOCK_SECONDS}s 處理一個區塊...")
         while True:
-            data = recorder.record(numframes=blocksize)
+            data = recorder.record(numframes=step_frames)
             if data.ndim > 1:
                 data = data[:, 0]
-            _process_audio_chunk(data.astype(np.float32))
+
+            audio_buffer = _advance_sliding_window(audio_buffer, data, step_frames)
+            buffered_frames = min(block_frames, buffered_frames + step_frames)
+
+            if buffered_frames >= block_frames:
+                _process_audio_chunk(audio_buffer.copy())
 
 
 def ensure_asr_worker_started(on_recognized_text):

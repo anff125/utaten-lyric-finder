@@ -1,7 +1,7 @@
 # system_media.py
 import asyncio
-import re
 import concurrent.futures
+import re
 
 # 👇 除錯模式開關
 DEBUG = False
@@ -78,6 +78,10 @@ async def _get_media_info_async():
             return None
 
         info = await current_session.try_get_media_properties_async()
+
+        if not info:
+            debug_log("無法取得媒體屬性。")
+            return None
 
         debug_log(f"抓取到原始資訊 -> 標題: '{info.title}', 頻道: '{info.artist}'")
 

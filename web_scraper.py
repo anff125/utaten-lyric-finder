@@ -2,8 +2,8 @@ import sys
 import urllib.parse
 from urllib.parse import urlparse
 
-import requests
 import jaconv
+import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
@@ -135,7 +135,7 @@ def search_utaten(artist, song, open_url_callback):
                 link = r.get("href", "")
 
                 if is_testing:
-                    print(f"  {i+1}: {link}")
+                    print(f"  {i + 1}: {link}")
 
                 if "utaten.com/lyric/" in link:
                     link = normalize_utaten_url(link)
