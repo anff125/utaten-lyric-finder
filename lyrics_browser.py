@@ -30,9 +30,12 @@ _state_lock = threading.Lock()
 _lyrics_agent = LyricsAgent()
 _last_success_normalized = ""
 _last_success_at = 0.0
+_buffer_start_at = 0.0
 
 # Ignore duplicate ASR chunks shortly after a successful match.
-DUPLICATE_RECOGNIZED_TTL_SECONDS = ASR_BLOCK_SECONDS / 2.0
+DUPLICATE_RECOGNIZED_TTL_SECONDS = ASR_BLOCK_SECONDS
+
+LOOKAHEAD_SECONDS_PER_LINE = 1.5
 
 LYRIC_ROOT_SELECTOR = ".lyricBody .hiragana, .lyricBody"
 LYRIC_LINE_SELECTOR = ".lyricBody .hiragana > p, .lyricBody > p, .lyricBody .hiragana span.lyric-line, .lyricBody span.lyric-line"
@@ -458,7 +461,8 @@ def open_in_dedicated_window(url):
         _pending_scroll_targets, \
         _pending_highlight_index, \
         _last_success_normalized, \
-        _last_success_at
+        _last_success_at, \
+        _buffer_start_at
 
     try:
         url = normalize_utaten_url(url)
@@ -502,6 +506,7 @@ def open_in_dedicated_window(url):
                 _lyrics_agent.reset()
                 _last_success_normalized = ""
                 _last_success_at = 0.0
+                _buffer_start_at = 0.0
             # print(f"📝 已解析歌詞行數: {len(_latest_lyrics)}")
             if _latest_lyrics:
                 # preview = " | ".join(line["original"] for line in _latest_lyrics[:3])
@@ -509,6 +514,7 @@ def open_in_dedicated_window(url):
                 first_line_scrolled = scroll_to_lyric_locator(page, 0)
                 if first_line_scrolled:
                     print("🎯 已自動定位到第一句歌詞")
+                    update_highlight_in_browser(0)
                 else:
                     print("⚠️ 無法定位到第一句歌詞")
             print("🖼️  瀏覽器視窗應已開啟，等待聲音識別觸發自動滾動...")
@@ -519,7 +525,7 @@ def open_in_dedicated_window(url):
 
 def queue_scroll_when_next_line_matches(recognized_text):
     global _current_lyric_index, _pending_scroll_targets, _pending_highlight_index
-    global _last_success_normalized, _last_success_at
+    global _last_success_normalized, _last_success_at, _buffer_start_at
 
     recognized_text = (recognized_text or "").strip()
     if not recognized_text:
@@ -533,8 +539,8 @@ def queue_scroll_when_next_line_matches(recognized_text):
         if not _latest_lyrics:
             return
 
+        now = time.monotonic()
         if _last_success_normalized:
-            now = time.monotonic()
             within_ttl = now - _last_success_at <= DUPLICATE_RECOGNIZED_TTL_SECONDS
             is_duplicate = normalized_recognized in _last_success_normalized
             if within_ttl and is_duplicate:
@@ -544,15 +550,32 @@ def queue_scroll_when_next_line_matches(recognized_text):
         if start_index >= len(_latest_lyrics):
             return
 
+        if not _lyrics_agent.asr_buffer:
+            _buffer_start_at = now
+
         _lyrics_agent.append(normalized_recognized)
         target_length = len(_latest_lyrics[start_index]["normalized"])
         _lyrics_agent.trim_if_needed(target_length)
 
+        elapsed_since_success = 0.0
+        if _last_success_at > 0.0:
+            elapsed_since_success = max(0.0, now - _last_success_at)
+        elif _buffer_start_at > 0.0:
+            elapsed_since_success = max(0.0, now - _buffer_start_at)
+
+        phase1_lookahead_lines = max(
+            1,
+            min(
+                FUZZY_LOOKAHEAD_LINES,
+                int(elapsed_since_success / LOOKAHEAD_SECONDS_PER_LINE),
+            ),
+        )
+
         # ==========================================
-        # 階段一：常規推進 (搜尋接下來的 4 行)
+        # 階段一：常規推進 (時間越久，搜尋範圍越大)
         # ==========================================
         end_index_phase1 = min(
-            start_index + FUZZY_LOOKAHEAD_LINES, len(_latest_lyrics) - 1
+            start_index + phase1_lookahead_lines, len(_latest_lyrics) - 1
         )
         best_index = None
         best_score = 0.0
@@ -566,10 +589,13 @@ def queue_scroll_when_next_line_matches(recognized_text):
                 best_index = idx
 
         # ==========================================
-        # 階段二：迷失恢復機制 (如果階段一沒過門檻，擴大搜尋範圍)
+        # 階段二：迷失恢復機制 (階段一達到上限後才啟用)
         # ==========================================
         is_recovery = False
-        if best_score < FUZZY_NEXT_LINE_THRESHOLD:
+        if (
+            best_score < FUZZY_NEXT_LINE_THRESHOLD
+            and phase1_lookahead_lines >= FUZZY_LOOKAHEAD_LINES
+        ):
             start_index_phase2 = end_index_phase1 + 1
             end_index_phase2 = min(
                 _current_lyric_index + RECOVERY_LOOKAHEAD_LINES, len(_latest_lyrics) - 1
@@ -611,15 +637,15 @@ def queue_scroll_when_next_line_matches(recognized_text):
         if is_recovery:
             print(f"⚠️ [迷失恢復] 成功跨越較大段落，重新定位到第 {best_index + 1} 行")
 
-        # 顯示邏輯改為「比對到的下一句」：畫面置中與高亮都以 next_display_index 為主。
         next_display_index = min(best_index + 1, len(_latest_lyrics) - 1)
         _pending_scroll_targets.append(
             _latest_lyrics[next_display_index]["locator_index"]
         )
         _pending_highlight_index = next_display_index
         _current_lyric_index = best_index
-        _last_success_normalized = _lyrics_agent.asr_buffer
+        _last_success_normalized = target_normalized
         _last_success_at = time.monotonic()
+        _buffer_start_at = 0.0
         _lyrics_agent.reset()
 
 
