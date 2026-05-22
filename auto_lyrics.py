@@ -22,7 +22,7 @@ from web_scraper import search_utaten
 
 
 def debug_log(msg):
-    if config.DEBUG:
+    if config.DEBUG_POLLING:
         now_time = datetime.now().strftime("%H:%M:%S")
         print(f"[{now_time}] [DEBUG-Main] {msg}")
 
@@ -45,7 +45,7 @@ def main(stop_event=None, on_track_update=None):
         ensure_asr_worker_started(queue_scroll_when_next_line_matches)
 
         print("🚀 開始監聽播放狀態... (按 Ctrl+C 停止)")
-        if config.DEBUG:
+        if config.DEBUG_POLLING:
             print("🛠️  Debug 模式已開啟，將顯示詳細的輪詢日誌。")
 
         while True:

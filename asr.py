@@ -225,7 +225,7 @@ def _asr_worker_loop(on_recognized_text):
 
             if result_text:
                 recognition_count += 1
-                if config.DEBUG:
+                if config.DEBUG_RECOGNITION:
                     print(f"🎤 [#{recognition_count}] 識別: {result_text}")
                 on_recognized_text(result_text)
 

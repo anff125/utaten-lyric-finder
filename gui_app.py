@@ -138,15 +138,25 @@ class App(ctk.CTk):
         ).pack(side="left", padx=6)
 
         row += 1
-        self.debug_var = ctk.BooleanVar(value=False)
-        debug_checkbox = ctk.CTkCheckBox(
+        self.polling_debug_var = ctk.BooleanVar(value=False)
+        polling_debug_checkbox = ctk.CTkCheckBox(
             container,
-            text="Enable Debug Logs",
-            variable=self.debug_var,
-            command=self.on_debug_changed,
+            text="Enable Polling Debug Logs",
+            variable=self.polling_debug_var,
+            command=self.on_polling_debug_changed,
         )
-        debug_checkbox.grid(row=row, column=0, padx=8, pady=6, sticky="w")
+        polling_debug_checkbox.grid(row=row, column=0, padx=8, pady=6, sticky="w")
 
+        self.recognition_debug_var = ctk.BooleanVar(value=False)
+        recognition_debug_checkbox = ctk.CTkCheckBox(
+            container,
+            text="Enable ASR Recognition Logs",
+            variable=self.recognition_debug_var,
+            command=self.on_recognition_debug_changed,
+        )
+        recognition_debug_checkbox.grid(row=row, column=1, padx=8, pady=6, sticky="w")
+
+        row += 1
         self.asr_var = ctk.BooleanVar(value=True)
         asr_checkbox = ctk.CTkCheckBox(
             container,
@@ -154,7 +164,7 @@ class App(ctk.CTk):
             variable=self.asr_var,
             command=self.on_asr_changed,
         )
-        asr_checkbox.grid(row=row, column=1, padx=8, pady=6, sticky="w")
+        asr_checkbox.grid(row=row, column=0, columnspan=2, padx=8, pady=6, sticky="w")
 
         row += 1
         ctk.CTkLabel(container, text="ASR Model").grid(
@@ -255,7 +265,8 @@ class App(ctk.CTk):
         if cached_callback_url:
             self.callback_url_entry.insert(0, cached_callback_url)
         self.source_var.set(config.AUDIO_SOURCE_MODE)
-        self.debug_var.set(config.DEBUG)
+        self.polling_debug_var.set(config.DEBUG_POLLING)
+        self.recognition_debug_var.set(config.DEBUG_RECOGNITION)
         self.asr_var.set(config.ASR_ENABLED)
         self.asr_model_var.set(config.ASR_MODEL_SIZE)
         self.asr_device_var.set(config.ASR_DEVICE)
@@ -267,7 +278,8 @@ class App(ctk.CTk):
             self.redirect_uri_entry.get(),
         )
         config.set_audio_source_mode(self.source_var.get())
-        config.set_debug(self.debug_var.get())
+        config.set_polling_debug(self.polling_debug_var.get())
+        config.set_recognition_debug(self.recognition_debug_var.get())
         config.set_asr_enabled(self.asr_var.get())
         config.set_asr_model_size(self.asr_model_var.get())
         config.set_asr_device(self.asr_device_var.get())
@@ -356,8 +368,22 @@ class App(ctk.CTk):
         except Exception as e:
             self.set_status(f"Source change failed: {e}")
 
+    def on_polling_debug_changed(self):
+        config.set_polling_debug(self.polling_debug_var.get())
+        self.set_status(f"Polling Debug: {'ON' if config.DEBUG_POLLING else 'OFF'}")
+
+    def on_recognition_debug_changed(self):
+        config.set_recognition_debug(self.recognition_debug_var.get())
+        self.set_status(
+            f"Recognition Debug: {'ON' if config.DEBUG_RECOGNITION else 'OFF'}"
+        )
+
     def on_debug_changed(self):
-        config.set_debug(self.debug_var.get())
+        config.set_debug(
+            self.polling_debug_var.get() or self.recognition_debug_var.get()
+        )
+        self.polling_debug_var.set(config.DEBUG_POLLING)
+        self.recognition_debug_var.set(config.DEBUG_RECOGNITION)
         self.set_status(f"Debug: {'ON' if config.DEBUG else 'OFF'}")
 
     def on_asr_changed(self):

@@ -31,3 +31,4 @@ lyrics_browser_profile/
 
 # PyInstaller spec
 auto_lyrics.spec
+pyrightconfig.json

@@ -27,6 +27,8 @@ ASR_BLOCK_SECONDS = 4
 SPOTIFY_POLL_SECONDS = 5
 MAIN_LOOP_SLEEP_SECONDS = 0.5
 
+DEBUG_POLLING = False
+DEBUG_RECOGNITION = False
 DEBUG = False
 # 支援: spotify / system_media
 AUDIO_SOURCE_MODE = "spotify"
@@ -39,6 +41,8 @@ _PERSISTED_KEYS = {
     "CLIENT_ID",
     "CLIENT_SECRET",
     "REDIRECT_URI",
+    "DEBUG_POLLING",
+    "DEBUG_RECOGNITION",
     "DEBUG",
     "AUDIO_SOURCE_MODE",
     "ASR_ENABLED",
@@ -80,7 +84,10 @@ def _load_runtime_settings() -> None:
     redirect_uri = data.get("REDIRECT_URI", REDIRECT_URI)
     set_spotify_credentials(client_id, client_secret, redirect_uri, persist=False)
 
-    set_debug(data.get("DEBUG", DEBUG), persist=False)
+    polling_debug = data.get("DEBUG_POLLING", data.get("DEBUG", DEBUG))
+    recognition_debug = data.get("DEBUG_RECOGNITION", data.get("DEBUG", DEBUG))
+    set_polling_debug(polling_debug, persist=False)
+    set_recognition_debug(recognition_debug, persist=False)
     set_asr_enabled(data.get("ASR_ENABLED", ASR_ENABLED), persist=False)
 
     model_size = data.get("ASR_MODEL_SIZE", ASR_MODEL_SIZE)
@@ -99,9 +106,30 @@ def _load_runtime_settings() -> None:
             pass
 
 
-def set_debug(enabled: bool, persist: bool = True) -> None:
+def _sync_debug_alias() -> None:
     global DEBUG
-    DEBUG = bool(enabled)
+    DEBUG = DEBUG_POLLING or DEBUG_RECOGNITION
+
+
+def set_polling_debug(enabled: bool, persist: bool = True) -> None:
+    global DEBUG_POLLING
+    DEBUG_POLLING = bool(enabled)
+    _sync_debug_alias()
+    if persist:
+        _save_runtime_settings()
+
+
+def set_recognition_debug(enabled: bool, persist: bool = True) -> None:
+    global DEBUG_RECOGNITION
+    DEBUG_RECOGNITION = bool(enabled)
+    _sync_debug_alias()
+    if persist:
+        _save_runtime_settings()
+
+
+def set_debug(enabled: bool, persist: bool = True) -> None:
+    set_polling_debug(enabled, persist=False)
+    set_recognition_debug(enabled, persist=False)
     if persist:
         _save_runtime_settings()
 
