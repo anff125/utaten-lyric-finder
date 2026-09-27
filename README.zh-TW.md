@@ -91,6 +91,7 @@ powershell -ExecutionPolicy Bypass -File .\build_portable.ps1 -SkipEnvBuild $tru
 ## ✨ 核心功能 (Features)
 
 - **自動偵測當前歌曲**：支援透過 Windows 系統媒體控制 (SMTC) (`system_media.py`) 或 Spotify API (`spotify_api.py`) 獲取正在播放的曲目資訊。
+- **Spotify 獨立進程收音 (Process Loopback)**：在 Windows 11 上原生支援單獨錄製 `Spotify.exe` 音訊 (`process_loopback.py`)，徹底排除遊戲、Discord、瀏覽器等其他系統雜音干擾。
 - **UtaTen 歌詞爬蟲**：自動搜尋並解析 UtaTen 網站的歌詞 (`web_scraper.py`)，特別適合獲取日文流行音樂 (J-Pop) 歌詞。
 - **AI 語音辨識與自動捲動**：內建 Whisper 模型 (`asr.py`) 分析音檔，並搭配文字匹配演算法 (`matching.py`)，在 UtaTen 頁面自動捲動到目前對應的歌詞位置。
 - **圖形化介面 (GUI)**：提供友善的使用者介面 (`gui_app.py` 與 `lyrics_browser.py`)，方便瀏覽歌詞與操作設定。
@@ -101,6 +102,7 @@ powershell -ExecutionPolicy Bypass -File .\build_portable.ps1 -SkipEnvBuild $tru
 - `gui_app.py`：圖形化主程式進入點。
 - `auto_lyrics.py`：自動化歌詞處理的核心邏輯與工作流程。
 - `asr.py`：負責音訊處理與 Whisper 語音辨識。
+- `process_loopback.py`：Windows 11 原生 WASAPI 進程級音訊捕獲模組。
 - `matching.py`：負責文本歌詞與辨識結果的匹配處理。
 - `web_scraper.py`：UtaTen 網站歌詞爬蟲模組。
 - `spotify_api.py` / `system_media.py`：獲取當前播放媒體資訊的介面。

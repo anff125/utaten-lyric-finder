@@ -17,7 +17,31 @@ RECOVERY_LOOKAHEAD_LINES = 8
 RECOVERY_THRESHOLD = 0.60
 
 ASR_ENABLED = True
-ASR_MODEL_SIZE = "large-v3"  # tiny, base, small, medium, large-v3
+ASR_MODEL_SIZE = "turbo"
+
+# ASR 模型推薦設定與硬體說明
+ASR_MODEL_MAP = {
+    "turbo (推薦首選 | VRAM >= 3GB | 速度最快)": "turbo",
+    "kotoba-whisper-v2.0 (日語專用強化 | VRAM >= 3GB)": "kotoba-tech/kotoba-whisper-v2.0-faster",
+    "large-v3 (高精準度 | VRAM >= 6GB)": "large-v3",
+    "medium (中等均衡 | VRAM >= 2GB / 效能 CPU)": "medium",
+    "small (CPU 推薦首選 | 輕量免顯卡)": "small",
+    "base (極速輕量 | 舊 CPU / 低資源)": "base",
+}
+
+
+def get_model_display_name(model_id: str) -> str:
+    """根據實際 model_id 取得 UI 顯示名稱；若找不到則回傳原字串。"""
+    for display, mid in ASR_MODEL_MAP.items():
+        if mid == model_id or display == model_id:
+            return display
+    return model_id
+
+
+def get_model_id_from_display(display_name: str) -> str:
+    """根據 UI 顯示名稱取得實際 model_id；若非預設選項則回傳原字串（支援自訂輸入）。"""
+    return ASR_MODEL_MAP.get(display_name, display_name)
+
 ASR_DEVICE = "auto"
 ASR_COMPUTE_TYPE = "default"
 ASR_LANGUAGE = "ja"
@@ -32,6 +56,8 @@ DEBUG_RECOGNITION = False
 DEBUG = False
 # 支援: spotify / system_media
 AUDIO_SOURCE_MODE = "spotify"
+# 當音源為 spotify 時，是否只錄製 Spotify 程序的獨立音訊 (Windows 11 Process Loopback)
+CAPTURE_SPOTIFY_PROCESS_ONLY = True
 
 
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -45,6 +71,7 @@ _PERSISTED_KEYS = {
     "DEBUG_RECOGNITION",
     "DEBUG",
     "AUDIO_SOURCE_MODE",
+    "CAPTURE_SPOTIFY_PROCESS_ONLY",
     "ASR_ENABLED",
     "ASR_MODEL_SIZE",
     "ASR_DEVICE",
@@ -143,7 +170,8 @@ def set_asr_enabled(enabled: bool, persist: bool = True) -> None:
 
 def set_asr_model_size(size: str, persist: bool = True) -> None:
     global ASR_MODEL_SIZE
-    ASR_MODEL_SIZE = size.strip()
+    actual_id = get_model_id_from_display(size.strip())
+    ASR_MODEL_SIZE = actual_id
     if persist:
         _save_runtime_settings()
 
@@ -161,6 +189,15 @@ def set_audio_source_mode(mode: str, persist: bool = True) -> None:
     if normalized not in {"spotify", "system_media"}:
         raise ValueError("AUDIO_SOURCE_MODE 必須是 'spotify' 或 'system_media'")
     AUDIO_SOURCE_MODE = normalized
+    if persist:
+        _save_runtime_settings()
+
+
+def set_capture_spotify_process_only(
+    enabled: bool, persist: bool = True
+) -> None:
+    global CAPTURE_SPOTIFY_PROCESS_ONLY
+    CAPTURE_SPOTIFY_PROCESS_ONLY = bool(enabled)
     if persist:
         _save_runtime_settings()
 

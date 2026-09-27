@@ -55,7 +55,7 @@ jobs:
       - name: Runtime smoke test
         shell: pwsh
         run: |
-          python -c "import tkinter; import customtkinter; import spotify_api; import web_scraper; import matching; print('[SUCCESS] runtime smoke imports loaded')"
+          python -c "import tkinter; import customtkinter; import spotify_api; import web_scraper; import matching; import process_loopback; print('[SUCCESS] runtime smoke imports loaded')"
 
       - name: Dry-run portable build script
         shell: pwsh
@@ -66,7 +66,7 @@ jobs:
           $PythonRoot = Join-Path $OutputRoot "python_env"
           New-Item -ItemType Directory -Path $PythonRoot -Force | Out-Null
 
-          ./build_portable.ps1 -SkipEnvBuild $true
+          ./build_portable.ps1 -SkipEnvBuild
 
           $ZipPath = "build\portable\utaten-lyric-finder.zip"
           if (-Not (Test-Path $ZipPath)) {

@@ -34,6 +34,17 @@ except Exception:
     sc = None
     SOUNDCARD_AVAILABLE = False
 
+try:
+    from process_loopback import (
+        SpotifyProcessAudioCapture,
+        find_spotify_process_id,
+        is_process_loopback_supported,
+    )
+
+    PROCESS_LOOPBACK_AVAILABLE = is_process_loopback_supported()
+except Exception:
+    PROCESS_LOOPBACK_AVAILABLE = False
+
 _asr_thread = None
 _asr_started = False
 _asr_disabled_logged = False
@@ -232,108 +243,224 @@ def _asr_worker_loop(on_recognized_text):
         except Exception as e:
             print(f"⚠️ Whisper 辨識發生內部錯誤: {e}")
 
-    if PYAUDIO_LOOPBACK_AVAILABLE:
-        if pyaudio is None:
-            return
-        pyaudio_mod = cast(Any, pyaudio)
-        pa = pyaudio_mod.PyAudio()
-        stream = None
-        try:
-            wasapi_info = pa.get_host_api_info_by_type(pyaudio_mod.paWASAPI)
-            device = pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+    def _run_spotify_process_loop():
+        nonlocal source_name
+        last_missing_logged = 0.0
+        capture = SpotifyProcessAudioCapture(target_sample_rate=sample_rate)
 
-            if not device.get("isLoopbackDevice", False):
-                for loopback in pa.get_loopback_device_info_generator():
-                    if device["name"] in loopback["name"]:
-                        device = loopback
+        try:
+            while True:
+                if (
+                    config.AUDIO_SOURCE_MODE != "spotify"
+                    or not getattr(config, "CAPTURE_SPOTIFY_PROCESS_ONLY", True)
+                ):
+                    capture.stop()
+                    return
+
+                if not capture.is_target_alive():
+                    capture.stop()
+                    pid = find_spotify_process_id()
+                    if pid is None:
+                        now = time.time()
+                        if now - last_missing_logged > 5.0:
+                            print("🎧 [Process Loopback] 等待 Spotify 啟動中...")
+                            last_missing_logged = now
+                        time.sleep(1.0)
+                        continue
+
+                    if not capture.start(pid):
+                        now = time.time()
+                        if now - last_missing_logged > 5.0:
+                            print(
+                                f"⚠️ [Process Loopback] 初始化 Spotify 音訊捕獲失敗 (PID={pid})，重試中..."
+                            )
+                            last_missing_logged = now
+                        time.sleep(1.0)
+                        continue
+
+                    source_name = f"Spotify.exe (PID: {pid})"
+                    print(f"🎙️ ASR 已啟動，來源: {source_name} [獨立進程 Loopback]")
+                    print(
+                        f"🔊 開始錄音，使用滑動視窗 (大小: {block_seconds}s, 步進: {step_seconds}s)..."
+                    )
+
+                audio_buffer = np.zeros(block_frames, dtype=np.float32)
+                buffered_frames = 0
+
+                while capture.is_target_alive():
+                    if (
+                        config.AUDIO_SOURCE_MODE != "spotify"
+                        or not getattr(config, "CAPTURE_SPOTIFY_PROCESS_ONLY", True)
+                    ):
+                        capture.stop()
+                        return
+
+                    mono_step = capture.read_audio_step(
+                        step_frames=step_frames,
+                        timeout_ms=int(step_seconds * 1500),
+                    )
+                    audio_buffer = _advance_sliding_window(
+                        audio_buffer, mono_step, step_frames
+                    )
+                    buffered_frames = min(
+                        block_frames, buffered_frames + step_frames
+                    )
+
+                    if buffered_frames >= block_frames:
+                        _process_audio_chunk(audio_buffer.copy())
+
+                capture.stop()
+        finally:
+            capture.stop()
+
+    def _run_default_loopback_loop():
+        nonlocal source_name
+
+        if PYAUDIO_LOOPBACK_AVAILABLE and pyaudio is not None:
+            pyaudio_mod = cast(Any, pyaudio)
+            pa = pyaudio_mod.PyAudio()
+            stream = None
+            try:
+                wasapi_info = pa.get_host_api_info_by_type(pyaudio_mod.paWASAPI)
+                device = pa.get_device_info_by_index(
+                    wasapi_info["defaultOutputDevice"]
+                )
+
+                if not device.get("isLoopbackDevice", False):
+                    for loopback in pa.get_loopback_device_info_generator():
+                        if device["name"] in loopback["name"]:
+                            device = loopback
+                            break
+
+                device_rate = int(device["defaultSampleRate"])
+                device_channels = max(
+                    1, min(2, int(device.get("maxInputChannels", 1)))
+                )
+                frames_per_buffer = max(512, int(device_rate * step_seconds))
+                source_name = device["name"]
+
+                stream = pa.open(
+                    format=pyaudio_mod.paFloat32,
+                    channels=device_channels,
+                    rate=device_rate,
+                    input=True,
+                    frames_per_buffer=frames_per_buffer,
+                    input_device_index=int(device["index"]),
+                )
+
+                print(f"🎙️ ASR 已啟動，來源: {source_name} [全系統混音 Loopback]")
+                print(
+                    f"🔊 開始錄音，使用滑動視窗 (大小: {block_seconds}s, 步進: {step_seconds}s)..."
+                )
+
+                audio_buffer = np.zeros(block_frames, dtype=np.float32)
+                buffered_frames = 0
+
+                while True:
+                    if (
+                        config.AUDIO_SOURCE_MODE == "spotify"
+                        and getattr(
+                            config, "CAPTURE_SPOTIFY_PROCESS_ONLY", True
+                        )
+                        and PROCESS_LOOPBACK_AVAILABLE
+                    ):
                         break
 
-            device_rate = int(device["defaultSampleRate"])
-            device_channels = max(1, min(2, int(device.get("maxInputChannels", 1))))
-            frames_per_buffer = max(512, int(device_rate * step_seconds))
-            source_name = device["name"]
+                    raw = stream.read(
+                        frames_per_buffer, exception_on_overflow=False
+                    )
+                    data = np.frombuffer(raw, dtype=np.float32)
+                    if device_channels > 1:
+                        data = data.reshape(-1, device_channels)[:, 0]
 
-            stream = pa.open(
-                format=pyaudio_mod.paFloat32,
-                channels=device_channels,
-                rate=device_rate,
-                input=True,
-                frames_per_buffer=frames_per_buffer,
-                input_device_index=int(device["index"]),
-            )
+                    mono = _resample_if_needed(data, device_rate, sample_rate)
+                    audio_buffer = _advance_sliding_window(
+                        audio_buffer, mono, step_frames
+                    )
+                    buffered_frames = min(
+                        block_frames, buffered_frames + step_frames
+                    )
 
-            print(f"🎙️ ASR 已啟動，來源: {source_name}")
+                    if buffered_frames >= block_frames:
+                        _process_audio_chunk(audio_buffer.copy())
+            finally:
+                if stream is not None:
+                    stream.stop_stream()
+                    stream.close()
+                pa.terminate()
+            return
+
+        if sc is not None:
+            speaker = sc.default_speaker()
+            if speaker is None:
+                print("ℹ️ 未啟用 ASR：找不到預設喇叭(loopback來源)")
+                time.sleep(2.0)
+                return
+
+            loopback_mic = None
+            try:
+                loopback_mic = sc.get_microphone(
+                    speaker.id, include_loopback=True
+                )
+            except Exception:
+                pass
+
+            if loopback_mic is None:
+                for mic in sc.all_microphones(include_loopback=True):
+                    if speaker.name in mic.name:
+                        loopback_mic = mic
+                        break
+
+            if loopback_mic is None:
+                print("ℹ️ 未啟用 ASR：找不到對應的 loopback 錄音裝置")
+                time.sleep(2.0)
+                return
+
+            print(f"🎙️ ASR 已啟動，來源: {speaker.name} [全系統混音 Loopback]")
             print(
                 f"🔊 開始錄音，使用滑動視窗 (大小: {block_seconds}s, 步進: {step_seconds}s)..."
             )
-
             audio_buffer = np.zeros(block_frames, dtype=np.float32)
             buffered_frames = 0
+            with loopback_mic.recorder(
+                samplerate=sample_rate,
+                channels=1,
+                blocksize=step_frames,
+            ) as recorder:
+                while True:
+                    if (
+                        config.AUDIO_SOURCE_MODE == "spotify"
+                        and getattr(
+                            config, "CAPTURE_SPOTIFY_PROCESS_ONLY", True
+                        )
+                        and PROCESS_LOOPBACK_AVAILABLE
+                    ):
+                        break
 
-            while True:
-                raw = stream.read(frames_per_buffer, exception_on_overflow=False)
-                data = np.frombuffer(raw, dtype=np.float32)
-                if device_channels > 1:
-                    data = data.reshape(-1, device_channels)[:, 0]
+                    data = recorder.record(numframes=step_frames)
+                    if data.ndim > 1:
+                        data = data[:, 0]
 
-                mono = _resample_if_needed(data, device_rate, sample_rate)
-                audio_buffer = _advance_sliding_window(audio_buffer, mono, step_frames)
-                buffered_frames = min(block_frames, buffered_frames + step_frames)
+                    audio_buffer = _advance_sliding_window(
+                        audio_buffer, data, step_frames
+                    )
+                    buffered_frames = min(
+                        block_frames, buffered_frames + step_frames
+                    )
 
-                if buffered_frames >= block_frames:
-                    _process_audio_chunk(audio_buffer.copy())
-        finally:
-            if stream is not None:
-                stream.stop_stream()
-                stream.close()
-            pa.terminate()
-        return
+                    if buffered_frames >= block_frames:
+                        _process_audio_chunk(audio_buffer.copy())
 
-    if sc is None:
-        return
+    while True:
+        mode = config.AUDIO_SOURCE_MODE
+        spotify_only = getattr(config, "CAPTURE_SPOTIFY_PROCESS_ONLY", True)
 
-    speaker = sc.default_speaker()
-    if speaker is None:
-        print("ℹ️ 未啟用 ASR：找不到預設喇叭(loopback來源)")
-        return
+        if mode == "spotify" and spotify_only and PROCESS_LOOPBACK_AVAILABLE:
+            _run_spotify_process_loop()
+        else:
+            _run_default_loopback_loop()
 
-    loopback_mic = None
-    try:
-        loopback_mic = sc.get_microphone(speaker.id, include_loopback=True)
-    except Exception:
-        pass
-
-    if loopback_mic is None:
-        for mic in sc.all_microphones(include_loopback=True):
-            if speaker.name in mic.name:
-                loopback_mic = mic
-                break
-
-    if loopback_mic is None:
-        print("ℹ️ 未啟用 ASR：找不到對應的 loopback 錄音裝置")
-        return
-
-    print(f"🎙️ ASR 已啟動，來源: {speaker.name}")
-    print(
-        f"🔊 開始錄音，使用滑動視窗 (大小: {block_seconds}s, 步進: {step_seconds}s)..."
-    )
-    audio_buffer = np.zeros(block_frames, dtype=np.float32)
-    buffered_frames = 0
-    with loopback_mic.recorder(
-        samplerate=sample_rate,
-        channels=1,
-        blocksize=step_frames,
-    ) as recorder:
-        while True:
-            data = recorder.record(numframes=step_frames)
-            if data.ndim > 1:
-                data = data[:, 0]
-
-            audio_buffer = _advance_sliding_window(audio_buffer, data, step_frames)
-            buffered_frames = min(block_frames, buffered_frames + step_frames)
-
-            if buffered_frames >= block_frames:
-                _process_audio_chunk(audio_buffer.copy())
+        time.sleep(0.5)
 
 
 def ensure_asr_worker_started(on_recognized_text):

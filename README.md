@@ -91,6 +91,7 @@ After completion, the portable folder and ZIP file will be generated under `buil
 ## ✨ Features
 
 - **Automatic current-song detection**: Supports Windows SMTC via `system_media.py` and Spotify API via `spotify_api.py`.
+- **Spotify Process Loopback**: Native Windows 11 WASAPI Process Loopback support (`process_loopback.py`) to capture audio exclusively from `Spotify.exe`, eliminating background game, Discord, and browser noise.
 - **UtaTen lyric scraping**: Automatically searches and parses lyrics from UtaTen using `web_scraper.py`, especially useful for J-Pop lyrics.
 - **ASR-driven auto-scroll**: Uses Whisper in `asr.py` and text matching in `matching.py` to scroll to the current lyric line.
 - **GUI application**: User-friendly interface implemented in `gui_app.py` and `lyrics_browser.py`.
@@ -101,6 +102,7 @@ After completion, the portable folder and ZIP file will be generated under `buil
 - `gui_app.py`: Main entry point for GUI mode.
 - `auto_lyrics.py`: Core lyric automation workflow.
 - `asr.py`: Audio processing and Whisper ASR pipeline.
+- `process_loopback.py`: Native Windows 11 WASAPI process-specific audio capture module.
 - `matching.py`: Text matching logic between ASR output and lyric lines.
 - `web_scraper.py`: UtaTen scraping module.
 - `spotify_api.py` / `system_media.py`: Current media metadata providers.

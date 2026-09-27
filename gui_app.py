@@ -138,6 +138,18 @@ class App(ctk.CTk):
         ).pack(side="left", padx=6)
 
         row += 1
+        self.spotify_process_only_var = ctk.BooleanVar(value=True)
+        self.spotify_process_only_checkbox = ctk.CTkCheckBox(
+            container,
+            text="Spotify Process Loopback (Only capture Spotify audio)",
+            variable=self.spotify_process_only_var,
+            command=self.on_spotify_process_only_changed,
+        )
+        self.spotify_process_only_checkbox.grid(
+            row=row, column=0, columnspan=2, padx=8, pady=6, sticky="w"
+        )
+
+        row += 1
         self.polling_debug_var = ctk.BooleanVar(value=False)
         polling_debug_checkbox = ctk.CTkCheckBox(
             container,
@@ -170,11 +182,13 @@ class App(ctk.CTk):
         ctk.CTkLabel(container, text="ASR Model").grid(
             row=row, column=0, padx=8, pady=6, sticky="w"
         )
-        self.asr_model_var = ctk.StringVar(value="large-v3")
+        self.asr_model_var = ctk.StringVar(
+            value=config.get_model_display_name(config.ASR_MODEL_SIZE)
+        )
         self.asr_model_combo = ctk.CTkComboBox(
             container,
             variable=self.asr_model_var,
-            values=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+            values=list(config.ASR_MODEL_MAP.keys()),
             command=self.on_asr_config_changed,
         )
         self.asr_model_combo.grid(row=row, column=1, padx=8, pady=6, sticky="ew")
@@ -265,10 +279,13 @@ class App(ctk.CTk):
         if cached_callback_url:
             self.callback_url_entry.insert(0, cached_callback_url)
         self.source_var.set(config.AUDIO_SOURCE_MODE)
+        self.spotify_process_only_var.set(config.CAPTURE_SPOTIFY_PROCESS_ONLY)
         self.polling_debug_var.set(config.DEBUG_POLLING)
         self.recognition_debug_var.set(config.DEBUG_RECOGNITION)
         self.asr_var.set(config.ASR_ENABLED)
-        self.asr_model_var.set(config.ASR_MODEL_SIZE)
+        self.asr_model_var.set(
+            config.get_model_display_name(config.ASR_MODEL_SIZE)
+        )
         self.asr_device_var.set(config.ASR_DEVICE)
 
     def _sync_config_from_ui(self):
@@ -278,6 +295,9 @@ class App(ctk.CTk):
             self.redirect_uri_entry.get(),
         )
         config.set_audio_source_mode(self.source_var.get())
+        config.set_capture_spotify_process_only(
+            self.spotify_process_only_var.get()
+        )
         config.set_polling_debug(self.polling_debug_var.get())
         config.set_recognition_debug(self.recognition_debug_var.get())
         config.set_asr_enabled(self.asr_var.get())
@@ -367,6 +387,12 @@ class App(ctk.CTk):
             )
         except Exception as e:
             self.set_status(f"Source change failed: {e}")
+
+    def on_spotify_process_only_changed(self):
+        enabled = self.spotify_process_only_var.get()
+        config.set_capture_spotify_process_only(enabled)
+        state_str = "Enabled" if enabled else "Disabled"
+        self.set_status(f"Spotify Process Loopback: {state_str}")
 
     def on_polling_debug_changed(self):
         config.set_polling_debug(self.polling_debug_var.get())

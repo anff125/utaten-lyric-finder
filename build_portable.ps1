@@ -1,10 +1,10 @@
-﻿param(
+param(
     [string]$PythonVersion = "3.11.9",
     [string]$PythonArch = "amd64",
     [string]$CudaIndexUrl = "https://download.pytorch.org/whl/cu121",
     [string]$BuildRoot = (Join-Path $PSScriptRoot "build\portable"),
     [string]$PackageName = "utaten-lyric-finder",
-    [bool]$SkipEnvBuild = $false  # 新增：控制是否跳過環境建置的參數
+    [switch]$SkipEnvBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -150,6 +150,7 @@ $filesToCopy = @(
     "gui_app.py",
     "lyrics_browser.py",
     "matching.py",
+    "process_loopback.py",
     "song_cache.py",
     "spotify_api.py",
     "system_media.py",
@@ -213,7 +214,7 @@ set "TEMP_PY=%~dp0temp_update.py"
 > "%TEMP_PY%" echo import urllib.request
 >> "%TEMP_PY%" echo import concurrent.futures
 >> "%TEMP_PY%" echo repo = 'https://raw.githubusercontent.com/anff125/utaten-lyric-finder/main/'
->> "%TEMP_PY%" echo files = ['asr.py', 'auto_lyrics.py', 'config.py', 'gui_app.py', 'lyrics_browser.py', 'matching.py', 'song_cache.py', 'spotify_api.py', 'system_media.py', 'web_scraper.py']
+>> "%TEMP_PY%" echo files = ['asr.py', 'auto_lyrics.py', 'config.py', 'gui_app.py', 'lyrics_browser.py', 'matching.py', 'process_loopback.py', 'song_cache.py', 'spotify_api.py', 'system_media.py', 'web_scraper.py']
 >> "%TEMP_PY%" echo def download(f):
 >> "%TEMP_PY%" echo     try:
 >> "%TEMP_PY%" echo         urllib.request.urlretrieve(repo+f, f)
@@ -241,9 +242,13 @@ pause
 '@
 Set-Content -LiteralPath (Join-Path $outputRoot "update.bat") -Value $updateBatContent -Encoding UTF8
 
-Write-Section "Creating ZIP archive using 7-Zip"
-$7zArgs = @("a", "-tzip", "-mx=5", "-mmt", $zipPath, "$outputRoot\*")
-Invoke-CheckedCommand -FilePath "7z.exe" -ArgumentList $7zArgs
+Write-Section "Creating ZIP archive"
+if (Get-Command "7z.exe" -ErrorAction SilentlyContinue) {
+    $7zArgs = @("a", "-tzip", "-mx=5", "-mmt", $zipPath, "$outputRoot\*")
+    Invoke-CheckedCommand -FilePath "7z.exe" -ArgumentList $7zArgs
+} else {
+    Compress-Archive -Path "$outputRoot\*" -DestinationPath $zipPath -Force
+}
 
 Write-Output ""
 Write-Output "Portable package created: $zipPath"
