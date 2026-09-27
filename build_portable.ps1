@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$PythonVersion = "3.11.9",
     [string]$PythonArch = "amd64",
     [string]$CudaIndexUrl = "https://download.pytorch.org/whl/cu121",
