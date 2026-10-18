@@ -280,7 +280,7 @@ def _asr_worker_loop(on_recognized_text):
                         device="cpu",
                         compute_type="int8",
                     )
-                    print(f"✅ 已切換為 CPU 模式運作")
+                    print("✅ 已切換為 CPU 模式運作")
                 except Exception as cpu_e:
                     print(f"❌ 切換 CPU 模式失敗: {cpu_e}")
             else:
