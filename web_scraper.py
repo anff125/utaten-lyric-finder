@@ -118,67 +118,77 @@ def verify_utaten_page(url, target_artist, target_song):
 def search_utaten(artist, song, open_url_callback):
     print(f"🎵 偵測到新歌！交給 DuckDuckGo 搜尋: {artist} - {song}")
 
-    query = f"{artist} {song} utaten 歌詞"
+    search_queries = [
+        f"{artist} {song} utaten 歌詞",
+        f"site:utaten.com {artist} {song}",
+    ]
     is_testing = not getattr(sys, "frozen", False)
 
     try:
+        full_lyric_url = None
+        first_utaten_link = None
+
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, region="jp-jp", max_results=20))
-
-            if is_testing:
-                print("🔍 程式背後抓到的網址:")
-
-            full_lyric_url = None
-            first_utaten_link = None
-
-            for i, r in enumerate(results):
-                link = r.get("href", "")
+            for q_idx, query in enumerate(search_queries):
+                if q_idx > 0:
+                    print(f"🔄 一般搜尋未命中，嘗試站內語法搜尋: {query}")
+                results = list(ddgs.text(query, region="jp-jp", max_results=20))
 
                 if is_testing:
-                    print(f"  {i + 1}: {link}")
+                    print(f"🔍 程式背後抓到的網址 (查詢: {query}):")
 
-                if "utaten.com/lyric/" in link:
-                    link = normalize_utaten_url(link)
-                    if not is_utaten_lyric_detail_url(link):
-                        if is_testing:
-                            print("  ⏭️ 跳過非單曲歌詞頁網址")
-                        continue
-
-                    if first_utaten_link is None:
-                        first_utaten_link = link
+                for i, r in enumerate(results):
+                    link = r.get("href", "")
 
                     if is_testing:
-                        print("  ▶️ 正在驗證此網址的內容...")
+                        print(f"  {i + 1}: {link}")
 
-                    is_match, page_artist, page_title = verify_utaten_page(
-                        link, artist, song
-                    )
+                    if "utaten.com/lyric/" in link:
+                        link = normalize_utaten_url(link)
+                        if not is_utaten_lyric_detail_url(link):
+                            if is_testing:
+                                print("  ⏭️ 跳過非單曲歌詞頁網址")
+                            continue
 
-                    if is_match:
-                        full_lyric_url = link
+                        if first_utaten_link is None:
+                            first_utaten_link = link
+
                         if is_testing:
-                            print(
-                                f"  ✅ 驗證成功: 確實是 {page_artist} 的 {page_title}"
-                            )
-                        break
-                    else:
-                        if is_testing:
-                            print(
-                                f"  ⏭️ 驗證失敗: 網頁內容為 {page_artist} - {page_title}，跳過。"
-                            )
+                            print("  ▶️ 正在驗證此網址的內容...")
 
-            if full_lyric_url:
-                print(f"✅ 找到完全吻合的 Utaten 網頁了！正在打開 {full_lyric_url}")
-                open_url_callback(full_lyric_url, "perfect")  # 👈 新增狀態 "perfect"
-            elif first_utaten_link:
-                print("⚠️ 找不到名稱完全吻合的結果 (可能是羅馬音/日文差異)。")
-                print("👉 信任搜尋引擎，為你開啟第一個 Utaten 結果當作備案！")
-                open_url_callback(first_utaten_link, "partial")  # 👈 新增狀態 "partial"
-            else:
-                print("❌ 前 20 筆結果都沒有包含 Utaten 的網址。")
-                safe_query = urllib.parse.quote(query)
-                fallback_url = f"https://www.google.com/search?q={safe_query}"
-                open_url_callback(fallback_url, "not_found")  # 👈 新增狀態 "not_found"
+                        is_match, page_artist, page_title = verify_utaten_page(
+                            link, artist, song
+                        )
+
+                        if is_match:
+                            full_lyric_url = link
+                            if is_testing:
+                                print(
+                                    f"  ✅ 驗證成功: 確實是 {page_artist} 的 {page_title}"
+                                )
+                            break
+                        else:
+                            if is_testing:
+                                print(
+                                    f"  ⏭️ 驗證失敗: 網頁內容為 {page_artist} - {page_title}，跳過。"
+                                )
+
+                if full_lyric_url:
+                    break
+
+        if full_lyric_url:
+            print(f"✅ 找到完全吻合的 Utaten 網頁了！正在打開 {full_lyric_url}")
+            open_url_callback(full_lyric_url, "perfect")  # 👈 新增狀態 "perfect"
+        elif first_utaten_link:
+            print("⚠️ 找不到名稱完全吻合的結果 (可能是羅馬音/日文差異)。")
+            print("👉 信任搜尋引擎，為你開啟第一個 Utaten 結果當作備案！")
+            open_url_callback(first_utaten_link, "partial")  # 👈 新增狀態 "partial"
+        else:
+            print("❌ 嘗試搜尋都沒有包含 Utaten 的網址。")
+            primary_query = search_queries[0]
+            safe_query = urllib.parse.quote(primary_query)
+            fallback_url = f"https://www.google.com/search?q={safe_query}"
+            open_url_callback(fallback_url, "not_found")  # 👈 新增狀態 "not_found"
 
     except Exception as e:
         print(f"⚠️ 搜尋發生錯誤: {e}")

@@ -1,13 +1,70 @@
+import ctypes
 import math  # 新增
 import os
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, cast
 
 from scipy.signal import resample_poly  # 新增
 
 import config
+
+
+def _prepare_windows_cuda_dll_paths():
+    """Register pip-installed NVIDIA DLL folders so Windows loader can resolve them."""
+    if os.name != "nt":
+        return
+
+    candidate_bases = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            candidate_bases.append(Path(meipass) / "nvidia")
+    else:
+        candidate_bases.append(Path(sys.prefix) / "Lib" / "site-packages" / "nvidia")
+        candidate_bases.append(
+            Path(__file__).resolve().parent / ".venv" / "Lib" / "site-packages" / "nvidia"
+        )
+        try:
+            import site
+
+            for sp in site.getsitepackages():
+                candidate_bases.append(Path(sp) / "nvidia")
+        except Exception:
+            pass
+
+    dll_dirs = []
+    for base in candidate_bases:
+        if not base.is_dir():
+            continue
+        for bin_dir in base.rglob("bin"):
+            if bin_dir.is_dir() and bin_dir not in dll_dirs:
+                dll_dirs.append(bin_dir)
+
+    for dll_dir in dll_dirs:
+        dir_str = str(dll_dir)
+        try:
+            os.add_dll_directory(dir_str)
+        except Exception:
+            pass
+
+        # ctranslate2 的 C++ 核心在 Windows 上依賴 PATH 尋找 cublas64_12.dll
+        current_path = os.environ.get("PATH", "")
+        if dir_str.lower() not in current_path.lower():
+            os.environ["PATH"] = dir_str + os.pathsep + current_path
+
+        # 預先加載 DLL 至進程空間，確保後續 LoadLibrary 調用直接命中
+        for dll_file in dll_dir.glob("*.dll"):
+            try:
+                ctypes.CDLL(str(dll_file))
+            except Exception:
+                pass
+
+
+# 在導入 faster_whisper / ctranslate2 前先設定好 DLL 路徑
+_prepare_windows_cuda_dll_paths()
 
 try:
     import numpy as np
@@ -51,39 +108,6 @@ _asr_started = False
 _asr_disabled_logged = False
 
 
-def _prepare_windows_cuda_dll_paths():
-    """Register pip-installed NVIDIA DLL folders so Windows loader can resolve them."""
-    if os.name != "nt":
-        return
-
-    # 判斷是否為 PyInstaller 打包後的環境
-    if getattr(sys, "frozen", False):
-        # 執行檔模式：路徑為 PyInstaller 解壓縮的暫存目錄
-        meipass = getattr(sys, "_MEIPASS", "")
-        base = os.path.join(meipass, "nvidia")
-    else:
-        # 開發模式：路徑為你的虛擬環境
-        base = os.path.join(
-            os.path.dirname(__file__), ".venv", "Lib", "site-packages", "nvidia"
-        )
-
-    dll_dirs = [
-        os.path.join(base, "cublas", "bin"),
-        os.path.join(base, "cudnn", "bin"),
-        os.path.join(base, "cuda_runtime", "bin"),
-        os.path.join(base, "cufft", "bin"),
-        os.path.join(base, "curand", "bin"),
-    ]
-
-    for dll_dir in dll_dirs:
-        if not os.path.isdir(dll_dir):
-            continue
-        try:
-            os.add_dll_directory(dll_dir)
-        except Exception as e:
-            print(f"⚠️ 無法加入 DLL 目錄 {dll_dir}: {e}")
-
-
 def _asr_worker_loop(on_recognized_text):
     global _asr_disabled_logged
 
@@ -112,17 +136,24 @@ def _asr_worker_loop(on_recognized_text):
             device=config.ASR_DEVICE,
             compute_type=config.ASR_COMPUTE_TYPE,
         )
+
+        # 暖身推理以確認 CUDA / cuBLAS 真正可用（若缺少 DLL 或 GPU 異常，在此立即攔截並 fallback）
+        dummy_audio = np.zeros(16000, dtype=np.float32)
+        warmup_segs, _ = model.transcribe(dummy_audio, language="ja")
+        _ = list(warmup_segs)
+
         print(f"✅ Whisper-{config.ASR_MODEL_SIZE} 模型已加載")
     except Exception as e:
         error_text = str(e)
         # If CUDA runtime/DLL is not available, retry once on CPU to keep ASR usable.
         if (
-            "cublas64_12.dll" in error_text
+            "cublas" in error_text.lower()
             or "cudnn" in error_text.lower()
             or "cannot be loaded" in error_text.lower()
             or "loadlibrary" in error_text.lower()
+            or "cuda" in error_text.lower()
         ):
-            print(f"⚠️ GPU 載入失敗，改用 CPU 模式重試: {e}")
+            print(f"⚠️ GPU 載入或推理失敗，改用 CPU 模式重試: {e}")
             try:
                 model = WhisperModel(
                     model_size_or_path=config.ASR_MODEL_SIZE,
@@ -215,12 +246,10 @@ def _asr_worker_loop(on_recognized_text):
                     segment.text for segment in segments if segment and segment.text
                 ).strip()
             except Exception as e:
+                error_text = str(e)
+                if "cublas" in error_text.lower() or "cuda" in error_text.lower():
+                    raise
                 print(f"⚠️ Whisper 迭代 segment 時發生錯誤: {e}")
-                try:
-                    problematic_segments = list(segments)
-                    print(f"🕵️ 問題 segments 內容: {problematic_segments}")
-                except Exception as list_e:
-                    print(f"無法將 segments 轉換為列表: {list_e}")
                 result_text = ""
 
             # 新增：過濾常見的 Whisper 幻覺字眼
@@ -242,7 +271,20 @@ def _asr_worker_loop(on_recognized_text):
                 on_recognized_text(result_text)
 
         except Exception as e:
-            print(f"⚠️ Whisper 辨識發生內部錯誤: {e}")
+            error_text = str(e)
+            if "cublas" in error_text.lower() or "cuda" in error_text.lower():
+                print(f"⚠️ Whisper GPU 辨識失敗，自動降級切換至 CPU 模式: {e}")
+                try:
+                    model = WhisperModel(
+                        model_size_or_path=config.ASR_MODEL_SIZE,
+                        device="cpu",
+                        compute_type="int8",
+                    )
+                    print(f"✅ 已切換為 CPU 模式運作")
+                except Exception as cpu_e:
+                    print(f"❌ 切換 CPU 模式失敗: {cpu_e}")
+            else:
+                print(f"⚠️ Whisper 辨識發生內部錯誤: {e}")
 
     def _run_spotify_process_loop():
         nonlocal source_name

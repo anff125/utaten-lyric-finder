@@ -100,6 +100,9 @@ def _add_dll_directories() -> None:
             os.add_dll_directory(str(path))
         except Exception:
             pass
+        path_str = str(path)
+        if path_str.lower() not in os.environ.get("PATH", "").lower():
+            os.environ["PATH"] = path_str + os.pathsep + os.environ.get("PATH", "")
 
 
 _add_dll_directories()

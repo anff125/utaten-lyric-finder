@@ -152,11 +152,13 @@ def main(stop_event=None, on_track_update=None):
 
                         cached_data = get_cached_data(song_id)
 
-                        if cached_data:
+                        if cached_data and cached_data.get("status") in {
+                            "perfect",
+                            "partial",
+                        }:
                             status_icon = {
                                 "perfect": "✅",
                                 "partial": "⚠️",
-                                "not_found": "❌",
                             }.get(cached_data["status"], "❓")
                             print(
                                 f"📦 從暫存庫找到歌曲 [{status_icon} {cached_data['status']}]"
