@@ -1,11 +1,12 @@
 @echo off
+chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
 
 title UtaTen Lyric Finder (Console Mode)
 set "PYTHONUTF8=1"
 
-:: 設定 CUDA DLL 路徑
+:: Set CUDA DLL paths
 set "PYTHON_ENV_SITE=%~dp0.venv\Lib\site-packages"
 if exist "%PYTHON_ENV_SITE%\nvidia\cublas\bin" (
     set "PATH=%PYTHON_ENV_SITE%\nvidia\cublas\bin;%PYTHON_ENV_SITE%\nvidia\cudnn\bin;%PATH%"

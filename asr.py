@@ -215,7 +215,7 @@ def _asr_worker_loop(on_recognized_text):
     chunk_counter = 0  # 1. 新增：用來為音訊片段檔名標號的計數器
 
     def _process_audio_chunk(mono_float32):
-        nonlocal recognition_count, chunk_counter
+        nonlocal model, recognition_count, chunk_counter
         global _asr_disabled_logged
 
         if not config.ASR_ENABLED:
