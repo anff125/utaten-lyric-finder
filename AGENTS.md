@@ -79,3 +79,5 @@ Invoke-ScriptAnalyzer -Path ./build_portable.ps1 -EnableExit
      3. The runtime smoke test in `.github/workflows/ci.yml` (if applicable)
 3. **Bilingual Documentation**:
    - User-facing workflow or feature changes should be reflected in both `README.md` (English) and `README.zh-TW.md` (Traditional Chinese).
+4. **Auto-Commit After Completing Tasks**:
+   - Whenever code, configuration, or documentation changes are completed and all mandatory pre-commit checks (Section 3) pass, **automatically stage and create a descriptive `git commit`** without waiting for the user to ask.
