@@ -230,7 +230,9 @@ def _asr_worker_loop(on_recognized_text):
 
         volume = abs(audio_data).mean()
         if volume < 0.0001:
-            print("🔇 [系統偵測] 收到的音訊完全沒聲音，可能抓到錯誤的音效裝置！")
+            if config.DEBUG_RECOGNITION:
+                print("🔇 [靜音] 目前無音訊輸入，跳過本輪辨識。")
+            return
 
         try:
             segments, _ = model.transcribe(

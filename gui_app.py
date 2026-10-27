@@ -7,7 +7,6 @@ from urllib.parse import urlparse
 import customtkinter as ctk
 
 import config
-from auto_lyrics import main as run_auto_lyrics
 from song_cache import set_cached_data
 from spotify_api import (
     exchange_callback_url_for_token,
@@ -523,16 +522,24 @@ class App(ctk.CTk):
             self.stop_event.clear()
 
             def _run():
-                run_auto_lyrics(
-                    stop_event=self.stop_event,
-                    on_track_update=self._on_track_update_from_worker,
-                )
+                try:
+                    from auto_lyrics import main as run_auto_lyrics
+
+                    run_auto_lyrics(
+                        stop_event=self.stop_event,
+                        on_track_update=self._on_track_update_from_worker,
+                    )
+                except Exception as e:
+                    self.after(
+                        0,
+                        lambda err=e: self.set_status(f"Worker error: {err}"),
+                    )
 
             self.worker_thread = threading.Thread(target=_run, daemon=True)
             self.worker_thread.start()
             self.start_btn.configure(state="disabled")
             self.stop_btn.configure(state="normal")
-            self.set_status("Tool running")
+            self.set_status("Tool running - Waiting for music playback...")
             self.after(300, self._poll_worker_status)
         except Exception as e:
             self.set_status(f"Start failed: {e}")

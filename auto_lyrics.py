@@ -4,7 +4,6 @@ import time
 from datetime import datetime
 
 import config
-from asr import ensure_asr_worker_started
 from config import (
     MAIN_LOOP_SLEEP_SECONDS,
     SPOTIFY_POLL_SECONDS,
@@ -42,9 +41,15 @@ def main(stop_event=None, on_track_update=None):
             debug_log(f"track update callback 發生錯誤: {e}")
 
     try:
-        ensure_asr_worker_started(queue_scroll_when_next_line_matches)
+        if config.ASR_ENABLED:
+            from asr import ensure_asr_worker_started
+
+            ensure_asr_worker_started(queue_scroll_when_next_line_matches)
+        else:
+            debug_log("ASR 自動捲動功能未啟用，跳過 ASR worker 啟動。")
 
         print("🚀 開始監聽播放狀態... (按 Ctrl+C 停止)")
+        print("✨ 【系統已全部就緒】請在 Spotify 開始播放日語歌曲，將自動為您開啟歌詞網頁！")
         if config.DEBUG_POLLING:
             print("🛠️  Debug 模式已開啟，將顯示詳細的輪詢日誌。")
 
