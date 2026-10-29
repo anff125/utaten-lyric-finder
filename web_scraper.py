@@ -17,7 +17,14 @@ except Exception:
     _kakasi = None
 
 _HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Referer": "https://utaten.com/",
 }
 
 
@@ -95,9 +102,15 @@ def _romaji_to_hiragana(text):
     s = (text or "").strip().lower()
     if not s:
         return ""
-    # 先將常見英語地名/長音拼法轉為標準羅馬字以便 jaconv 轉換平假名
-    s = re.sub(r"\btokyo\b", "toukyou", s)
-    s = re.sub(r"\bosaka\b", "oosaka", s)
+    # 先將常見英語地名/外來語/長音拼法轉為日文讀音以便 jaconv 轉換平假名
+    for eng, kana in (
+        (r"\btokyo\b", "とうきょう"),
+        (r"\bosaka\b", "おおさか"),
+        (r"\blove\b", "らぶ"),
+        (r"\bsong\b", "そんぐ"),
+        (r"\bbaby\b", "べいびー"),
+    ):
+        s = re.sub(eng, kana, s)
     s = re.sub(r"\s+", "", s)
     return jaconv.kata2hira(jaconv.alphabet2kana(s))
 
@@ -109,9 +122,18 @@ def _to_phonetic_romaji(text):
     - 統一 l -> r
     - 折疊平文式常省略的長音 (ou/oo -> o, uu -> u 等) 與促音重複子音
     """
-    s = _to_hiragana(text).lower().strip()
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    if re.search(r"[a-zA-Z]", raw):
+        raw = re.sub(r"(?i)\blove\b", "らぶ", raw)
+        raw = re.sub(r"(?i)\bsong\b", "そんぐ", raw)
+        raw = re.sub(r"(?i)\bbaby\b", "べいびー", raw)
+    s = _to_hiragana(raw).lower().strip()
     if not s:
         return ""
+    # 將小寫母音假名 (ぁぃぅぇぉ) 轉為一般母音，避免 jaconv 轉出 x/l (如 べぃ -> bexi)
+    s = s.translate(str.maketrans("ぁぃぅぇぉー", "あいうえお "))
     s = jaconv.kana2alphabet(s)
     s = re.sub(r"[^a-z0-9]", "", s)
     for k, v in (
@@ -279,7 +301,10 @@ def _fetch_utaten_search_links(artist_name="", title="", sort=""):
         headers=_HTTP_HEADERS,
         timeout=5,
     )
-    if response.status_code != 200:
+    if response.status_code != 200 or not response.text.strip():
+        print(
+            f"  ⚠️ UtaTen 站內搜尋未回傳有效內容 (status={response.status_code}, len={len(response.text)})"
+        )
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
