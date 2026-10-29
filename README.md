@@ -115,7 +115,7 @@ After completion, the portable folder and ZIP file will be generated under `buil
   - Supports `kotoba-whisper-v2.0-faster` and `turbo` with polyphase resampling (`scipy.signal.resample_poly`) and sliding-window capture.
   - Two-phase lyric matching (local lookahead + lost-position recovery) with Japanese hiragana normalization (`matching.py`) and manual jump buttons on every line.
 - **UtaTen lyric scraping & smart caching**: Automatically searches and parses lyrics from UtaTen (`web_scraper.py`) and caches results in `song_cache.py` for instant loading on repeat plays.
-- **GUI & Granular Debug Logging**: User-friendly interface (`gui_app.py` and `lyrics_browser.py`) with live model/source switching and separate toggles for Polling Debug and Recognition Debug logs.
+- **GUI & Granular Debug Logging**: User-friendly interface (`gui_app.py` and `lyrics_browser.py`) with live model/source switching, manual lyric URL override, one-click **Re-search Lyrics** cache refresh, and separate toggles for Polling Debug and Recognition Debug logs.
 
 ## 📁 Project structure
 

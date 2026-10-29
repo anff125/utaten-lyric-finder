@@ -56,6 +56,7 @@ class App(ctk.CTk):
 
         self.worker_thread = None
         self.stop_event = threading.Event()
+        self.force_research_event = threading.Event()
         self.current_song_id = None
         self.current_song_name = ""
         self.current_artist_name = ""
@@ -254,13 +255,24 @@ class App(ctk.CTk):
         self.manual_url_entry.grid(row=2, column=1, padx=8, pady=4, sticky="ew")
         self.manual_url_entry.configure(state="disabled")
 
+        action_btn_frame = ctk.CTkFrame(track_frame, fg_color="transparent")
+        action_btn_frame.grid(row=3, column=1, padx=8, pady=(4, 8), sticky="w")
+
         self.update_cache_btn = ctk.CTkButton(
-            track_frame,
+            action_btn_frame,
             text="Update Cache URL",
             command=self.update_cache_url,
             state="disabled",
         )
-        self.update_cache_btn.grid(row=3, column=1, padx=8, pady=(4, 8), sticky="w")
+        self.update_cache_btn.pack(side="left", padx=(0, 8))
+
+        self.re_search_btn = ctk.CTkButton(
+            action_btn_frame,
+            text="Re-search Lyrics",
+            command=self.re_search_lyrics,
+            state="disabled",
+        )
+        self.re_search_btn.pack(side="left")
 
         row += 1
         self.status_label = ctk.CTkLabel(container, text="Ready")
@@ -346,6 +358,35 @@ class App(ctk.CTk):
             self.update_cache_btn.configure(state="disabled")
             self.manual_url_entry.configure(state="disabled")
             self.manual_url_entry.delete(0, "end")
+
+        worker_running = bool(self.worker_thread and self.worker_thread.is_alive())
+        can_research = (
+            worker_running
+            and bool(self.current_song_id)
+            and self.current_cache_status != "checking"
+        )
+        self.re_search_btn.configure(state="normal" if can_research else "disabled")
+
+        if self.current_cache_status != "checking" and str(
+            self.status_label.cget("text")
+        ).startswith("正在重新搜尋歌詞:"):
+            self.set_status(f"重新搜尋完成 ({self.current_cache_status})")
+
+    def re_search_lyrics(self):
+        if not (self.worker_thread and self.worker_thread.is_alive()):
+            self.set_status("請先啟動工具 (Start Tool) 才能重新搜尋")
+            return
+
+        if not self.current_song_id:
+            self.set_status("目前沒有偵測到歌曲，無法重新搜尋")
+            return
+
+        self.re_search_btn.configure(state="disabled")
+        self.cache_status_label.configure(text="⏳ checking")
+        self.set_status(
+            f"正在重新搜尋歌詞: {self.current_artist_name} - {self.current_song_name}..."
+        )
+        self.force_research_event.set()
 
     def update_cache_url(self):
         if self.current_cache_status not in {"partial", "not_found"}:
@@ -520,6 +561,7 @@ class App(ctk.CTk):
         try:
             self._sync_config_from_ui()
             self.stop_event.clear()
+            self.force_research_event.clear()
 
             def _run():
                 try:
@@ -528,6 +570,7 @@ class App(ctk.CTk):
                     run_auto_lyrics(
                         stop_event=self.stop_event,
                         on_track_update=self._on_track_update_from_worker,
+                        force_research_event=self.force_research_event,
                     )
                 except Exception as e:
                     self.after(
@@ -539,6 +582,8 @@ class App(ctk.CTk):
             self.worker_thread.start()
             self.start_btn.configure(state="disabled")
             self.stop_btn.configure(state="normal")
+            if self.current_song_id and self.current_cache_status != "checking":
+                self.re_search_btn.configure(state="normal")
             self.set_status("Tool running - Waiting for music playback...")
             self.after(300, self._poll_worker_status)
         except Exception as e:
@@ -551,6 +596,7 @@ class App(ctk.CTk):
 
         self.stop_event.set()
         self.stop_btn.configure(state="disabled")
+        self.re_search_btn.configure(state="disabled")
         self.set_status("Stopping tool...")
         self.after(300, self._poll_worker_status)
 
@@ -564,6 +610,7 @@ class App(ctk.CTk):
     def _on_worker_stopped(self):
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        self.re_search_btn.configure(state="disabled")
         self.set_status("Tool stopped")
 
     def on_close(self):

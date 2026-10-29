@@ -26,10 +26,11 @@ def debug_log(msg):
         print(f"[{now_time}] [DEBUG-Main] {msg}")
 
 
-def main(stop_event=None, on_track_update=None):
+def main(stop_event=None, on_track_update=None, force_research_event=None):
     sp = None
     last_source_mode = None
     last_played_song_id = None
+    last_track_info = None
     last_spotify_poll_at = 0.0
 
     def notify_track_update(payload):
@@ -59,8 +60,13 @@ def main(stop_event=None, on_track_update=None):
                 break
 
             now = time.time()
+            force_research = bool(
+                force_research_event and force_research_event.is_set()
+            )
+            if force_research and force_research_event is not None:
+                force_research_event.clear()
 
-            if now - last_spotify_poll_at >= SPOTIFY_POLL_SECONDS:
+            if force_research or (now - last_spotify_poll_at >= SPOTIFY_POLL_SECONDS):
                 debug_log("=== 開始新的狀態輪詢 ===")
                 current_track_info = None
                 system_media_ignored = False
@@ -70,6 +76,7 @@ def main(stop_event=None, on_track_update=None):
                     debug_log(f"偵測到來源切換: {last_source_mode} -> {source_mode}")
                     last_source_mode = source_mode
                     last_played_song_id = None
+                    last_track_info = None
                     if source_mode != "spotify":
                         sp = None
 
@@ -129,11 +136,19 @@ def main(stop_event=None, on_track_update=None):
                 else:
                     debug_log(f"⚠️ 未知來源模式: {source_mode}")
 
+                if current_track_info:
+                    last_track_info = current_track_info
+                elif force_research and last_track_info is not None:
+                    current_track_info = last_track_info
+                    debug_log(
+                        f"目前無即時播放曲目，使用上一筆曲目進行重新搜尋: {current_track_info['song_name']}"
+                    )
+
                 # 3. 處理偵測到的歌曲
                 if current_track_info:
                     song_id = current_track_info["id"]
 
-                    if song_id != last_played_song_id:
+                    if force_research or song_id != last_played_song_id:
                         song_name = current_track_info["song_name"]
                         artist_name = current_track_info["artist_name"]
 
@@ -150,12 +165,17 @@ def main(stop_event=None, on_track_update=None):
                             }
                         )
 
-                        print(
-                            f"\n🎧 偵測到新歌 [{current_track_info['source']}]: {artist_name} - {song_name}"
-                        )
-                        debug_log(f"準備進入快取/搜尋流程，Song ID: {song_id}")
-
-                        cached_data = get_cached_data(song_id)
+                        if force_research:
+                            print(
+                                f"\n🔄 手動觸發重新搜尋 [{current_track_info['source']}]: {artist_name} - {song_name}"
+                            )
+                            cached_data = None
+                        else:
+                            print(
+                                f"\n🎧 偵測到新歌 [{current_track_info['source']}]: {artist_name} - {song_name}"
+                            )
+                            debug_log(f"準備進入快取/搜尋流程，Song ID: {song_id}")
+                            cached_data = get_cached_data(song_id)
 
                         if cached_data and cached_data.get("status") in {
                             "perfect",

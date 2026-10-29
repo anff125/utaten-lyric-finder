@@ -118,7 +118,7 @@ powershell -ExecutionPolicy Bypass -File .\build_portable.ps1 -SkipEnvBuild $tru
   - 支援 `kotoba-whisper-v2.0-faster` 與 `turbo` 等模型，使用多相濾波重採樣 (`scipy.signal.resample_poly`) 與滑動視窗收音。
   - 內建兩階段歌詞匹配（局部前瞻 + 迷失恢復機制）與日文平假名正規化 (`matching.py`)，並支援點擊歌詞旁按鈕手動跳轉定位。
 - **UtaTen 歌詞爬蟲與智慧快取**：自動搜尋並解析 UtaTen 網站歌詞 (`web_scraper.py`)，並透過本地快取 (`song_cache.py`) 秒開已聽過的歌曲。
-- **圖形化介面與細分除錯日誌**：提供友善的 GUI (`gui_app.py` / `lyrics_browser.py`)，支援即時切換音源、模型與獨立開關「輪詢日誌 (Polling Debug)」及「辨識日誌 (Recognition Debug)」。
+- **圖形化介面與細分除錯日誌**：提供友善的 GUI (`gui_app.py` / `lyrics_browser.py`)，支援即時切換音源與模型、手動覆寫歌詞網址、一鍵重新搜尋歌詞 (**Re-search Lyrics**) 刷新快取，以及獨立開關「輪詢日誌 (Polling Debug)」及「辨識日誌 (Recognition Debug)」。
 
 ## 📁 專案架構 (Project Structure)
 
