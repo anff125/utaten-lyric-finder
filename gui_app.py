@@ -4,17 +4,31 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import cast
 from urllib.parse import urlparse
 
-import customtkinter as ctk
-
 import config
-from song_cache import set_cached_data
-from spotify_api import (
-    exchange_callback_url_for_token,
-    get_spotify_authorize_url,
-    has_valid_cached_token,
-    load_last_callback_url,
-    save_last_callback_url,
-)
+
+if __name__ == "__main__":
+    config.STARTUP_PROGRESS_ACTIVE = True
+    config.report_startup_progress(
+        0.20, "正在載入基礎設定與快取模組...", console_only=True
+    )
+
+from song_cache import set_cached_data  # noqa: E402
+
+with config.startup_progress_stage(
+    0.35, 0.60, "正在載入 Spotify API 模組...", console_only=True
+):
+    from spotify_api import (  # noqa: E402
+        exchange_callback_url_for_token,
+        get_spotify_authorize_url,
+        has_valid_cached_token,
+        load_last_callback_url,
+        save_last_callback_url,
+    )
+
+with config.startup_progress_stage(
+    0.65, 0.85, "正在載入 GUI 介面框架 (CustomTkinter)...", console_only=True
+):
+    import customtkinter as ctk  # noqa: E402
 
 
 class _CallbackHTTPServer(HTTPServer):
@@ -49,7 +63,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Utaten with Spotify Tool")
-        self.geometry("720x680")
+        self.geometry("720x710")
 
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("green")
@@ -64,6 +78,9 @@ class App(ctk.CTk):
 
         self._build_ui()
         self._load_defaults()
+        config.set_startup_progress_callback(
+            self._on_startup_progress_from_worker
+        )
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
@@ -275,9 +292,16 @@ class App(ctk.CTk):
         self.re_search_btn.pack(side="left")
 
         row += 1
+        self.progress_bar = ctk.CTkProgressBar(container)
+        self.progress_bar.grid(
+            row=row, column=0, columnspan=2, padx=8, pady=(8, 2), sticky="ew"
+        )
+        self.progress_bar.set(0.0)
+
+        row += 1
         self.status_label = ctk.CTkLabel(container, text="Ready")
         self.status_label.grid(
-            row=row, column=0, columnspan=2, padx=8, pady=6, sticky="w"
+            row=row, column=0, columnspan=2, padx=8, pady=(2, 6), sticky="w"
         )
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -317,6 +341,21 @@ class App(ctk.CTk):
 
     def set_status(self, text):
         self.status_label.configure(text=text)
+
+    def _on_startup_progress_from_worker(self, fraction: float, message: str):
+        self.after(
+            0, lambda f=fraction, m=message: self._render_startup_progress(f, m)
+        )
+
+    def _render_startup_progress(self, fraction: float, message: str):
+        self.progress_bar.set(fraction)
+        pct = int(round(fraction * 100))
+        if fraction >= 1.0:
+            self.set_status(
+                f"[{pct}%] {message} - Waiting for music playback..."
+            )
+        else:
+            self.set_status(f"[{pct}%] {message}")
 
     def _on_track_update_from_worker(self, payload):
         self.after(0, lambda p=payload: self._render_track_update(p))
@@ -562,9 +601,16 @@ class App(ctk.CTk):
             self._sync_config_from_ui()
             self.stop_event.clear()
             self.force_research_event.clear()
+            self.progress_bar.set(0.02)
+            self.set_status("[2%] 正在啟動背景監聽與語音辨識服務...")
 
             def _run():
                 try:
+                    print("\n⏳ 正在啟動背景服務與語音辨識引擎...")
+                    config.STARTUP_PROGRESS_ACTIVE = True
+                    config.report_startup_progress(
+                        0.04, "正在載入核心主程式模組..."
+                    )
                     from auto_lyrics import main as run_auto_lyrics
 
                     run_auto_lyrics(
@@ -573,6 +619,7 @@ class App(ctk.CTk):
                         force_research_event=self.force_research_event,
                     )
                 except Exception as e:
+                    config.STARTUP_PROGRESS_ACTIVE = False
                     self.after(
                         0,
                         lambda err=e: self.set_status(f"Worker error: {err}"),
@@ -584,7 +631,6 @@ class App(ctk.CTk):
             self.stop_btn.configure(state="normal")
             if self.current_song_id and self.current_cache_status != "checking":
                 self.re_search_btn.configure(state="normal")
-            self.set_status("Tool running - Waiting for music playback...")
             self.after(300, self._poll_worker_status)
         except Exception as e:
             self.set_status(f"Start failed: {e}")
@@ -611,15 +657,27 @@ class App(ctk.CTk):
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.re_search_btn.configure(state="disabled")
+        self.progress_bar.set(0.0)
         self.set_status("Tool stopped")
 
     def on_close(self):
+        config.set_startup_progress_callback(None)
         self.stop_event.set()
         self.destroy()
 
 
 def main():
+    config.report_startup_progress(
+        0.90, "正在建立主視窗介面...", console_only=True
+    )
     app = App()
+    config.report_startup_progress(
+        1.0,
+        "GUI 視窗已開啟！請在視窗點擊「Start Tool」啟動監聽。",
+        newline=True,
+        console_only=True,
+    )
+    config.STARTUP_PROGRESS_ACTIVE = False
     app.mainloop()
 
 

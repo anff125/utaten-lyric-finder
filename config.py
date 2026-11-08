@@ -1,5 +1,10 @@
+import contextlib
 import json
 import os
+import sys
+import threading
+import time
+from typing import Callable
 
 CLIENT_ID = ""
 CLIENT_SECRET = ""
@@ -41,6 +46,7 @@ def get_model_display_name(model_id: str) -> str:
 def get_model_id_from_display(display_name: str) -> str:
     """根據 UI 顯示名稱取得實際 model_id；若非預設選項則回傳原字串（支援自訂輸入）。"""
     return ASR_MODEL_MAP.get(display_name, display_name)
+
 
 ASR_DEVICE = "auto"
 ASR_COMPUTE_TYPE = "default"
@@ -211,6 +217,110 @@ def set_spotify_credentials(
     REDIRECT_URI = (redirect_uri or "").strip()
     if persist:
         _save_runtime_settings()
+
+
+STARTUP_PROGRESS_ACTIVE = False
+_startup_progress_callback: Callable[[float, str], None] | None = None
+_progress_lock = threading.Lock()
+
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
+def set_startup_progress_callback(
+    callback: Callable[[float, str], None] | None,
+) -> None:
+    global _startup_progress_callback
+    _startup_progress_callback = callback
+
+
+def _display_width(text: str) -> int:
+    width = 0
+    for ch in text:
+        code = ord(ch)
+        if code in (0x2588, 0x2591):
+            width += 1
+        elif code > 127:
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def format_console_progress_bar(
+    fraction: float, message: str, width: int = 20
+) -> str:
+    clamped = max(0.0, min(1.0, float(fraction)))
+    filled = int(round(clamped * width))
+    bar = "█" * filled + "░" * (width - filled)
+    percent = int(round(clamped * 100))
+    return f"  [{bar}] {percent:3d}% | {message}"
+
+
+def report_startup_progress(
+    fraction: float,
+    message: str,
+    *,
+    newline: bool = False,
+    console_only: bool = False,
+) -> None:
+    clamped = max(0.0, min(1.0, float(fraction)))
+    if STARTUP_PROGRESS_ACTIVE:
+        with _progress_lock:
+            line = format_console_progress_bar(clamped, message)
+            pad = max(0, 74 - _display_width(line))
+            end_char = "\n" if (newline or clamped >= 1.0) else ""
+            try:
+                sys.stdout.write(f"\r{line}{' ' * pad}{end_char}")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+    if not console_only and _startup_progress_callback is not None:
+        try:
+            _startup_progress_callback(clamped, message)
+        except Exception:
+            pass
+
+
+@contextlib.contextmanager
+def startup_progress_stage(
+    start_fraction: float,
+    max_fraction: float,
+    message: str,
+    *,
+    console_only: bool = False,
+):
+    if not STARTUP_PROGRESS_ACTIVE and (
+        console_only or _startup_progress_callback is None
+    ):
+        yield
+        return
+
+    stop_ticker = threading.Event()
+    t0 = time.perf_counter()
+    report_startup_progress(start_fraction, message, console_only=console_only)
+
+    def _ticker():
+        current = start_fraction
+        while not stop_ticker.wait(0.25):
+            elapsed = time.perf_counter() - t0
+            step = (max_fraction - current) * 0.18
+            current = min(max_fraction, current + max(0.005, step))
+            report_startup_progress(
+                current, f"{message} ({elapsed:.1f}s)", console_only=console_only
+            )
+
+    ticker_thread = threading.Thread(target=_ticker, daemon=True)
+    ticker_thread.start()
+    try:
+        yield
+    finally:
+        stop_ticker.set()
+        ticker_thread.join(timeout=0.5)
 
 
 _load_runtime_settings()

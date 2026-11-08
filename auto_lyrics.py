@@ -8,16 +8,20 @@ from config import (
     MAIN_LOOP_SLEEP_SECONDS,
     SPOTIFY_POLL_SECONDS,
 )
-from lyrics_browser import (
+
+config.report_startup_progress(0.08, "載入瀏覽器與日文分詞模組...")
+from lyrics_browser import (  # noqa: E402
     cleanup_playwright,
     flush_pending_scroll,
     open_in_dedicated_window,
     queue_scroll_when_next_line_matches,
 )
-from song_cache import get_cached_data, set_cached_data
-from spotify_api import get_spotify_client
-from system_media import get_system_media_info
-from web_scraper import search_utaten
+from song_cache import get_cached_data, set_cached_data  # noqa: E402
+from spotify_api import get_spotify_client  # noqa: E402
+
+config.report_startup_progress(0.14, "載入系統媒體與歌詞爬蟲模組...")
+from system_media import get_system_media_info  # noqa: E402
+from web_scraper import search_utaten  # noqa: E402
 
 
 def debug_log(msg):
@@ -42,12 +46,20 @@ def main(stop_event=None, on_track_update=None, force_research_event=None):
             debug_log(f"track update callback 發生錯誤: {e}")
 
     try:
-        if config.ASR_ENABLED:
-            from asr import ensure_asr_worker_started
+        config.STARTUP_PROGRESS_ACTIVE = True
+        try:
+            if config.ASR_ENABLED:
+                config.report_startup_progress(0.18, "準備啟動語音辨識引擎 (ASR)...")
+                from asr import ensure_asr_worker_started
 
-            ensure_asr_worker_started(queue_scroll_when_next_line_matches)
-        else:
-            debug_log("ASR 自動捲動功能未啟用，跳過 ASR worker 啟動。")
+                ensure_asr_worker_started(queue_scroll_when_next_line_matches)
+            else:
+                config.report_startup_progress(
+                    1.0, "系統初始化完成 (ASR 未啟用)！", newline=True
+                )
+                debug_log("ASR 自動捲動功能未啟用，跳過 ASR worker 啟動。")
+        finally:
+            config.STARTUP_PROGRESS_ACTIVE = False
 
         print("🚀 開始監聽播放狀態... (按 Ctrl+C 停止)")
         print("✨ 【系統已全部就緒】請在 Spotify 開始播放日語歌曲，將自動為您開啟歌詞網頁！")

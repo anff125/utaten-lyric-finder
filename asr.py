@@ -7,12 +7,13 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
-from scipy.signal import resample_poly  # 新增
-
 import config
 
+with config.startup_progress_stage(0.20, 0.30, "載入音訊重採樣模組 (SciPy)..."):
+    from scipy.signal import resample_poly  # 新增
 
-def _prepare_windows_cuda_dll_paths():
+
+def _prepare_windows_cuda_dll_paths(report_progress: bool = False):
     """Register pip-installed NVIDIA DLL folders so Windows loader can resolve them."""
     if os.name != "nt":
         return
@@ -43,6 +44,7 @@ def _prepare_windows_cuda_dll_paths():
             if bin_dir.is_dir() and bin_dir not in dll_dirs:
                 dll_dirs.append(bin_dir)
 
+    dll_files = []
     for dll_dir in dll_dirs:
         dir_str = str(dll_dir)
         try:
@@ -55,26 +57,40 @@ def _prepare_windows_cuda_dll_paths():
         if dir_str.lower() not in current_path.lower():
             os.environ["PATH"] = dir_str + os.pathsep + current_path
 
-        # 預先加載 DLL 至進程空間，確保後續 LoadLibrary 調用直接命中
         for dll_file in dll_dir.glob("*.dll"):
-            try:
-                ctypes.CDLL(str(dll_file))
-            except Exception:
-                pass
+            dll_files.append(dll_file)
+
+    total_dlls = len(dll_files)
+    for idx, dll_file in enumerate(dll_files, start=1):
+        if report_progress and total_dlls > 0:
+            frac = 0.30 + 0.20 * (idx / total_dlls)
+            config.report_startup_progress(
+                frac, f"預載入 CUDA 加速函式庫 ({idx}/{total_dlls})..."
+            )
+        # 預先加載 DLL 至進程空間，確保後續 LoadLibrary 調用直接命中
+        try:
+            ctypes.CDLL(str(dll_file))
+        except Exception:
+            pass
 
 
 # 在導入 faster_whisper / ctranslate2 前先設定好 DLL 路徑
-_prepare_windows_cuda_dll_paths()
+_prepare_windows_cuda_dll_paths(report_progress=True)
 
 try:
-    import numpy as np
-    from faster_whisper import WhisperModel
+    with config.startup_progress_stage(
+        0.50, 0.62, "載入 Faster-Whisper 語音辨識引擎..."
+    ):
+        import numpy as np
+        from faster_whisper import WhisperModel
 
     ASR_CORE_DEPS_AVAILABLE = True
     ASR_DEPS_ERROR = ""
 except Exception as _import_error:
     ASR_CORE_DEPS_AVAILABLE = False
     ASR_DEPS_ERROR = str(_import_error)
+
+config.report_startup_progress(0.64, "檢查系統音訊擷取裝置 (WASAPI / Loopback)...")
 
 try:
     import pyaudiowpatch as pyaudio
@@ -108,22 +124,31 @@ _asr_started = False
 _asr_disabled_logged = False
 
 
-def _asr_worker_loop(on_recognized_text):
+def _asr_worker_loop(
+    on_recognized_text, init_done_event: threading.Event | None = None
+):
     global _asr_disabled_logged
-
-    print("ℹ️  ASR worker 啟動中...")
 
     _prepare_windows_cuda_dll_paths()
 
     if not ASR_CORE_DEPS_AVAILABLE:
+        config.report_startup_progress(
+            1.0, f"未啟用 ASR：缺少套件 ({ASR_DEPS_ERROR})", newline=True
+        )
         print(f"ℹ️ 未啟用 ASR：缺少套件 ({ASR_DEPS_ERROR})")
+        if init_done_event is not None:
+            init_done_event.set()
         return
 
     if not (PYAUDIO_LOOPBACK_AVAILABLE or SOUNDCARD_AVAILABLE):
+        config.report_startup_progress(
+            1.0, "未啟用 ASR：缺少音訊錄製套件", newline=True
+        )
         print("ℹ️ 未啟用 ASR：需要 pyaudiowpatch 或 soundcard 其中之一")
+        if init_done_event is not None:
+            init_done_event.set()
         return
 
-    print(f"🎧 正在加載 Whisper-{config.ASR_MODEL_SIZE} 模型...")
     try:
         # 開啟 faster-whisper 的下載進度條
         import faster_whisper.utils
@@ -131,17 +156,42 @@ def _asr_worker_loop(on_recognized_text):
 
         faster_whisper.utils.disabled_tqdm = tqdm
 
-        model = WhisperModel(
-            model_size_or_path=config.ASR_MODEL_SIZE,
-            device=config.ASR_DEVICE,
-            compute_type=config.ASR_COMPUTE_TYPE,
-        )
+        model_path = config.ASR_MODEL_SIZE
+        if not os.path.isdir(model_path):
+            try:
+                model_path = faster_whisper.utils.download_model(
+                    config.ASR_MODEL_SIZE, local_files_only=True
+                )
+            except Exception:
+                config.report_startup_progress(
+                    0.68,
+                    f"首次使用，正在下載 Whisper-{config.ASR_MODEL_SIZE} 模型...",
+                    newline=True,
+                )
+                model_path = faster_whisper.utils.download_model(
+                    config.ASR_MODEL_SIZE, local_files_only=False
+                )
+
+        with config.startup_progress_stage(
+            0.70, 0.85, f"正在加載 Whisper-{config.ASR_MODEL_SIZE} 模型..."
+        ):
+            model = WhisperModel(
+                model_size_or_path=model_path,
+                device=config.ASR_DEVICE,
+                compute_type=config.ASR_COMPUTE_TYPE,
+            )
 
         # 暖身推理以確認 CUDA / cuBLAS 真正可用（若缺少 DLL 或 GPU 異常，在此立即攔截並 fallback）
-        dummy_audio = np.zeros(16000, dtype=np.float32)
-        warmup_segs, _ = model.transcribe(dummy_audio, language="ja")
-        _ = list(warmup_segs)
+        with config.startup_progress_stage(
+            0.86, 0.98, f"正在執行 Whisper-{config.ASR_MODEL_SIZE} 暖身推理..."
+        ):
+            dummy_audio = np.zeros(16000, dtype=np.float32)
+            warmup_segs, _ = model.transcribe(dummy_audio, language="ja")
+            _ = list(warmup_segs)
 
+        config.report_startup_progress(
+            1.0, f"Whisper-{config.ASR_MODEL_SIZE} 模型已就緒！", newline=True
+        )
         print(f"✅ Whisper-{config.ASR_MODEL_SIZE} 模型已加載")
     except Exception as e:
         error_text = str(e)
@@ -153,20 +203,46 @@ def _asr_worker_loop(on_recognized_text):
             or "loadlibrary" in error_text.lower()
             or "cuda" in error_text.lower()
         ):
+            config.report_startup_progress(
+                0.88, "GPU 載入失敗，改用 CPU 模式重試...", newline=True
+            )
             print(f"⚠️ GPU 載入或推理失敗，改用 CPU 模式重試: {e}")
             try:
-                model = WhisperModel(
-                    model_size_or_path=config.ASR_MODEL_SIZE,
-                    device="cpu",
-                    compute_type="int8",
+                with config.startup_progress_stage(
+                    0.88,
+                    0.98,
+                    f"正在以 CPU 模式加載 Whisper-{config.ASR_MODEL_SIZE}...",
+                ):
+                    model = WhisperModel(
+                        model_size_or_path=config.ASR_MODEL_SIZE,
+                        device="cpu",
+                        compute_type="int8",
+                    )
+                config.report_startup_progress(
+                    1.0,
+                    f"Whisper-{config.ASR_MODEL_SIZE} (CPU 模式) 已就緒！",
+                    newline=True,
                 )
                 print(f"✅ Whisper-{config.ASR_MODEL_SIZE} 已以 CPU 模式加載")
             except Exception as cpu_e:
+                config.report_startup_progress(
+                    1.0, "CPU 模式也無法加載 Whisper 模型", newline=True
+                )
                 print(f"❌ CPU 模式也無法加載 Whisper 模型: {cpu_e}")
+                if init_done_event is not None:
+                    init_done_event.set()
                 return
         else:
+            config.report_startup_progress(
+                1.0, "無法加載 Whisper 模型", newline=True
+            )
             print(f"❌ 無法加載 Whisper 模型: {e}")
+            if init_done_event is not None:
+                init_done_event.set()
             return
+    finally:
+        if init_done_event is not None:
+            init_done_event.set()
 
     def _resample_if_needed(samples, in_rate, out_rate):
         if in_rate == out_rate:
@@ -511,13 +587,21 @@ def _asr_worker_loop(on_recognized_text):
 def ensure_asr_worker_started(on_recognized_text):
     global _asr_thread, _asr_started
 
-    if not config.ASR_ENABLED or _asr_started:
+    if not config.ASR_ENABLED:
         return
 
+    if _asr_started:
+        config.report_startup_progress(
+            1.0, f"Whisper-{config.ASR_MODEL_SIZE} 模型已就緒！", newline=True
+        )
+        return
+
+    init_done_event = threading.Event()
     _asr_thread = threading.Thread(
         target=_asr_worker_loop,
-        args=(on_recognized_text,),
+        args=(on_recognized_text, init_done_event),
         daemon=True,
     )
     _asr_thread.start()
     _asr_started = True
+    init_done_event.wait()

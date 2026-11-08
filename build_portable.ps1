@@ -173,13 +173,21 @@ if (Test-Path (Join-Path $repoRoot "_cache")) {
 Write-Section "Creating start.bat"
 $startBatContent = @'
 @echo off
+chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
-:: 設定 CUDA DLL 路徑
+title UtaTen Lyric Finder (Console Mode)
+:: Set CUDA DLL paths
 set "PYTHON_ENV_SITE=%~dp0python_env\Lib\site-packages"
 set "PATH=%PYTHON_ENV_SITE%\nvidia\cublas\bin;%PYTHON_ENV_SITE%\nvidia\cudnn\bin;%PATH%"
 set "PYTHONUTF8=1"
 set "PYTHONNOUSERSITE=1"
+
+echo ========================================================
+echo   Starting UtaTen Lyric Finder...
+echo ========================================================
+echo.
+
 "%~dp0python_env\python.exe" "%~dp0gui_app.py"
 if errorlevel 1 pause
 '@
