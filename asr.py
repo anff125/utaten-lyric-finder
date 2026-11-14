@@ -13,10 +13,71 @@ with config.startup_progress_stage(0.20, 0.30, "載入音訊重採樣模組 (Sci
     from scipy.signal import resample_poly  # 新增
 
 
+_PRELOADED_CUDA_DLLS: set[str] = set()
+_CUDA_DLL_PRIORITY_PREFIXES = (
+    (0, ("cublaslt", "nvrtc-builtins", "cudnn64", "cudnn_graph", "cudnn_ops")),
+    (1, ("cublas64", "cudnn_heuristic", "cudnn_cnn", "cudnn_adv")),
+)
+
+
+def _suppress_windows_loader_popups() -> None:
+    """Prevent Windows from showing modal Bad Image popups during DLL probing."""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        err_flags = 0x0001 | 0x8000  # SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX
+        prev_mode = kernel32.SetErrorMode(err_flags)
+        kernel32.SetErrorMode(prev_mode | err_flags)
+    except Exception:
+        pass
+
+
+def _cuda_dll_load_priority(dll_path: Path) -> tuple[int, str]:
+    """Return sort key so leaf CUDA DLLs load before DLLs that depend on them."""
+    lower_name = dll_path.name.lower()
+    for priority, prefixes in _CUDA_DLL_PRIORITY_PREFIXES:
+        if lower_name.startswith(prefixes):
+            return (priority, lower_name)
+    return (2, lower_name)
+
+
+def _preload_cuda_dll(dll_file: Path, frac: float, report_progress: bool) -> None:
+    """Preload a CUDA DLL, retrying briefly if Smart App Control is scanning it."""
+    dll_key = str(dll_file)
+    if dll_key in _PRELOADED_CUDA_DLLS:
+        return
+
+    max_retries = 6
+    for attempt in range(max_retries + 1):
+        try:
+            ctypes.CDLL(dll_key)
+            _PRELOADED_CUDA_DLLS.add(dll_key)
+            return
+        except OSError as err:
+            if getattr(err, "winerror", None) != 577:
+                return
+            if attempt >= max_retries:
+                print(
+                    f"⚠️ Windows 智慧應用程式控制暫時攔截 {dll_file.name} (WinError 577)，"
+                    "稍後若 GPU 初始化失敗將自動切換至 CPU 模式。"
+                )
+                return
+            retry_num = attempt + 1
+            if report_progress:
+                config.report_startup_progress(
+                    frac,
+                    f"等待 Windows 安全性驗證 CUDA 函式庫 ({dll_file.name}, 重試 {retry_num}/{max_retries})...",
+                )
+            time.sleep(2.5)
+        except Exception:
+            return
+
+
 def _prepare_windows_cuda_dll_paths(report_progress: bool = False):
     """Register pip-installed NVIDIA DLL folders so Windows loader can resolve them."""
     if os.name != "nt":
         return
+
+    _suppress_windows_loader_popups()
 
     candidate_bases = []
     if getattr(sys, "frozen", False):
@@ -58,20 +119,22 @@ def _prepare_windows_cuda_dll_paths(report_progress: bool = False):
             os.environ["PATH"] = dir_str + os.pathsep + current_path
 
         for dll_file in dll_dir.glob("*.dll"):
-            dll_files.append(dll_file)
+            if dll_file.name.lower().endswith(".alt.dll"):
+                continue
+            if dll_file not in dll_files:
+                dll_files.append(dll_file)
+
+    dll_files.sort(key=_cuda_dll_load_priority)
 
     total_dlls = len(dll_files)
     for idx, dll_file in enumerate(dll_files, start=1):
+        frac = 0.30 + 0.20 * (idx / total_dlls) if total_dlls > 0 else 0.50
         if report_progress and total_dlls > 0:
-            frac = 0.30 + 0.20 * (idx / total_dlls)
             config.report_startup_progress(
                 frac, f"預載入 CUDA 加速函式庫 ({idx}/{total_dlls})..."
             )
         # 預先加載 DLL 至進程空間，確保後續 LoadLibrary 調用直接命中
-        try:
-            ctypes.CDLL(str(dll_file))
-        except Exception:
-            pass
+        _preload_cuda_dll(dll_file, frac, report_progress)
 
 
 # 在導入 faster_whisper / ctranslate2 前先設定好 DLL 路徑
@@ -214,7 +277,7 @@ def _asr_worker_loop(
                     f"正在以 CPU 模式加載 Whisper-{config.ASR_MODEL_SIZE}...",
                 ):
                     model = WhisperModel(
-                        model_size_or_path=config.ASR_MODEL_SIZE,
+                        model_size_or_path=model_path,
                         device="cpu",
                         compute_type="int8",
                     )
@@ -354,7 +417,7 @@ def _asr_worker_loop(
                 print(f"⚠️ Whisper GPU 辨識失敗，自動降級切換至 CPU 模式: {e}")
                 try:
                     model = WhisperModel(
-                        model_size_or_path=config.ASR_MODEL_SIZE,
+                        model_size_or_path=model_path,
                         device="cpu",
                         compute_type="int8",
                     )
