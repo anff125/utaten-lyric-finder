@@ -1,10 +1,10 @@
-import threading
-import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import cast
-from urllib.parse import urlparse
+"""Legacy CustomTkinter desktop control panel (retained during Phase 1 migration)."""
 
-import config
+import threading
+from urllib.parse import urlparse
+import webbrowser
+
+from utaten_finder.core import config
 
 if __name__ == "__main__":
     config.STARTUP_PROGRESS_ACTIVE = True
@@ -12,51 +12,24 @@ if __name__ == "__main__":
         0.20, "正在載入基礎設定與快取模組...", console_only=True
     )
 
-from song_cache import set_cached_data  # noqa: E402
+from utaten_finder.lyrics.song_cache import set_cached_data  # noqa: E402
 
 with config.startup_progress_stage(
     0.35, 0.60, "正在載入 Spotify API 模組...", console_only=True
 ):
-    from spotify_api import (  # noqa: E402
+    from utaten_finder.media.spotify_api import (  # noqa: E402
         exchange_callback_url_for_token,
         get_spotify_authorize_url,
         has_valid_cached_token,
         load_last_callback_url,
         save_last_callback_url,
+        wait_for_oauth_callback,
     )
 
 with config.startup_progress_stage(
     0.65, 0.85, "正在載入 GUI 介面框架 (CustomTkinter)...", console_only=True
 ):
     import customtkinter as ctk  # noqa: E402
-
-
-class _CallbackHTTPServer(HTTPServer):
-    callback_path: str
-    callback_host: str
-    callback_url: str | None
-
-
-class _CallbackHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        server = cast(_CallbackHTTPServer, self.server)
-        if self.path.startswith(server.callback_path):
-            full_url = f"http://{server.callback_host}:{server.server_port}{self.path}"
-            server.callback_url = full_url
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(
-                "<html><body><h3>Authentication received. You can close this tab.</h3></body></html>".encode(
-                    "utf-8"
-                )
-            )
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):
-        return
 
 
 class App(ctk.CTk):
@@ -530,16 +503,9 @@ class App(ctk.CTk):
 
             def listen_callback():
                 try:
-                    server = _CallbackHTTPServer(
-                        (callback_host, callback_port), _CallbackHandler
+                    callback_url = wait_for_oauth_callback(
+                        callback_host, callback_port, callback_path, timeout=180
                     )
-                    server.callback_path = callback_path
-                    server.callback_host = callback_host
-                    server.callback_url = None
-                    server.timeout = 180
-                    server.handle_request()
-                    callback_url = server.callback_url
-                    server.server_close()
                     if callback_url:
                         self.after(0, lambda: self._on_callback_received(callback_url))
                     else:
@@ -611,7 +577,7 @@ class App(ctk.CTk):
                     config.report_startup_progress(
                         0.04, "正在載入核心主程式模組..."
                     )
-                    from auto_lyrics import main as run_auto_lyrics
+                    from utaten_finder.core.orchestrator import main as run_auto_lyrics
 
                     run_auto_lyrics(
                         stop_event=self.stop_event,

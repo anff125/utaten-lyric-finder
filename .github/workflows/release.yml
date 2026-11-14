@@ -28,14 +28,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/portable/utaten-lyric-finder/python_env
-          key: ${{ runner.os }}-portable-env-${{ hashFiles('**/requirements.txt', 'build_portable.ps1') }}
+          key: ${{ runner.os }}-portable-env-${{ hashFiles('**/requirements.txt', 'scripts/build_portable.ps1') }}
 
       - name: Build portable package
         shell: pwsh
         run: |
           # 判斷是否命中快取
           $skip = if ('${{ steps.cache-env.outputs.cache-hit }}' -eq 'true') { $true } else { $false }
-          ./build_portable.ps1 -SkipEnvBuild $skip
+          ./scripts/build_portable.ps1 -SkipEnvBuild $skip
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

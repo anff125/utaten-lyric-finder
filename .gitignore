@@ -20,14 +20,15 @@ venv/
 .vscode/
 
 # Project-specific generated data
+data/
+.cache/
+_cache/
+.ruff_cache/
 lyrics_browser_profile/
+song_cache.json
 .github/*
 !.github/workflows/
 *test*
-*cache*
-
-# Keep this source file tracked even with *cache* ignore rule
-!song_cache.py
 
 # PyInstaller spec
 auto_lyrics.spec

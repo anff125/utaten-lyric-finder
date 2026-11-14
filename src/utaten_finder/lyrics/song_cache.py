@@ -1,14 +1,16 @@
-import json
-import os
+"""Local JSON song URL cache helpers."""
 
-CACHE_FILE = "song_cache.json"
+import json
+
+from utaten_finder.core import config
 
 
 def load_cache():
     """讀取本地的歌曲暫存檔案"""
-    if os.path.exists(CACHE_FILE):
+    cache_path = config.SONG_CACHE_FILE
+    if cache_path.exists():
         try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            with open(cache_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
             print(f"⚠️ 讀取暫存檔失敗: {e}")
@@ -19,7 +21,8 @@ def load_cache():
 def save_cache(cache_data):
     """將資料寫入暫存檔案"""
     try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(config.SONG_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache_data, f, ensure_ascii=False, indent=4)
     except Exception as e:
         print(f"⚠️ 寫入暫存檔失敗: {e}")

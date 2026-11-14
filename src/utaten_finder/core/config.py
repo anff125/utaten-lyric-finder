@@ -1,10 +1,13 @@
 import contextlib
 import json
-import os
+from pathlib import Path
+import shutil
 import sys
 import threading
 import time
 from typing import Callable
+
+from utaten_finder.core.events import bus
 
 CLIENT_ID = ""
 CLIENT_SECRET = ""
@@ -65,10 +68,15 @@ AUDIO_SOURCE_MODE = "spotify"
 # 當音源為 spotify 時，是否只錄製 Spotify 程序的獨立音訊 (Windows 11 Process Loopback)
 CAPTURE_SPOTIFY_PROCESS_ONLY = True
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DATA_DIR = PROJECT_ROOT / "data"
+ASSETS_DIR = PROJECT_ROOT / "assets"
+BROWSER_PROFILE_DIR = DATA_DIR / "browser_profile"
+RUNTIME_SETTINGS_FILE = DATA_DIR / "runtime_settings.json"
+SONG_CACHE_FILE = DATA_DIR / "song_cache.json"
+SPOTIFY_TOKEN_CACHE_FILE = DATA_DIR / "spotify_token_cache"
+SPOTIFY_LAST_CALLBACK_FILE = DATA_DIR / "spotify_last_callback_url.txt"
 
-_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
-_CACHE_DIR = os.path.join(_MODULE_DIR, ".cache")
-_RUNTIME_SETTINGS_FILE = os.path.join(_CACHE_DIR, "runtime_settings.json")
 _PERSISTED_KEYS = {
     "CLIENT_ID",
     "CLIENT_SECRET",
@@ -84,15 +92,58 @@ _PERSISTED_KEYS = {
 }
 
 
-def _ensure_cache_dir() -> None:
-    os.makedirs(_CACHE_DIR, exist_ok=True)
+def _ensure_data_dir() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _migrate_legacy_data_files() -> None:
+    """Copy legacy root/.cache/_cache runtime files into data/ if not yet migrated."""
+    _ensure_data_dir()
+    legacy_mappings = (
+        (
+            RUNTIME_SETTINGS_FILE,
+            (
+                PROJECT_ROOT / ".cache" / "runtime_settings.json",
+                PROJECT_ROOT / "_cache" / "runtime_settings.json",
+            ),
+        ),
+        (
+            SPOTIFY_TOKEN_CACHE_FILE,
+            (
+                PROJECT_ROOT / ".cache" / "spotify_token_cache",
+                PROJECT_ROOT / "_cache" / "spotify_token_cache",
+            ),
+        ),
+        (
+            SPOTIFY_LAST_CALLBACK_FILE,
+            (
+                PROJECT_ROOT / ".cache" / "spotify_last_callback_url.txt",
+                PROJECT_ROOT / "_cache" / "spotify_last_callback_url.txt",
+            ),
+        ),
+        (
+            SONG_CACHE_FILE,
+            (PROJECT_ROOT / "song_cache.json",),
+        ),
+    )
+
+    for target_path, candidates in legacy_mappings:
+        if target_path.exists():
+            continue
+        for source_path in candidates:
+            if source_path.is_file():
+                try:
+                    shutil.copy2(source_path, target_path)
+                except Exception:
+                    pass
+                break
 
 
 def _save_runtime_settings() -> None:
     try:
-        _ensure_cache_dir()
+        _ensure_data_dir()
         data = {key: globals()[key] for key in _PERSISTED_KEYS}
-        with open(_RUNTIME_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        with open(RUNTIME_SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         # 設定儲存失敗時不應中斷主要流程。
@@ -100,11 +151,11 @@ def _save_runtime_settings() -> None:
 
 
 def _load_runtime_settings() -> None:
-    if not os.path.exists(_RUNTIME_SETTINGS_FILE):
+    if not RUNTIME_SETTINGS_FILE.exists():
         return
 
     try:
-        with open(_RUNTIME_SETTINGS_FILE, "r", encoding="utf-8") as f:
+        with open(RUNTIME_SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
         return
@@ -137,6 +188,12 @@ def _load_runtime_settings() -> None:
             set_audio_source_mode(mode, persist=False)
         except ValueError:
             pass
+
+    if "CAPTURE_SPOTIFY_PROCESS_ONLY" in data:
+        set_capture_spotify_process_only(
+            data.get("CAPTURE_SPOTIFY_PROCESS_ONLY", CAPTURE_SPOTIFY_PROCESS_ONLY),
+            persist=False,
+        )
 
 
 def _sync_debug_alias() -> None:
@@ -279,11 +336,13 @@ def report_startup_progress(
             except Exception:
                 pass
 
-    if not console_only and _startup_progress_callback is not None:
-        try:
-            _startup_progress_callback(clamped, message)
-        except Exception:
-            pass
+    if not console_only:
+        bus.emit("startup_progress", {"fraction": clamped, "message": message})
+        if _startup_progress_callback is not None:
+            try:
+                _startup_progress_callback(clamped, message)
+            except Exception:
+                pass
 
 
 @contextlib.contextmanager
@@ -323,4 +382,5 @@ def startup_progress_stage(
         ticker_thread.join(timeout=0.5)
 
 
+_migrate_legacy_data_files()
 _load_runtime_settings()

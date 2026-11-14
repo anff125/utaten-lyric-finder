@@ -1,0 +1,1 @@
+"""UtaTen Lyric Finder package."""

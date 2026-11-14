@@ -1,27 +1,28 @@
-# auto_lyrics.py
+"""Main playback polling and lyrics synchronization orchestrator."""
+
+from datetime import datetime
 import sys
 import time
-from datetime import datetime
 
-import config
-from config import (
+from utaten_finder.core import config, events
+from utaten_finder.core.config import (
     MAIN_LOOP_SLEEP_SECONDS,
     SPOTIFY_POLL_SECONDS,
 )
 
 config.report_startup_progress(0.08, "載入瀏覽器與日文分詞模組...")
-from lyrics_browser import (  # noqa: E402
+from utaten_finder.lyrics.browser_sync import (  # noqa: E402
     cleanup_playwright,
     flush_pending_scroll,
     open_in_dedicated_window,
     queue_scroll_when_next_line_matches,
 )
-from song_cache import get_cached_data, set_cached_data  # noqa: E402
-from spotify_api import get_spotify_client  # noqa: E402
+from utaten_finder.lyrics.song_cache import get_cached_data, set_cached_data  # noqa: E402
+from utaten_finder.media.spotify_api import get_spotify_client  # noqa: E402
 
 config.report_startup_progress(0.14, "載入系統媒體與歌詞爬蟲模組...")
-from system_media import get_system_media_info  # noqa: E402
-from web_scraper import search_utaten  # noqa: E402
+from utaten_finder.lyrics.web_scraper import search_utaten  # noqa: E402
+from utaten_finder.media.system_media import get_system_media_info  # noqa: E402
 
 
 def debug_log(msg):
@@ -38,6 +39,7 @@ def main(stop_event=None, on_track_update=None, force_research_event=None):
     last_spotify_poll_at = 0.0
 
     def notify_track_update(payload):
+        events.bus.emit("track_updated", payload)
         if not on_track_update:
             return
         try:
@@ -50,7 +52,7 @@ def main(stop_event=None, on_track_update=None, force_research_event=None):
         try:
             if config.ASR_ENABLED:
                 config.report_startup_progress(0.18, "準備啟動語音辨識引擎 (ASR)...")
-                from asr import ensure_asr_worker_started
+                from utaten_finder.audio.asr_worker import ensure_asr_worker_started
 
                 ensure_asr_worker_started(queue_scroll_when_next_line_matches)
             else:

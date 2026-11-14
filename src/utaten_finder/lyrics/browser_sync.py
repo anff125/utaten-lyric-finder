@@ -1,41 +1,27 @@
-import os
+"""Playwright browser controller synchronized via LyricSyncEngine."""
+
 import re
-import threading
-import time
-import webbrowser
 from typing import Any, Dict, List
+import webbrowser
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
-from config import (
-    ASR_BLOCK_SECONDS,
-    FUZZY_LOOKAHEAD_LINES,
-    FUZZY_NEXT_LINE_THRESHOLD,
-    PLAYWRIGHT_NAV_TIMEOUT_MS,
-    RECOVERY_LOOKAHEAD_LINES,  # 新增
-    RECOVERY_THRESHOLD,  # 新增
+from utaten_finder.core import config
+from utaten_finder.lyrics.matching import (
+    LyricSyncEngine,
+    normalize_match_text,
+    normalize_to_hiragana,
 )
-from matching import LyricsAgent, normalize_match_text, normalize_to_hiragana
-from web_scraper import is_utaten_lyric_detail_url, normalize_utaten_url
+from utaten_finder.lyrics.web_scraper import (
+    is_utaten_lyric_detail_url,
+    normalize_utaten_url,
+)
 
 _playwright = None
 _browser_context = None
 _browser_page = None
-_latest_lyrics: List[Dict[str, Any]] = []
-_current_lyric_index = -1
-_pending_scroll_targets: List[int] = []
-_pending_highlight_index = -1
-_state_lock = threading.Lock()
-_lyrics_agent = LyricsAgent()
-_last_success_normalized = ""
-_last_success_at = 0.0
-_buffer_start_at = 0.0
-
-# Ignore duplicate ASR chunks shortly after a successful match.
-DUPLICATE_RECOGNIZED_TTL_SECONDS = ASR_BLOCK_SECONDS
-
-LOOKAHEAD_SECONDS_PER_LINE = 1.5
+_sync_engine = LyricSyncEngine()
 
 LYRIC_ROOT_SELECTOR = ".lyricBody .hiragana, .lyricBody"
 LYRIC_LINE_SELECTOR = ".lyricBody .hiragana > p, .lyricBody > p, .lyricBody .hiragana span.lyric-line, .lyricBody span.lyric-line"
@@ -163,10 +149,7 @@ def update_highlight_in_browser(index):
     except Exception:
         return
 
-    locator_index = -1
-    with _state_lock:
-        if 0 <= index < len(_latest_lyrics):
-            locator_index = _latest_lyrics[index]["locator_index"]
+    locator_index = _sync_engine.get_locator_index_for_lyric(index)
 
     try:
         page.evaluate(
@@ -228,43 +211,20 @@ def _consume_manual_jump_from_browser(page):
 
 
 def _apply_manual_jump_if_needed(page):
-    global _current_lyric_index, _pending_scroll_targets, _pending_highlight_index
-    global _last_success_normalized, _last_success_at
-
     lyric_index = _consume_manual_jump_from_browser(page)
     if lyric_index is None:
         return
 
-    current_line_no = None
-    current_line_text = ""
-    next_line_no = None
-    next_line_text = ""
-
-    with _state_lock:
-        if lyric_index < 0 or lyric_index >= len(_latest_lyrics):
-            return
-
-        _current_lyric_index = lyric_index
-        _pending_scroll_targets = []
-        _pending_highlight_index = lyric_index
-        _lyrics_agent.reset()
-        _last_success_normalized = ""
-        _last_success_at = 0.0
-
-        current_line_no = lyric_index + 1
-        current_line_text = _latest_lyrics[lyric_index]["original"]
-        next_compare_index = lyric_index + 1
-        if next_compare_index < len(_latest_lyrics):
-            next_line_no = next_compare_index + 1
-            next_line_text = _latest_lyrics[next_compare_index]["original"]
-
-    if current_line_no is None:
+    jump_info = _sync_engine.apply_manual_jump(lyric_index)
+    if not jump_info:
         return
 
-    print(f"🖱️ [手動定位] 目前定位到第 {current_line_no} 行: '{current_line_text}'")
-    if next_line_no is not None:
+    print(
+        f"🖱️ [手動定位] 目前定位到第 {jump_info['current_line_no']} 行: '{jump_info['current_line_text']}'"
+    )
+    if jump_info["next_line_no"] is not None:
         print(
-            f"🔎 [比對起點] 下一次語音將從第 {next_line_no} 行開始比對: '{next_line_text}'"
+            f"🔎 [比對起點] 下一次語音將從第 {jump_info['next_line_no']} 行開始比對: '{jump_info['next_line_text']}'"
         )
     else:
         print("🔎 [比對起點] 已在最後一行，後續語音不會再往下比對")
@@ -301,12 +261,12 @@ def _dispose_browser_handles(stop_playwright=False):
 def _get_or_create_playwright_page():
     global _playwright, _browser_context, _browser_page
 
-    profile_path = os.path.abspath("./lyrics_browser_profile")
-    os.makedirs(profile_path, exist_ok=True)
+    profile_dir = config.BROWSER_PROFILE_DIR
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    profile_path = str(profile_dir)
 
     if _browser_page:
         try:
-            # 單靠 is_closed() 不夠，context 已關閉時仍可能回傳 False。
             _ = _browser_page.context.pages
             if not _browser_page.is_closed():
                 print(f"🔄 重用已開啟的頁面 (is_closed={_browser_page.is_closed()})")
@@ -331,7 +291,7 @@ def _get_or_create_playwright_page():
                 user_data_dir=profile_path,
                 channel="msedge",
                 headless=False,
-                no_viewport=True,  # 解決放大視窗留白的問題
+                no_viewport=True,
             )
             print("🌐 已啟動 Edge (persistent context)")
         except Exception as e:
@@ -339,15 +299,12 @@ def _get_or_create_playwright_page():
             _browser_context = _playwright.chromium.launch_persistent_context(
                 user_data_dir=profile_path,
                 headless=False,
-                no_viewport=True,  # 解決放大視窗留白的問題
+                no_viewport=True,
             )
             print("🌐 已啟動 Chromium (persistent context)")
 
     pages = _browser_context.pages
     _browser_page = pages[0] if pages else _browser_context.new_page()
-    # print(
-    #     f"✅ 頁面已準備 (total_pages={len(_browser_context.pages)}, closed={_browser_page.is_closed()})"
-    # )
     return _browser_page
 
 
@@ -360,7 +317,6 @@ def extract_lyrics_from_html(html_text):
     if lyrics_root is None:
         return []
 
-    # 移除所有的 rt (注音/羅馬音)
     for rt in lyrics_root.select("span.rt"):
         rt.decompose()
 
@@ -383,9 +339,7 @@ def extract_lyrics_from_current_page(page):
     paragraph_locator = page.locator(".lyricBody .hiragana > p, .lyricBody > p")
     paragraph_count = paragraph_locator.count()
 
-    # 如果找不到 <p> 標籤，代表這是只有 <br> 換行的版型
     if paragraph_count == 0:
-        # 動態注入 JS：將被 <br> 切開的文字片段包裝進 <span class="lyric-line"> 中
         page.evaluate("""() => {
             const root = document.querySelector('.lyricBody .hiragana') || document.querySelector('.lyricBody');
             if (root) {
@@ -393,7 +347,6 @@ def extract_lyrics_from_current_page(page):
                 root.innerHTML = lines.map(line => `<span class="lyric-line">${line}</span>`).join('<br/>');
             }
         }""")
-        # 將定位器改為我們自己生成的 span
         paragraph_locator = page.locator(
             ".lyricBody .hiragana span.lyric-line, .lyricBody span.lyric-line"
         )
@@ -402,9 +355,6 @@ def extract_lyrics_from_current_page(page):
     if paragraph_count > 0:
         for idx in range(paragraph_count):
             p = paragraph_locator.nth(idx)
-
-            # 使用 JS 複製節點，拔除所有 rt (注音/羅馬音) 後取得純文字
-            # 這樣可以確保不漏抓任何沒被 ruby 包住的字，同時也不會混入拼音
             line_text = p.evaluate("""(el) => {
                 let clone = el.cloneNode(true);
                 let removableNodes = clone.querySelectorAll('.rt, .manual-lyric-jump');
@@ -428,7 +378,6 @@ def extract_lyrics_from_current_page(page):
         _inject_lyrics_ui(page, lines)
         return lines
 
-    # 最壞情況的 Fallback
     html_text = page.content()
     fallback_lines = extract_lyrics_from_html(html_text)
     for idx, line_text in enumerate(fallback_lines):
@@ -444,73 +393,48 @@ def extract_lyrics_from_current_page(page):
 
 
 def scroll_to_lyric_locator(page, locator_index):
-    # 同時支援原生的 <p> 以及我們剛才動態注入的 <span class="lyric-line">
     target = page.locator(LYRIC_LINE_SELECTOR).nth(locator_index)
     if target.count() == 0:
         return False
 
-    # 改用 block: 'center' 讓目標歌詞保持在畫面正中央
     target.evaluate("el => el.scrollIntoView({ behavior: 'smooth', block: 'center' })")
     return True
 
 
 def open_in_dedicated_window(url):
-    global \
-        _latest_lyrics, \
-        _current_lyric_index, \
-        _pending_scroll_targets, \
-        _pending_highlight_index, \
-        _last_success_normalized, \
-        _last_success_at, \
-        _buffer_start_at
-
     try:
         url = normalize_utaten_url(url)
         page = _get_or_create_playwright_page()
 
-        # print(f"📄 正在導航至: {url}")
         try:
             page.goto(
                 url,
                 wait_until="domcontentloaded",
-                timeout=PLAYWRIGHT_NAV_TIMEOUT_MS,
+                timeout=config.PLAYWRIGHT_NAV_TIMEOUT_MS,
             )
         except Exception as nav_error:
-            # 使用者手動關閉瀏覽器後，舊 page/context 可能仍殘留在記憶體，重建一次再試。
             print(f"⚠️ 偵測到頁面失效，嘗試重建瀏覽器: {nav_error}")
             _dispose_browser_handles(stop_playwright=False)
             page = _get_or_create_playwright_page()
             page.goto(
                 url,
                 wait_until="domcontentloaded",
-                timeout=PLAYWRIGHT_NAV_TIMEOUT_MS,
+                timeout=config.PLAYWRIGHT_NAV_TIMEOUT_MS,
             )
-        # print(f"✅ 頁面已加載，URL: {page.url}")
 
         if is_utaten_lyric_detail_url(url):
             try:
                 page.wait_for_selector(
-                    LYRIC_ROOT_SELECTOR, timeout=PLAYWRIGHT_NAV_TIMEOUT_MS
+                    LYRIC_ROOT_SELECTOR, timeout=config.PLAYWRIGHT_NAV_TIMEOUT_MS
                 )
             except Exception as wait_error:
                 print(f"⚠️ 歌詞區塊等待逾時，略過自動捲動初始化: {wait_error}")
                 return
 
             extracted_lyrics = extract_lyrics_from_current_page(page)
+            _sync_engine.reset_with_lyrics(extracted_lyrics)
 
-            with _state_lock:
-                _latest_lyrics = extracted_lyrics
-                _current_lyric_index = -1
-                _pending_scroll_targets = []
-                _pending_highlight_index = -1
-                _lyrics_agent.reset()
-                _last_success_normalized = ""
-                _last_success_at = 0.0
-                _buffer_start_at = 0.0
-            # print(f"📝 已解析歌詞行數: {len(_latest_lyrics)}")
-            if _latest_lyrics:
-                # preview = " | ".join(line["original"] for line in _latest_lyrics[:3])
-                # print(f"📝 歌詞預覽(前三行): {preview}")
+            if extracted_lyrics:
                 first_line_scrolled = scroll_to_lyric_locator(page, 0)
                 if first_line_scrolled:
                     print("🎯 已自動定位到第一句歌詞")
@@ -524,139 +448,27 @@ def open_in_dedicated_window(url):
 
 
 def queue_scroll_when_next_line_matches(recognized_text):
-    global _current_lyric_index, _pending_scroll_targets, _pending_highlight_index
-    global _last_success_normalized, _last_success_at, _buffer_start_at
-
-    recognized_text = (recognized_text or "").strip()
-    if not recognized_text:
+    match_payload = _sync_engine.process_recognized_text(recognized_text)
+    if not match_payload:
         return
 
-    normalized_recognized = normalize_match_text(normalize_to_hiragana(recognized_text))
-    if not normalized_recognized:
-        return
-
-    with _state_lock:
-        if not _latest_lyrics:
-            return
-
-        now = time.monotonic()
-        if _last_success_normalized:
-            within_ttl = now - _last_success_at <= DUPLICATE_RECOGNIZED_TTL_SECONDS
-            is_duplicate = normalized_recognized in _last_success_normalized
-            if within_ttl and is_duplicate:
-                return
-
-        start_index = _current_lyric_index + 1
-        if start_index >= len(_latest_lyrics):
-            return
-
-        if not _lyrics_agent.asr_buffer:
-            _buffer_start_at = now
-
-        _lyrics_agent.append(normalized_recognized)
-        target_length = len(_latest_lyrics[start_index]["normalized"])
-        _lyrics_agent.trim_if_needed(target_length)
-
-        elapsed_since_success = 0.0
-        if _last_success_at > 0.0:
-            elapsed_since_success = max(0.0, now - _last_success_at)
-        elif _buffer_start_at > 0.0:
-            elapsed_since_success = max(0.0, now - _buffer_start_at)
-
-        phase1_lookahead_lines = max(
-            1,
-            min(
-                FUZZY_LOOKAHEAD_LINES,
-                int(elapsed_since_success / LOOKAHEAD_SECONDS_PER_LINE),
-            ),
-        )
-
-        # ==========================================
-        # 階段一：常規推進 (時間越久，搜尋範圍越大)
-        # ==========================================
-        end_index_phase1 = min(
-            start_index + phase1_lookahead_lines, len(_latest_lyrics) - 1
-        )
-        best_index = None
-        best_score = 0.0
-
-        for idx in range(start_index, end_index_phase1 + 1):
-            target_normalized = _latest_lyrics[idx]["normalized"]
-            score = _lyrics_agent.score(target_normalized)
-
-            if score > best_score:
-                best_score = score
-                best_index = idx
-
-        # ==========================================
-        # 階段二：迷失恢復機制 (階段一達到上限後才啟用)
-        # ==========================================
-        is_recovery = False
-        if (
-            best_score < FUZZY_NEXT_LINE_THRESHOLD
-            and phase1_lookahead_lines >= FUZZY_LOOKAHEAD_LINES
-        ):
-            start_index_phase2 = end_index_phase1 + 1
-            end_index_phase2 = min(
-                _current_lyric_index + RECOVERY_LOOKAHEAD_LINES, len(_latest_lyrics) - 1
-            )
-
-            if start_index_phase2 <= end_index_phase2:
-                for idx in range(start_index_phase2, end_index_phase2 + 1):
-                    target_normalized = _latest_lyrics[idx]["normalized"]
-                    score = _lyrics_agent.ratio_score(target_normalized)
-
-                    # 迷失恢復需要嚴格的匹配分數 (RECOVERY_THRESHOLD)
-                    if score > best_score and score >= RECOVERY_THRESHOLD:
-                        best_score = score
-                        best_index = idx
-                        is_recovery = True
-
-        # ==========================================
-        # 最終判定與執行捲動
-        # ==========================================
-        threshold_to_pass = (
-            RECOVERY_THRESHOLD if is_recovery else FUZZY_NEXT_LINE_THRESHOLD
-        )
-
-        if best_index is None or best_score < threshold_to_pass:
-            return
-
-        # 🎯 印出結果
-        target_original = _latest_lyrics[best_index]["original"]
-        target_normalized = _latest_lyrics[best_index]["normalized"]
-
-        buffer_length = len(_lyrics_agent.asr_buffer)
+    print(
+        f"\n🎤 [語音識別] 最新片段: '{match_payload['recognized_text']}' "
+        f"(累積長度: {match_payload['buffer_length']})"
+    )
+    print(
+        f"🎯 [比對成功] 歌詞: '{match_payload['target_original']}' "
+        f"(正規化: '{match_payload['target_normalized']}', 分數: {match_payload['score']:.2f})"
+    )
+    if match_payload["is_recovery"]:
         print(
-            f"\n🎤 [語音識別] 最新片段: '{recognized_text}' (累積長度: {buffer_length})"
+            f"⚠️ [迷失恢復] 成功跨越較大段落，重新定位到第 {match_payload['matched_index'] + 1} 行"
         )
-        print(
-            f"🎯 [比對成功] 歌詞: '{target_original}' (正規化: '{target_normalized}', 分數: {best_score:.2f})"
-        )
-
-        if is_recovery:
-            print(f"⚠️ [迷失恢復] 成功跨越較大段落，重新定位到第 {best_index + 1} 行")
-
-        next_display_index = min(best_index + 1, len(_latest_lyrics) - 1)
-        _pending_scroll_targets.append(
-            _latest_lyrics[next_display_index]["locator_index"]
-        )
-        _pending_highlight_index = next_display_index
-        _current_lyric_index = best_index
-        _last_success_normalized = target_normalized
-        _last_success_at = time.monotonic()
-        _buffer_start_at = 0.0
-        _lyrics_agent.reset()
 
 
 def flush_pending_scroll():
-    global _pending_scroll_targets, _pending_highlight_index
-
     page = _browser_page
-    with _state_lock:
-        has_pending_work = (
-            bool(_pending_scroll_targets) or _pending_highlight_index >= 0
-        )
+    has_pending_work = _sync_engine.has_pending_updates()
 
     if page is None:
         if has_pending_work:
@@ -670,14 +482,7 @@ def flush_pending_scroll():
 
     _apply_manual_jump_if_needed(page)
 
-    with _state_lock:
-        target_indices = list(_pending_scroll_targets)
-        _pending_scroll_targets = []
-        highlight_index = _pending_highlight_index
-        _pending_highlight_index = -1
-        if highlight_index < 0 and target_indices:
-            highlight_index = _current_lyric_index
-
+    target_indices, highlight_index = _sync_engine.consume_pending_updates()
     if not target_indices and highlight_index < 0:
         return
 

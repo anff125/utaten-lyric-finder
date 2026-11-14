@@ -2,7 +2,7 @@
     [string]$PythonVersion = "3.11.9",
     [string]$PythonArch = "amd64",
     [string]$CudaIndexUrl = "https://download.pytorch.org/whl/cu121",
-    [string]$BuildRoot = (Join-Path $PSScriptRoot "build\portable"),
+    [string]$BuildRoot = (Join-Path (Split-Path -Parent $PSScriptRoot) "build\portable"),
     [string]$PackageName = "utaten-lyric-finder",
     [switch]$SkipEnvBuild
 )
@@ -34,11 +34,15 @@ function Copy-ProjectFile {
     )
 
     if (Test-Path $SourcePath) {
+        $destDir = Split-Path -Parent $DestinationPath
+        if ($destDir -and -Not (Test-Path $destDir)) {
+            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+        }
         Copy-Item -LiteralPath $SourcePath -Destination $DestinationPath -Force
     }
 }
 
-$repoRoot = $PSScriptRoot
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $outputRoot = Join-Path $BuildRoot $PackageName
 $pythonRoot = Join-Path $outputRoot "python_env"
 $sitePackagesRoot = Join-Path $pythonRoot "Lib\site-packages"
@@ -78,7 +82,17 @@ if (-Not $SkipEnvBuild -or -Not (Test-Path $pythonRoot)) {
 
     $siteCustomizeContent = @'
 import os
+import sys
 from pathlib import Path
+
+
+def _add_src_to_path() -> None:
+    site_packages = Path(__file__).resolve().parent
+    src_dir = site_packages.parent.parent.parent / "src"
+    if src_dir.is_dir():
+        src_str = str(src_dir)
+        if src_str not in sys.path:
+            sys.path.insert(0, src_str)
 
 
 def _add_dll_directories() -> None:
@@ -105,6 +119,7 @@ def _add_dll_directories() -> None:
             os.environ["PATH"] = path_str + os.pathsep + os.environ.get("PATH", "")
 
 
+_add_src_to_path()
 _add_dll_directories()
 '@
     Set-Content -LiteralPath (Join-Path $sitePackagesRoot "sitecustomize.py") -Value $siteCustomizeContent -Encoding ASCII
@@ -141,33 +156,42 @@ else {
 # 以下步驟無論是否命中快取，每次都要執行 (更新專案代碼與打包)
 # =========================================================================
 
-Write-Section "Preparing cache and profile folders"
-New-Item -ItemType Directory -Path (Join-Path $outputRoot "_cache") -Force -ErrorAction SilentlyContinue | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $outputRoot "lyrics_browser_profile") -Force -ErrorAction SilentlyContinue | Out-Null
+Write-Section "Preparing data, assets, and profile folders"
+New-Item -ItemType Directory -Path (Join-Path $outputRoot "data") -Force -ErrorAction SilentlyContinue | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $outputRoot "data\browser_profile") -Force -ErrorAction SilentlyContinue | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $outputRoot "assets") -Force -ErrorAction SilentlyContinue | Out-Null
 
 Write-Section "Copying application files"
 $filesToCopy = @(
-    "asr.py",
-    "auto_lyrics.py",
-    "config.py",
-    "gui_app.py",
-    "lyrics_browser.py",
-    "matching.py",
-    "process_loopback.py",
-    "song_cache.py",
-    "spotify_api.py",
-    "system_media.py",
-    "web_scraper.py",
-    "requirements.txt",
-    "song_cache.json"
+    "app.py",
+    "requirements.txt"
 )
 
 foreach ($relativePath in $filesToCopy) {
     Copy-ProjectFile -SourcePath (Join-Path $repoRoot $relativePath) -DestinationPath (Join-Path $outputRoot $relativePath)
 }
 
-if (Test-Path (Join-Path $repoRoot "_cache")) {
-    Copy-Item -Path (Join-Path $repoRoot "_cache\*") -Destination (Join-Path $outputRoot "_cache") -Recurse -Force -ErrorAction SilentlyContinue
+$srcPackageRoot = Join-Path $repoRoot "src\utaten_finder"
+if (Test-Path $srcPackageRoot) {
+    Get-ChildItem -Path $srcPackageRoot -Recurse -File | Where-Object {
+        $_.FullName -notmatch "\\__pycache__\\" -and $_.Extension -ne ".pyc"
+    } | ForEach-Object {
+        $relativeSubPath = $_.FullName.Substring($repoRoot.Length).TrimStart('\')
+        Copy-ProjectFile -SourcePath $_.FullName -DestinationPath (Join-Path $outputRoot $relativeSubPath)
+    }
+}
+
+$assetsSourceRoot = Join-Path $repoRoot "assets"
+if (Test-Path $assetsSourceRoot) {
+    Get-ChildItem -Path $assetsSourceRoot -Recurse -File | ForEach-Object {
+        $relativeSubPath = $_.FullName.Substring($repoRoot.Length).TrimStart('\')
+        Copy-ProjectFile -SourcePath $_.FullName -DestinationPath (Join-Path $outputRoot $relativeSubPath)
+    }
+}
+
+$songCacheSource = Join-Path $repoRoot "data\song_cache.json"
+if (Test-Path $songCacheSource) {
+    Copy-ProjectFile -SourcePath $songCacheSource -DestinationPath (Join-Path $outputRoot "data\song_cache.json")
 }
 
 Write-Section "Creating start.bat"
@@ -182,13 +206,14 @@ set "PYTHON_ENV_SITE=%~dp0python_env\Lib\site-packages"
 set "PATH=%PYTHON_ENV_SITE%\nvidia\cublas\bin;%PYTHON_ENV_SITE%\nvidia\cudnn\bin;%PATH%"
 set "PYTHONUTF8=1"
 set "PYTHONNOUSERSITE=1"
+set "PYTHONPATH=%~dp0src"
 
 echo ========================================================
 echo   Starting UtaTen Lyric Finder...
 echo ========================================================
 echo.
 
-"%~dp0python_env\python.exe" "%~dp0gui_app.py"
+"%~dp0python_env\python.exe" "%~dp0app.py" %*
 if errorlevel 1 pause
 '@
 Set-Content -LiteralPath (Join-Path $outputRoot "start.bat") -Value $startBatContent -Encoding ASCII
@@ -222,14 +247,39 @@ echo.
 :: 2. 建立多執行緒下載的暫存 Python 腳本 (避免縮排與特殊字元問題，採用前置重定向寫法)
 set "TEMP_PY=%~dp0temp_update.py"
 
-> "%TEMP_PY%" echo import urllib.request
+> "%TEMP_PY%" echo import os
+>> "%TEMP_PY%" echo import urllib.request
 >> "%TEMP_PY%" echo import concurrent.futures
 >> "%TEMP_PY%" echo repo = 'https://raw.githubusercontent.com/anff125/utaten-lyric-finder/main/'
->> "%TEMP_PY%" echo files = ['asr.py', 'auto_lyrics.py', 'config.py', 'gui_app.py', 'lyrics_browser.py', 'matching.py', 'process_loopback.py', 'song_cache.py', 'spotify_api.py', 'system_media.py', 'web_scraper.py']
+>> "%TEMP_PY%" echo files = [
+>> "%TEMP_PY%" echo     'app.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/__init__.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/core/__init__.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/core/config.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/core/events.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/core/orchestrator.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/media/__init__.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/media/spotify_api.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/media/system_media.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/audio/__init__.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/audio/asr_worker.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/audio/cuda_loader.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/audio/process_loopback.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/__init__.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/browser_sync.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/matching.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/song_cache.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/web_scraper.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/ui/__init__.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/ui/legacy_gui.py',
+>> "%TEMP_PY%" echo ]
 >> "%TEMP_PY%" echo def download(f):
 >> "%TEMP_PY%" echo     try:
+>> "%TEMP_PY%" echo         parent = os.path.dirname(f)
+>> "%TEMP_PY%" echo         if parent:
+>> "%TEMP_PY%" echo             os.makedirs(parent, exist_ok=True)
 >> "%TEMP_PY%" echo         urllib.request.urlretrieve(repo+f, f)
->> "%TEMP_PY%" echo         print(f'[INFO] 更新 {f:20} ... 成功')
+>> "%TEMP_PY%" echo         print(f'[INFO] 更新 {f:42} ... 成功')
 >> "%TEMP_PY%" echo     except Exception as e:
 >> "%TEMP_PY%" echo         print(f'[ERROR] 更新 {f:20} ... 失敗: {e}')
 >> "%TEMP_PY%" echo with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:

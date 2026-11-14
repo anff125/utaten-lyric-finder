@@ -5,6 +5,7 @@ cd /d "%~dp0"
 
 title UtaTen Lyric Finder (Console Mode)
 set "PYTHONUTF8=1"
+set "PYTHONPATH=%~dp0src"
 
 :: Set CUDA DLL paths
 set "PYTHON_ENV_SITE=%~dp0.venv\Lib\site-packages"
@@ -17,7 +18,7 @@ echo   Starting UtaTen Lyric Finder...
 echo ========================================================
 echo.
 
-".venv\Scripts\python.exe" "gui_app.py"
+".venv\Scripts\python.exe" "app.py" %*
 
 if errorlevel 1 (
     echo.

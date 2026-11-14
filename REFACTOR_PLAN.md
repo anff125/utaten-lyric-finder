@@ -181,19 +181,19 @@ utaten-lyric-finder/
 ### Phase 1：目錄結構重構與執行期資料遷移（保持現有功能 100% 相容）
 **目標**：先把雜亂的檔案整理乾淨、分離邏輯耦合，但暫時維持現有 CustomTkinter + Playwright 正常運作，確保每一步都可驗證。
 
-- [ ] **1.1 建立目標資料夾與套件骨架**
+- [x] **1.1 建立目標資料夾與套件骨架**
   - 建立 `src/utaten_finder/{core,media,audio,lyrics,ui}/__init__.py`、`assets/`、`data/`、`scripts/`。
   - 根目錄新增 `app.py` 作為統一入口；更新 `.gitignore` 將 `data/` 列入忽略並移除不再需要的例外規則。
-- [ ] **1.2 集中設定管理與舊版資料自動遷移 (`core/config.py`, `lyrics/song_cache.py`, `media/spotify_api.py`)**
+- [x] **1.2 集中設定管理與舊版資料自動遷移 (`core/config.py`, `lyrics/song_cache.py`, `media/spotify_api.py`)**
   - 統一設定與快取目錄至 `data/`（徹底解決 `.cache` 與 `_cache` 分歧）。
   - 加入一次性遷移函式：若 `data/` 尚無對應檔案，自動從舊 `.cache/runtime_settings.json`、`.cache/spotify_token_cache`、`.cache/spotify_last_callback_url.txt` 與根目錄 `song_cache.json` 搬移或複製至 `data/`。
-- [ ] **1.3 模組拆遷與邏輯解耦**
+- [x] **1.3 模組拆遷與邏輯解耦**
   - 將 `asr.py` 拆為 `audio/cuda_loader.py`（保留 `SetErrorMode` 與 `WinError 577` 重試）與 `audio/asr_worker.py`。
   - 將 `process_loopback.py` 移至 `audio/process_loopback.py`；`system_media.py` 移至 `media/system_media.py`。
   - 將 `gui_app.py` 內的 `_CallbackHTTPServer` 移至 `media/spotify_api.py`。
   - 從 `lyrics_browser.py` 抽離 `LyricSyncEngine`（純資料狀態機，不依賴 Playwright）至 `lyrics/matching.py`。
   - 建立 `core/events.py` 統一處理啟動進度、狀態更新與日誌訂閱。
-- [ ] **1.4 同步更新建置與 CI 腳本**
+- [x] **1.4 同步更新建置與 CI 腳本**
   - 將 `build_portable.ps1` 移至 `scripts/build_portable.ps1`（維持 **UTF-8 with BOM** 與 `PSScriptAnalyzer` 零警告），更新檔案複製清單以支援 `src/`、`assets/`、`data/`。
   - 更新 `start.bat`（維持 **CRLF** 與 **UTF-8 without BOM**）呼叫 `app.py`。
   - 更新 `.github/workflows/ci.yml` 與 `AGENTS.md` 中的路徑與 Smoke Test 指令。
