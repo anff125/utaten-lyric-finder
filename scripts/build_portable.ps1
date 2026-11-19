@@ -70,7 +70,7 @@ if (-Not $SkipEnvBuild -or -Not (Test-Path $pythonRoot)) {
     New-Item -ItemType Directory -Path $sitePackagesRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $tempDownloadRoot -Force | Out-Null
 
-    Write-Section "Downloading official Python $PythonVersion (with tkinter)"
+    Write-Section "Downloading official Python $PythonVersion"
     Invoke-WebRequest -UseBasicParsing -Uri $pythonInstallerUrl -OutFile $pythonInstallerPath
 
     Write-Section "Installing Python portably to $pythonRoot"
@@ -158,7 +158,7 @@ else {
 
 Write-Section "Preparing data, assets, and profile folders"
 New-Item -ItemType Directory -Path (Join-Path $outputRoot "data") -Force -ErrorAction SilentlyContinue | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $outputRoot "data\browser_profile") -Force -ErrorAction SilentlyContinue | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $outputRoot "data\webview_profile") -Force -ErrorAction SilentlyContinue | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $outputRoot "assets") -Force -ErrorAction SilentlyContinue | Out-Null
 
 Write-Section "Copying application files"
@@ -195,28 +195,62 @@ if (Test-Path $songCacheSource) {
 }
 
 Write-Section "Creating start.bat"
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $startBatContent = @'
 @echo off
 chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
-title UtaTen Lyric Finder (Console Mode)
-:: Set CUDA DLL paths
-set "PYTHON_ENV_SITE=%~dp0python_env\Lib\site-packages"
-set "PATH=%PYTHON_ENV_SITE%\nvidia\cublas\bin;%PYTHON_ENV_SITE%\nvidia\cudnn\bin;%PATH%"
+
+set "PYTHON_EXE=%~dp0python_env\python.exe"
+set "PYTHONW_EXE=%~dp0python_env\pythonw.exe"
 set "PYTHONUTF8=1"
 set "PYTHONNOUSERSITE=1"
 set "PYTHONPATH=%~dp0src"
+set "USE_CONSOLE=0"
+set "APP_ARGS="
 
+:parse_args
+if "%~1"=="" goto after_args
+if /i "%~1"=="--console" (
+    set "USE_CONSOLE=1"
+) else (
+    if /i "%~1"=="--cli" set "USE_CONSOLE=1"
+    if /i "%~1"=="-h" set "USE_CONSOLE=1"
+    if /i "%~1"=="--help" set "USE_CONSOLE=1"
+    set "APP_ARGS=%APP_ARGS% %1"
+)
+shift
+goto parse_args
+
+:after_args
+:: Set CUDA DLL paths
+set "PYTHON_ENV_SITE=%~dp0python_env\Lib\site-packages"
+if exist "%PYTHON_ENV_SITE%\nvidia\cublas\bin" (
+    set "PATH=%PYTHON_ENV_SITE%\nvidia\cublas\bin;%PYTHON_ENV_SITE%\nvidia\cudnn\bin;%PATH%"
+)
+
+if not "%USE_CONSOLE%"=="1" if exist "%PYTHONW_EXE%" (
+    start "" "%PYTHONW_EXE%" "%~dp0app.py"%APP_ARGS%
+    exit /b 0
+)
+
+title UtaTen Lyric Finder (Console Mode)
 echo ========================================================
 echo   Starting UtaTen Lyric Finder...
 echo ========================================================
 echo.
 
-"%~dp0python_env\python.exe" "%~dp0app.py" %*
-if errorlevel 1 pause
+"%PYTHON_EXE%" "%~dp0app.py"%APP_ARGS%
+set "EXIT_CODE=%ERRORLEVEL%"
+if not "%EXIT_CODE%"=="0" (
+    echo.
+    echo [ERROR] Application exited with error code %EXIT_CODE%.
+    pause
+    exit /b %EXIT_CODE%
+)
 '@
-Set-Content -LiteralPath (Join-Path $outputRoot "start.bat") -Value $startBatContent -Encoding ASCII
+[System.IO.File]::WriteAllText((Join-Path $outputRoot "start.bat"), ($startBatContent -replace "`r?`n", "`r`n"), $utf8NoBom)
 
 Write-Section "Creating update.bat"
 $updateBatContent = @'
@@ -266,13 +300,11 @@ set "TEMP_PY=%~dp0temp_update.py"
 >> "%TEMP_PY%" echo     'src/utaten_finder/audio/cuda_loader.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/audio/process_loopback.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/__init__.py',
->> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/browser_sync.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/matching.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/parser.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/song_cache.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/web_scraper.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/ui/__init__.py',
->> "%TEMP_PY%" echo     'src/utaten_finder/ui/legacy_gui.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/ui/webview_app.py',
 >> "%TEMP_PY%" echo     'assets/web/index.html',
 >> "%TEMP_PY%" echo     'assets/web/styles.css',
@@ -306,7 +338,7 @@ echo 執行結束。
 echo ---------------------------------------
 pause
 '@
-Set-Content -LiteralPath (Join-Path $outputRoot "update.bat") -Value $updateBatContent -Encoding UTF8
+[System.IO.File]::WriteAllText((Join-Path $outputRoot "update.bat"), ($updateBatContent -replace "`r?`n", "`r`n"), $utf8NoBom)
 
 Write-Section "Creating ZIP archive"
 if (Get-Command "7z.exe" -ErrorAction SilentlyContinue) {

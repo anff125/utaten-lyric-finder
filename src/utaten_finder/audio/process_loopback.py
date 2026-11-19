@@ -552,13 +552,19 @@ class SpotifyProcessAudioCapture:
         return True
 
     def read_audio_step(
-        self, step_frames: int, timeout_ms: int = 1500
+        self,
+        step_frames: int,
+        timeout_ms: int = 1500,
+        on_packet=None,
+        stop_event: Optional[threading.Event] = None,
     ) -> np.ndarray:
         """Reads and resamples accumulated audio chunk of target step_frames (16kHz mono).
 
         Args:
             step_frames: Number of samples in target sample rate (e.g., 16kHz).
             timeout_ms: Max wait time for incoming packets.
+            on_packet: Optional callback invoked with each raw packet array (or empty array on silence).
+            stop_event: Optional threading event to abort waiting early.
 
         Returns:
             np.ndarray: float32 mono audio array with length == step_frames.
@@ -586,11 +592,17 @@ class SpotifyProcessAudioCapture:
             collected_device_frames < needed_device_frames
             and (time.time() - start_time) < max_duration_sec
         ):
+            if stop_event is not None and stop_event.is_set():
+                break
+
             # Wait for next audio event
             res = self._kernel32.WaitForSingleObject(self._h_event, 50)
             if res != 0 and res != 258:  # Not WAIT_OBJECT_0 and not WAIT_TIMEOUT
                 break
+            if stop_event is not None and stop_event.is_set():
+                break
 
+            received_packet = False
             while True:
                 hr = self._capture_client.contents.lpVtbl.contents.GetNextPacketSize(
                     self._capture_client, byref(packet_size)
@@ -612,6 +624,7 @@ class SpotifyProcessAudioCapture:
                 frames = num_frames.value
                 if frames > 0:
                     collected_device_frames += frames
+                    received_packet = True
                     if flags.value & AUDCLNT_BUFFERFLAGS_SILENT:
                         raw_samples.append(
                             np.zeros(
@@ -619,18 +632,35 @@ class SpotifyProcessAudioCapture:
                                 dtype=np.float32,
                             )
                         )
+                        if on_packet is not None:
+                            try:
+                                on_packet(np.empty(0, dtype=np.float32))
+                            except Exception:
+                                pass
                     else:
                         buf_type = ctypes.c_float * (
                             frames * self._device_channels
                         )
                         raw_buf = buf_type.from_address(p_data.value)
-                        raw_samples.append(
-                            np.ctypeslib.as_array(raw_buf).copy()
-                        )
+                        packet_arr = np.ctypeslib.as_array(raw_buf).copy()
+                        raw_samples.append(packet_arr)
+                        if on_packet is not None:
+                            try:
+                                on_packet(packet_arr)
+                            except Exception:
+                                pass
 
                 self._capture_client.contents.lpVtbl.contents.ReleaseBuffer(
                     self._capture_client, frames
                 )
+                if stop_event is not None and stop_event.is_set():
+                    break
+
+            if not received_packet and res == 258 and on_packet is not None:
+                try:
+                    on_packet(np.empty(0, dtype=np.float32))
+                except Exception:
+                    pass
 
         if not raw_samples:
             return np.zeros(step_frames, dtype=np.float32)

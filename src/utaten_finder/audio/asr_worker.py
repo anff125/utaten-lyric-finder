@@ -64,12 +64,91 @@ _asr_callback = None
 _asr_listening_active = True
 _asr_stop_event = threading.Event()
 _asr_active_device = ""
+_asr_fallback_cpu = False
+
+AUDIO_LEVEL_MIN_INTERVAL_SECONDS = 0.08
+AUDIO_METER_CHUNK_SECONDS = 0.08
+
+
+def compute_audio_level(samples: Any) -> tuple[float, float, bool]:
+    """Compute (rms, peak, silent) energy metrics in [0.0, 1.0] for VU metering."""
+    if not ASR_CORE_DEPS_AVAILABLE:
+        return (0.0, 0.0, True)
+
+    arr = np.asarray(samples, dtype=np.float32)
+    if arr.size == 0:
+        return (0.0, 0.0, True)
+
+    arr = np.clip(np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0), -1.0, 1.0)
+    rms = float(np.sqrt(np.mean(np.square(arr))))
+    peak = float(np.max(np.abs(arr)))
+    silent = rms < 0.0002 and peak < 0.001
+    return (min(1.0, max(0.0, rms)), min(1.0, max(0.0, peak)), silent)
+
+
+class AudioLevelEmitter:
+    """Throttled EventBus publisher for real-time audio VU meter readings."""
+
+    def __init__(self, min_interval: float = AUDIO_LEVEL_MIN_INTERVAL_SECONDS) -> None:
+        self._min_interval = max(0.0, float(min_interval))
+        self._last_emit_at = 0.0
+        self._last_source = ""
+        self._has_emitted = False
+
+    def emit_samples(
+        self, samples: Any, source_name: str, *, force: bool = False
+    ) -> bool:
+        rms, peak, silent = compute_audio_level(samples)
+        return self.emit_values(rms, peak, silent, source_name, force=force)
+
+    def emit_values(
+        self,
+        rms: float,
+        peak: float,
+        silent: bool,
+        source_name: str,
+        *,
+        force: bool = False,
+    ) -> bool:
+        now = time.monotonic()
+        if (
+            not force
+            and self._has_emitted
+            and source_name == self._last_source
+            and (now - self._last_emit_at) < self._min_interval
+        ):
+            return False
+
+        self._has_emitted = True
+        self._last_emit_at = now
+        self._last_source = source_name
+        clamped_rms = round(min(1.0, max(0.0, float(rms))), 4)
+        clamped_peak = round(min(1.0, max(0.0, float(peak))), 4)
+        events.bus.emit(
+            "audio_level",
+            {
+                "rms": clamped_rms,
+                "peak": clamped_peak,
+                "silent": bool(silent),
+                "source_name": source_name,
+            },
+        )
+        return True
+
+
+def _emit_silent_audio_level(source_name: str = "") -> None:
+    events.bus.emit(
+        "audio_level",
+        {"rms": 0.0, "peak": 0.0, "silent": True, "source_name": source_name},
+    )
 
 
 def set_asr_listening(active: bool) -> None:
     """Enable or pause ASR transcription without tearing down the loaded model."""
     global _asr_listening_active
     _asr_listening_active = bool(active)
+    if not _asr_listening_active:
+        _emit_silent_audio_level()
 
 
 def request_asr_stop() -> None:
@@ -77,6 +156,7 @@ def request_asr_stop() -> None:
     global _asr_listening_active
     _asr_listening_active = False
     _asr_stop_event.set()
+    _emit_silent_audio_level()
 
 
 def get_asr_device_mode() -> str:
@@ -94,7 +174,9 @@ def _resolve_model_device(model_obj: Any, fallback: str = "cpu") -> str:
     return fallback
 
 
-def _emit_asr_status(ready: bool, device_mode: str, error: str = "") -> None:
+def _emit_asr_status(
+    ready: bool, device_mode: str, error: str = "", fallback: bool = False
+) -> None:
     events.bus.emit(
         "asr_status",
         {
@@ -102,6 +184,7 @@ def _emit_asr_status(ready: bool, device_mode: str, error: str = "") -> None:
             "device_mode": device_mode,
             "model": config.ASR_MODEL_SIZE,
             "error": error,
+            "fallback": bool(fallback),
         },
     )
 
@@ -109,13 +192,14 @@ def _emit_asr_status(ready: bool, device_mode: str, error: str = "") -> None:
 def _asr_worker_loop(
     on_recognized_text, init_done_event: threading.Event | None = None
 ):
-    global _asr_disabled_logged, _asr_active_device, _asr_started
+    global _asr_disabled_logged, _asr_active_device, _asr_started, _asr_fallback_cpu
 
     prepare_windows_cuda_dll_paths()
 
     if not ASR_CORE_DEPS_AVAILABLE:
         _asr_active_device = ""
-        _emit_asr_status(False, "", error=ASR_DEPS_ERROR)
+        _asr_fallback_cpu = False
+        _emit_asr_status(False, "", error=ASR_DEPS_ERROR, fallback=False)
         config.report_startup_progress(
             1.0, f"未啟用 ASR：缺少套件 ({ASR_DEPS_ERROR})", newline=True
         )
@@ -127,7 +211,8 @@ def _asr_worker_loop(
 
     if not (PYAUDIO_LOOPBACK_AVAILABLE or SOUNDCARD_AVAILABLE):
         _asr_active_device = ""
-        _emit_asr_status(False, "", error="缺少音訊錄製套件")
+        _asr_fallback_cpu = False
+        _emit_asr_status(False, "", error="缺少音訊錄製套件", fallback=False)
         config.report_startup_progress(
             1.0, "未啟用 ASR：缺少音訊錄製套件", newline=True
         )
@@ -178,7 +263,8 @@ def _asr_worker_loop(
             _ = list(warmup_segs)
 
         _asr_active_device = _resolve_model_device(model)
-        _emit_asr_status(True, _asr_active_device)
+        _asr_fallback_cpu = False
+        _emit_asr_status(True, _asr_active_device, fallback=False)
         config.report_startup_progress(
             1.0, f"Whisper-{config.ASR_MODEL_SIZE} 模型已就緒！", newline=True
         )
@@ -209,7 +295,8 @@ def _asr_worker_loop(
                         compute_type="int8",
                     )
                 _asr_active_device = "cpu"
-                _emit_asr_status(True, "cpu")
+                _asr_fallback_cpu = True
+                _emit_asr_status(True, "cpu", fallback=True)
                 config.report_startup_progress(
                     1.0,
                     f"Whisper-{config.ASR_MODEL_SIZE} (CPU 模式) 已就緒！",
@@ -218,7 +305,8 @@ def _asr_worker_loop(
                 print(f"✅ Whisper-{config.ASR_MODEL_SIZE} 已以 CPU 模式加載")
             except Exception as cpu_e:
                 _asr_active_device = ""
-                _emit_asr_status(False, "", error=str(cpu_e))
+                _asr_fallback_cpu = False
+                _emit_asr_status(False, "", error=str(cpu_e), fallback=False)
                 config.report_startup_progress(
                     1.0, "CPU 模式也無法加載 Whisper 模型", newline=True
                 )
@@ -229,7 +317,8 @@ def _asr_worker_loop(
                 return
         else:
             _asr_active_device = ""
-            _emit_asr_status(False, "", error=error_text)
+            _asr_fallback_cpu = False
+            _emit_asr_status(False, "", error=error_text, fallback=False)
             config.report_startup_progress(
                 1.0, "無法加載 Whisper 模型", newline=True
             )
@@ -282,10 +371,11 @@ def _asr_worker_loop(
     step_frames = int(step_seconds * sample_rate)
     recognition_count = 0
     chunk_counter = 0
+    level_emitter = AudioLevelEmitter()
 
     def _process_audio_chunk(mono_float32):
         nonlocal model, recognition_count, chunk_counter
-        global _asr_disabled_logged, _asr_active_device
+        global _asr_disabled_logged, _asr_active_device, _asr_fallback_cpu
 
         if not _asr_listening_active or _asr_stop_event.is_set():
             return
@@ -356,7 +446,8 @@ def _asr_worker_loop(
                         compute_type="int8",
                     )
                     _asr_active_device = "cpu"
-                    _emit_asr_status(True, "cpu")
+                    _asr_fallback_cpu = True
+                    _emit_asr_status(True, "cpu", fallback=True)
                     print("✅ 已切換為 CPU 模式運作")
                 except Exception as cpu_e:
                     print(f"❌ 切換 CPU 模式失敗: {cpu_e}")
@@ -367,6 +458,10 @@ def _asr_worker_loop(
         nonlocal source_name
         last_missing_logged = 0.0
         capture = SpotifyProcessAudioCapture(target_sample_rate=sample_rate)
+
+        def _on_loopback_packet(packet_samples: Any) -> None:
+            if _asr_listening_active and not _asr_stop_event.is_set():
+                level_emitter.emit_samples(packet_samples, source_name)
 
         try:
             while not _asr_stop_event.is_set():
@@ -381,6 +476,10 @@ def _asr_worker_loop(
                     capture.stop()
                     pid = find_spotify_process_id()
                     if pid is None:
+                        if _asr_listening_active:
+                            level_emitter.emit_values(
+                                0.0, 0.0, True, "等待 Spotify 啟動..."
+                            )
                         now = time.time()
                         if now - last_missing_logged > 5.0:
                             print("🎧 [Process Loopback] 等待 Spotify 啟動中...")
@@ -418,6 +517,8 @@ def _asr_worker_loop(
                     mono_step = capture.read_audio_step(
                         step_frames=step_frames,
                         timeout_ms=int(step_seconds * 1500),
+                        on_packet=_on_loopback_packet,
+                        stop_event=_asr_stop_event,
                     )
                     audio_buffer = _advance_sliding_window(
                         audio_buffer, mono_step, step_frames
@@ -456,7 +557,10 @@ def _asr_worker_loop(
                 device_channels = max(
                     1, min(2, int(device.get("maxInputChannels", 1)))
                 )
-                frames_per_buffer = max(512, int(device_rate * step_seconds))
+                meter_frames = max(512, int(device_rate * AUDIO_METER_CHUNK_SECONDS))
+                step_device_frames = max(
+                    meter_frames, int(device_rate * step_seconds)
+                )
                 source_name = device["name"]
 
                 stream = pa.open(
@@ -464,7 +568,7 @@ def _asr_worker_loop(
                     channels=device_channels,
                     rate=device_rate,
                     input=True,
-                    frames_per_buffer=frames_per_buffer,
+                    frames_per_buffer=meter_frames,
                     input_device_index=int(device["index"]),
                 )
 
@@ -475,6 +579,8 @@ def _asr_worker_loop(
 
                 audio_buffer = np.zeros(block_frames, dtype=np.float32)
                 buffered_frames = 0
+                step_chunks: list[Any] = []
+                step_collected = 0
 
                 while not _asr_stop_event.is_set():
                     if (
@@ -487,13 +593,31 @@ def _asr_worker_loop(
                         break
 
                     raw = stream.read(
-                        frames_per_buffer, exception_on_overflow=False
+                        meter_frames, exception_on_overflow=False
                     )
                     data = np.frombuffer(raw, dtype=np.float32)
                     if device_channels > 1:
                         data = data.reshape(-1, device_channels)[:, 0]
 
-                    mono = _resample_if_needed(data, device_rate, sample_rate)
+                    if _asr_listening_active and not _asr_stop_event.is_set():
+                        level_emitter.emit_samples(data, source_name)
+
+                    step_chunks.append(data)
+                    step_collected += data.size
+                    if step_collected < step_device_frames:
+                        continue
+
+                    combined = (
+                        np.concatenate(step_chunks)
+                        if len(step_chunks) > 1
+                        else step_chunks[0]
+                    )
+                    step_data = combined[:step_device_frames]
+                    remainder = combined[step_device_frames:]
+                    step_chunks = [remainder] if remainder.size > 0 else []
+                    step_collected = int(remainder.size)
+
+                    mono = _resample_if_needed(step_data, device_rate, sample_rate)
                     audio_buffer = _advance_sliding_window(
                         audio_buffer, mono, step_frames
                     )
@@ -536,16 +660,20 @@ def _asr_worker_loop(
                 _asr_stop_event.wait(2.0)
                 return
 
-            print(f"🎙️ ASR 已啟動，來源: {speaker.name} [全系統混音 Loopback]")
+            source_name = speaker.name
+            print(f"🎙️ ASR 已啟動，來源: {source_name} [全系統混音 Loopback]")
             print(
                 f"🔊 開始錄音，使用滑動視窗 (大小: {block_seconds}s, 步進: {step_seconds}s)..."
             )
+            meter_frames = max(512, int(sample_rate * AUDIO_METER_CHUNK_SECONDS))
             audio_buffer = np.zeros(block_frames, dtype=np.float32)
             buffered_frames = 0
+            step_chunks = []
+            step_collected = 0
             with loopback_mic.recorder(
                 samplerate=sample_rate,
                 channels=1,
-                blocksize=step_frames,
+                blocksize=meter_frames,
             ) as recorder:
                 while not _asr_stop_event.is_set():
                     if (
@@ -557,12 +685,30 @@ def _asr_worker_loop(
                     ):
                         break
 
-                    data = recorder.record(numframes=step_frames)
+                    data = recorder.record(numframes=meter_frames)
                     if data.ndim > 1:
                         data = data[:, 0]
 
+                    if _asr_listening_active and not _asr_stop_event.is_set():
+                        level_emitter.emit_samples(data, source_name)
+
+                    step_chunks.append(data)
+                    step_collected += data.size
+                    if step_collected < step_frames:
+                        continue
+
+                    combined = (
+                        np.concatenate(step_chunks)
+                        if len(step_chunks) > 1
+                        else step_chunks[0]
+                    )
+                    step_data = combined[:step_frames]
+                    remainder = combined[step_frames:]
+                    step_chunks = [remainder] if remainder.size > 0 else []
+                    step_collected = int(remainder.size)
+
                     audio_buffer = _advance_sliding_window(
-                        audio_buffer, data, step_frames
+                        audio_buffer, step_data, step_frames
                     )
                     buffered_frames = min(
                         block_frames, buffered_frames + step_frames
@@ -602,7 +748,9 @@ def ensure_asr_worker_started(on_recognized_text):
             1.0, f"Whisper-{config.ASR_MODEL_SIZE} 模型已就緒！", newline=True
         )
         if _asr_active_device:
-            _emit_asr_status(True, _asr_active_device)
+            _emit_asr_status(
+                True, _asr_active_device, fallback=_asr_fallback_cpu
+            )
         return
 
     init_done_event = threading.Event()

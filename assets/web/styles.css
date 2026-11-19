@@ -646,6 +646,10 @@ body {
   transition: width 70ms linear;
 }
 
+.vu-bar-fill.is-silent {
+  opacity: 0.35;
+}
+
 .dock-right {
   flex: 1 1 auto;
   min-width: 0;

@@ -60,7 +60,7 @@ jobs:
       - name: Runtime smoke test
         shell: pwsh
         run: |
-          python -c "import sys; sys.path.insert(0, 'src'); import tkinter; import customtkinter; import webview; from utaten_finder.core import config, events, orchestrator; from utaten_finder.media import spotify_api, system_media; from utaten_finder.lyrics import web_scraper, parser, matching, song_cache, browser_sync; from utaten_finder.audio import process_loopback, cuda_loader, asr_worker; from utaten_finder.ui import legacy_gui, webview_app; print('[SUCCESS] runtime smoke imports loaded')"
+          python -c "import sys; sys.path.insert(0, 'src'); import webview; from utaten_finder.core import config, events, orchestrator; from utaten_finder.media import spotify_api, system_media; from utaten_finder.lyrics import web_scraper, parser, matching, song_cache; from utaten_finder.audio import process_loopback, cuda_loader, asr_worker; from utaten_finder.ui import webview_app; print('[SUCCESS] runtime smoke imports loaded')"
 
       - name: Dry-run portable build script
         shell: pwsh
@@ -77,6 +77,32 @@ jobs:
           if (-Not (Test-Path $ZipPath)) {
               Write-Error "[ERROR] Dry-run 失敗：找不到預期的壓縮檔 $ZipPath"
               exit 1
+          }
+
+          $RequiredFiles = @(
+              "start.bat",
+              "update.bat",
+              "assets\web\index.html",
+              "src\utaten_finder\ui\webview_app.py"
+          )
+          foreach ($RelPath in $RequiredFiles) {
+              $FullPath = Join-Path $OutputRoot $RelPath
+              if (-Not (Test-Path $FullPath)) {
+                  Write-Error "[ERROR] Dry-run 失敗：缺少預期檔案 $FullPath"
+                  exit 1
+              }
+          }
+
+          $ForbiddenFiles = @(
+              "src\utaten_finder\ui\legacy_gui.py",
+              "src\utaten_finder\lyrics\browser_sync.py"
+          )
+          foreach ($RelPath in $ForbiddenFiles) {
+              $FullPath = Join-Path $OutputRoot $RelPath
+              if (Test-Path $FullPath) {
+                  Write-Error "[ERROR] Dry-run 失敗：發現不應存在的舊版檔案 $FullPath"
+                  exit 1
+              }
           }
 
           Write-Host "[SUCCESS] 打包腳本執行無誤，產出物已成功生成！"

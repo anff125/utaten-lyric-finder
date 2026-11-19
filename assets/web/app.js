@@ -19,6 +19,11 @@
     linesCount: 0,
     audioSourceMode: "spotify",
     asrModels: {},
+    asrReady: false,
+    asrDeviceMode: "",
+    asrModel: "",
+    asrFallback: false,
+    vuDecayTimer: null,
     logs: [],
     logFilter: "all",
     activeDrawer: null,
@@ -427,9 +432,16 @@
     els.listenLabel.textContent = state.workerRunning ? "停止監聽" : "開始監聽";
     if (payload.audio_source_label) {
       els.vuSourceLabel.textContent = payload.audio_source_label;
+      els.vuSourceLabel.title = payload.audio_source_label;
     } else if (!state.workerRunning) {
+      if (state.vuDecayTimer) {
+        window.clearTimeout(state.vuDecayTimer);
+        state.vuDecayTimer = null;
+      }
       els.vuSourceLabel.textContent = "待命";
+      els.vuSourceLabel.title = "";
       els.vuBarFill.style.width = "0%";
+      els.vuBarFill.classList.add("is-silent");
     }
     updateResearchButtons();
   }
@@ -451,7 +463,25 @@
     if (!payload || typeof payload !== "object") {
       return;
     }
-    const device = (payload.device_mode || "").toLowerCase();
+    if (typeof payload.ready === "boolean") {
+      state.asrReady = payload.ready;
+    }
+    if (payload.device_mode !== undefined) {
+      state.asrDeviceMode = payload.device_mode || "";
+    }
+    if (payload.model) {
+      state.asrModel = payload.model;
+    }
+    if (typeof payload.fallback === "boolean") {
+      state.asrFallback = payload.fallback;
+    }
+
+    const device = (payload.device_mode ?? state.asrDeviceMode ?? "").toLowerCase();
+    const modelName = payload.model || state.asrModel || "";
+    const modelSuffix = modelName ? ` (${modelName})` : "";
+    const isFallback =
+      typeof payload.fallback === "boolean" ? payload.fallback : state.asrFallback;
+
     els.asrDeviceBadge.className = "badge";
     if (payload.error) {
       els.asrDeviceBadge.textContent = "ASR 異常";
@@ -460,12 +490,19 @@
     } else if (!payload.ready) {
       els.asrDeviceBadge.textContent = els.settingAsrEnabled.checked ? "ASR 待命" : "ASR 關閉";
       els.asrDeviceBadge.classList.add("badge-muted");
+      els.asrDeviceBadge.title = "";
     } else if (device === "cuda") {
       els.asrDeviceBadge.textContent = "CUDA GPU";
       els.asrDeviceBadge.classList.add("badge-spotify");
+      els.asrDeviceBadge.title = `CUDA GPU${modelSuffix}`;
+    } else if (isFallback) {
+      els.asrDeviceBadge.textContent = "CPU 降級";
+      els.asrDeviceBadge.classList.add("badge-partial");
+      els.asrDeviceBadge.title = `GPU 異常已自動降級至 CPU${modelSuffix}`;
     } else {
       els.asrDeviceBadge.textContent = "CPU 模式";
       els.asrDeviceBadge.classList.add("badge-partial");
+      els.asrDeviceBadge.title = `CPU 模式${modelSuffix}`;
     }
   }
 
@@ -487,11 +524,29 @@
     if (!payload || typeof payload !== "object") {
       return;
     }
-    const level = Math.max(0, Math.min(1, Number(payload.peak ?? payload.rms) || 0));
-    const pct = Math.round(Math.pow(level, 0.55) * 100);
+    if (state.vuDecayTimer) {
+      window.clearTimeout(state.vuDecayTimer);
+      state.vuDecayTimer = null;
+    }
+    const rms = Number(payload.rms) || 0;
+    const peak = Number(payload.peak) || 0;
+    const silent = Boolean(payload.silent) || (rms <= 0 && peak <= 0);
+    const rawLevel = silent
+      ? 0
+      : Math.max(0, Math.min(1, Math.max(rms * 1.4, peak * 0.85)));
+    const pct = silent ? 0 : Math.round(Math.pow(rawLevel, 0.55) * 100);
     els.vuBarFill.style.width = `${pct}%`;
+    els.vuBarFill.classList.toggle("is-silent", silent);
     if (payload.source_name) {
       els.vuSourceLabel.textContent = payload.source_name;
+      els.vuSourceLabel.title = payload.source_name;
+    }
+    if (!silent) {
+      state.vuDecayTimer = window.setTimeout(() => {
+        els.vuBarFill.style.width = "0%";
+        els.vuBarFill.classList.add("is-silent");
+        state.vuDecayTimer = null;
+      }, 700);
     }
   }
 
@@ -745,6 +800,8 @@
     renderAsrStatus({
       ready: Boolean(initial.asr_ready),
       device_mode: initial.asr_device_mode || "",
+      model: initial.asr_model || settings.asr_model_size || "",
+      fallback: Boolean(initial.asr_fallback),
     });
 
     if (Array.isArray(initial.logs)) {
@@ -944,7 +1001,22 @@
       control.addEventListener("change", () => {
         persistSettings(true);
         if (control === els.settingAsrEnabled) {
-          renderAsrStatus({ ready: false, device_mode: "" });
+          if (els.settingAsrEnabled.checked && state.asrReady) {
+            renderAsrStatus({
+              ready: true,
+              device_mode: state.asrDeviceMode,
+              model: state.asrModel,
+              fallback: state.asrFallback,
+            });
+          } else {
+            const prevReady = state.asrReady;
+            const prevDevice = state.asrDeviceMode;
+            renderAsrStatus({ ready: false, device_mode: "" });
+            if (!els.settingAsrEnabled.checked) {
+              state.asrReady = prevReady;
+              state.asrDeviceMode = prevDevice;
+            }
+          }
         }
       });
     }

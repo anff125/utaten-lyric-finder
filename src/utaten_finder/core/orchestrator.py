@@ -4,6 +4,7 @@ from datetime import datetime
 import sys
 import time
 from typing import Any
+import webbrowser
 
 from utaten_finder.core import config, events
 from utaten_finder.core.config import (
@@ -107,12 +108,24 @@ def load_lyrics_into_engine(
     return payload
 
 
+def _open_url_if_requested(url: str, open_external_browser: bool) -> None:
+    if (
+        open_external_browser
+        and isinstance(url, str)
+        and url.startswith(("http://", "https://"))
+    ):
+        try:
+            webbrowser.open(url)
+        except Exception as exc:
+            debug_log(f"⚠️ 無法開啟系統預設瀏覽器: {exc}")
+
+
 def main(
     stop_event=None,
     on_track_update=None,
     force_research_event=None,
     *,
-    use_browser: bool = True,
+    open_external_browser: bool = False,
     sync_engine: LyricSyncEngine | None = None,
 ):
     sp = None
@@ -121,59 +134,45 @@ def main(
     last_track_info = None
     last_spotify_poll_at = 0.0
 
-    browser_open_fn = None
-    browser_flush_fn = None
-    browser_cleanup_fn = None
     set_asr_listening_fn = None
     asr_listening_started = False
 
-    if use_browser:
-        from utaten_finder.lyrics.browser_sync import (
-            cleanup_playwright,
-            flush_pending_scroll,
-            open_in_dedicated_window,
-            queue_scroll_when_next_line_matches,
+    engine = sync_engine if sync_engine is not None else LyricSyncEngine()
+    get_device_fn = None
+
+    def _on_asr_recognized(recognized_text: str) -> None:
+        match_payload = engine.process_recognized_text(recognized_text)
+        device_mode = get_device_fn() if get_device_fn is not None else ""
+        events.bus.emit(
+            "asr_preview",
+            {
+                "text": recognized_text,
+                "buffer_len": match_payload["buffer_length"]
+                if match_payload
+                else engine.get_buffer_length(),
+                "matched": bool(match_payload),
+                "score": match_payload["score"] if match_payload else None,
+                "line_index": match_payload["display_index"]
+                if match_payload
+                else None,
+                "device_mode": device_mode,
+            },
         )
-
-        browser_open_fn = open_in_dedicated_window
-        browser_flush_fn = flush_pending_scroll
-        browser_cleanup_fn = cleanup_playwright
-        asr_callback = queue_scroll_when_next_line_matches
-    else:
-        engine = sync_engine if sync_engine is not None else LyricSyncEngine()
-        get_device_fn = None
-
-        def _on_asr_recognized(recognized_text: str) -> None:
-            match_payload = engine.process_recognized_text(recognized_text)
-            device_mode = get_device_fn() if get_device_fn is not None else ""
-            events.bus.emit(
-                "asr_preview",
-                {
-                    "text": recognized_text,
-                    "buffer_len": engine.get_buffer_length(),
-                    "matched": bool(match_payload),
-                    "score": match_payload["score"] if match_payload else None,
-                    "line_index": match_payload["display_index"]
-                    if match_payload
-                    else None,
-                    "device_mode": device_mode,
-                },
+        if match_payload:
+            print(
+                f"\n🎤 [語音識別] 最新片段: '{match_payload['recognized_text']}' "
+                f"(累積長度: {match_payload['buffer_length']})"
             )
-            if match_payload:
+            print(
+                f"🎯 [比對成功] 歌詞: '{match_payload['target_original']}' "
+                f"(正規化: '{match_payload['target_normalized']}', 分數: {match_payload['score']:.2f})"
+            )
+            if match_payload["is_recovery"]:
                 print(
-                    f"\n🎤 [語音識別] 最新片段: '{match_payload['recognized_text']}' "
-                    f"(累積長度: {match_payload['buffer_length']})"
+                    f"⚠️ [迷失恢復] 成功跨越較大段落，重新定位到第 {match_payload['matched_index'] + 1} 行"
                 )
-                print(
-                    f"🎯 [比對成功] 歌詞: '{match_payload['target_original']}' "
-                    f"(正規化: '{match_payload['target_normalized']}', 分數: {match_payload['score']:.2f})"
-                )
-                if match_payload["is_recovery"]:
-                    print(
-                        f"⚠️ [迷失恢復] 成功跨越較大段落，重新定位到第 {match_payload['matched_index'] + 1} 行"
-                    )
 
-        asr_callback = _on_asr_recognized
+    asr_callback = _on_asr_recognized
 
     def notify_track_update(payload):
         events.bus.emit("track_updated", payload)
@@ -185,7 +184,7 @@ def main(
             debug_log(f"track update callback 發生錯誤: {e}")
 
     try:
-        config.STARTUP_PROGRESS_ACTIVE = True
+        config.STARTUP_PROGRESS_ACTIVE = sys.__stdout__ is not None
         try:
             if config.ASR_ENABLED:
                 config.report_startup_progress(0.18, "準備啟動語音辨識引擎 (ASR)...")
@@ -196,22 +195,21 @@ def main(
                 )
 
                 set_asr_listening_fn = set_asr_listening
-                if not use_browser:
-                    get_device_fn = get_asr_device_mode
+                get_device_fn = get_asr_device_mode
                 set_asr_listening(True)
                 asr_listening_started = True
                 ensure_asr_worker_started(asr_callback)
             else:
-                if not use_browser:
-                    events.bus.emit(
-                        "asr_status",
-                        {
-                            "ready": False,
-                            "device_mode": "",
-                            "model": config.ASR_MODEL_SIZE,
-                            "error": "",
-                        },
-                    )
+                events.bus.emit(
+                    "asr_status",
+                    {
+                        "ready": False,
+                        "device_mode": "",
+                        "model": config.ASR_MODEL_SIZE,
+                        "error": "",
+                        "fallback": False,
+                    },
+                )
                 config.report_startup_progress(
                     1.0, "系統初始化完成 (ASR 未啟用)！", newline=True
                 )
@@ -220,9 +218,9 @@ def main(
             config.STARTUP_PROGRESS_ACTIVE = False
 
         print("🚀 開始監聽播放狀態...")
-        if use_browser:
+        if open_external_browser:
             print(
-                "✨ 【系統已全部就緒】請在 Spotify 開始播放日語歌曲，將自動為您開啟歌詞網頁！"
+                "✨ 【系統已全部就緒】請開始播放日語歌曲，將自動為您載入歌詞並開啟預設瀏覽器！"
             )
         else:
             print(
@@ -376,16 +374,16 @@ def main(
                                     "cache_url": cached_data.get("url", ""),
                                 }
                             )
-                            if use_browser and browser_open_fn is not None:
-                                browser_open_fn(cached_data["url"])
-                            elif not use_browser:
-                                load_lyrics_into_engine(
-                                    cached_data["url"],
-                                    engine,
-                                    song_name=song_name,
-                                    artist_name=artist_name,
-                                    cache_status=cached_data.get("status", "perfect"),
-                                )
+                            load_lyrics_into_engine(
+                                cached_data["url"],
+                                engine,
+                                song_name=song_name,
+                                artist_name=artist_name,
+                                cache_status=cached_data.get("status", "perfect"),
+                            )
+                            _open_url_if_requested(
+                                cached_data["url"], open_external_browser
+                            )
                         else:
                             debug_log("快取未命中，開始啟動爬蟲搜尋 Utaten...")
 
@@ -413,16 +411,14 @@ def main(
                                         "cache_url": url,
                                     }
                                 )
-                                if use_browser and browser_open_fn is not None:
-                                    browser_open_fn(url)
-                                elif not use_browser:
-                                    load_lyrics_into_engine(
-                                        url,
-                                        engine,
-                                        song_name=_song_name,
-                                        artist_name=_artist_name,
-                                        cache_status=status,
-                                    )
+                                load_lyrics_into_engine(
+                                    url,
+                                    engine,
+                                    song_name=_song_name,
+                                    artist_name=_artist_name,
+                                    cache_status=status,
+                                )
+                                _open_url_if_requested(url, open_external_browser)
 
                             search_utaten(
                                 artist=artist_name,
@@ -442,12 +438,6 @@ def main(
                 last_spotify_poll_at = now
                 debug_log("=== 輪詢結束 ===\n")
 
-            if use_browser and browser_flush_fn is not None:
-                try:
-                    browser_flush_fn()
-                except Exception as e:
-                    debug_log(f"⚠️ 自動捲動發生錯誤: {e}")
-
             if stop_event:
                 if stop_event.wait(MAIN_LOOP_SLEEP_SECONDS):
                     debug_log("停止事件於等待期間觸發，主迴圈結束。")
@@ -455,15 +445,13 @@ def main(
             else:
                 time.sleep(MAIN_LOOP_SLEEP_SECONDS)
     finally:
-        if use_browser and browser_cleanup_fn is not None:
-            browser_cleanup_fn()
-        elif asr_listening_started and set_asr_listening_fn is not None:
+        if asr_listening_started and set_asr_listening_fn is not None:
             set_asr_listening_fn(False)
 
 
 if __name__ == "__main__":
     try:
-        main()
+        main(open_external_browser=True)
     except KeyboardInterrupt:
         print("\n🛑 收到終止訊號，正在關閉程式...")
         sys.exit(0)

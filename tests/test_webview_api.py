@@ -137,6 +137,8 @@ class TestConsoleLogCapture(unittest.TestCase):
             self.assertEqual(levels.get("❌ test error log"), "error")
         finally:
             events.bus.unsubscribe("log_message", captured_events.append)
+            if not orig_flag:
+                events._uninstall_console_log_capture_handler()
             sys.stdout = orig_stdout
             sys.stderr = orig_stderr
             events._capture_installed = orig_flag

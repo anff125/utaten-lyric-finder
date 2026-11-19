@@ -221,15 +221,15 @@ utaten-lyric-finder/
 ### Phase 3：整合即時音訊視覺化、淘汰舊版多視窗並完成打包驗證
 **目標**：完成所有進階 UX 細節、清理過渡期的舊碼與 Playwright 重度依賴、更新文件與攜帶版建置。
 
-- [ ] **3.1 即時音訊能量與 ASR 辨識狀態推送 (`audio/asr_worker.py`)**
+- [x] **3.1 即時音訊能量與 ASR 辨識狀態推送 (`audio/asr_worker.py`)**
   - 於音訊滑動視窗計算 RMS / Peak 能量並透過 `events.py` 節流（約 10–15 Hz）推送至前端 VU Meter。
   - 將當前實際運作裝置（CUDA GPU 或降級後 CPU 模式）與辨識片段推送至底部狀態列顯示。
   - 將 `print` 與 Logger 輸出同時導向 `events.py` 供日誌抽屜顯示，無需開啟黑底終端機。
-- [ ] **3.2 切換預設啟動與移除冗餘多視窗程式碼**
+- [x] **3.2 切換預設啟動與移除冗餘多視窗程式碼**
   - `app.py` 預設啟動 PyWebView 主視窗（可保留 `--cli` 純終端機模式）。
   - 移除主流程對 Playwright 瀏覽器（`lyrics_browser.py`）與 CustomTkinter 的依賴；當無法自動匹配或使用者想看原網頁時，改用系統內建 `webbrowser.open(url)` 開啟。
   - 清理 `requirements.txt` 中不再需要的 `playwright`、`customtkinter`（確認是否保留或移至選用依賴，大幅縮小攜帶版體積）。
-- [ ] **3.3 啟動無黑窗優化與打包測試**
+- [x] **3.3 啟動無黑窗優化與打包測試**
   - `start.bat` 改為支援預設無黑窗啟動（`pythonw.exe app.py`）或保留快速 Debug 參數（`start.bat --console`）。
   - 驗證 `scripts/build_portable.ps1` 完整建置與 `update.bat` 檔案更新清單（必須涵蓋 `src/` 巢狀目錄與 `assets/web/` 下所有檔案）。
   - 同步更新 `README.md`（英文）與 `README.zh-TW.md`（繁體中文）的功能介紹與截圖/操作說明。

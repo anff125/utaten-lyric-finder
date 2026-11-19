@@ -4,7 +4,7 @@
 
 Language: [English](README.md) | [繁體中文](README.zh-TW.md)
 
-UtaTen Lyric Finder is an automated lyric acquisition tool. It detects the song currently playing from your system media session or Spotify, fetches Japanese lyrics from [UtaTen](https://utaten.com/), and combines Whisper ASR with text matching to auto-scroll to the corresponding lyric position on the UtaTen page.
+UtaTen Lyric Finder is an automated Japanese lyric acquisition and live synchronization desktop app. It detects the song currently playing from Spotify or Windows System Media Transport Controls (SMTC), scrapes and sanitizes furigana (`<ruby>/<rt>`) lyrics from [UtaTen](https://utaten.com/) inside a clean single-window dark **PyWebView (Edge WebView2)** interface, and combines `faster-whisper` ASR with two-phase Japanese fuzzy matching to highlight and center-scroll the active lyric line in real time.
 
 ## 📦 Release and Portable Build
 
@@ -16,8 +16,8 @@ UtaTen Lyric Finder is an automated lyric acquisition tool. It detects the song 
 
 ### Portable package files
 
-- `start.bat`: Launches the main GUI app and prepares required runtime settings.
-- `update.bat`: Syncs core project files from the GitHub `main` branch for quick updates.
+- `start.bat`: Launches the single-window PyWebView desktop app silently (`pythonw.exe`, no black console window). Supports `--console`, `--debug`, and `--cli` flags.
+- `update.bat`: Syncs application source files and web UI assets from the GitHub `main` branch for quick updates.
 - `python_env/`: Bundled portable Python + dependencies environment. You usually do not need to install Python separately.
 
 ### Portable package update flow
@@ -51,84 +51,116 @@ python -m venv .venv
 # 2. Activate the virtual environment (PowerShell)
 .\.venv\Scripts\Activate.ps1
 
-# 3. Upgrade pip and install all dependencies (including faster-whisper and NVIDIA CUDA runtime wheels)
+# 3. Upgrade pip and install all dependencies (including PyWebView, faster-whisper, and NVIDIA CUDA runtime wheels)
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 3. Browser & System Requirements
+### 3. System Requirements
 
-- **Microsoft Edge**: Playwright launches the system's built-in Microsoft Edge (`channel="msedge"`) to display the interactive lyric page. No extra `playwright install` download is required on Windows 10/11.
+- **Microsoft Edge WebView2**: PyWebView uses the Edge WebView2 runtime built into Windows 10/11 to render the single-window lyric stage (no Playwright browser download or external browser automation needed).
 - **FFmpeg (Optional)**: `faster-whisper` uses bundled PyAV for decoding, though you can optionally install system FFmpeg via `winget install ffmpeg`.
 
 ### 4. Launch the Application (Usage)
 
 Once `.venv` is installed, you can start the application in any of the following ways:
 
-- **Option A: Run `start.bat` (Recommended)**
+- **Option A: Run `start.bat` (Recommended, Console-less GUI)**
   ```powershell
   .\start.bat
   ```
-  `start.bat` automatically configures `.venv` CUDA/cuDNN DLL paths and launches the GUI.
+  By default, `start.bat` configures `.venv` CUDA/cuDNN DLL paths and launches `app.py` via `pythonw.exe` without keeping a console window open. All console and Python logger output is visible inside the in-app **📜 Logs** drawer.
 
-- **Option B: Launch the GUI directly via Python**
+- **Option B: Launch with Console / DevTools / Headless CLI Flags**
   ```powershell
-  .\.venv\Scripts\python.exe gui_app.py
+  # Keep a console window attached for troubleshooting
+  .\start.bat --console
+
+  # Launch GUI with WebView2 DevTools enabled
+  .\start.bat --debug
+
+  # Launch headless CLI orchestrator (opens matched UtaTen URL in your default browser)
+  .\start.bat --cli
   ```
 
-- **Option C: Launch the CLI workflow**
+- **Option C: Launch directly via Python**
   ```powershell
-  .\.venv\Scripts\python.exe auto_lyrics.py
+  # Single-window PyWebView desktop app
+  .\.venv\Scripts\python.exe app.py
+
+  # With DevTools enabled
+  .\.venv\Scripts\python.exe app.py --debug
+
+  # Headless CLI mode
+  .\.venv\Scripts\python.exe app.py --cli
   ```
 
-### 5. First-Time Configuration (In-App GUI Settings)
+### 5. First-Time Configuration & Interface Guide
 
-All runtime settings can be configured directly inside the GUI (and are persisted to `.cache/runtime_settings.json`):
-- **Audio Source (`spotify` / `system_media`)**:
-  - `System Media (SMTC)`: Works out of the box without API keys using Windows System Media Transport Controls.
-  - `Spotify`: Supports Windows 11 **Process Loopback** to capture audio exclusively from `Spotify.exe`, completely ignoring game, Discord, or browser audio. (For Spotify Web API track polling, enter your `Client ID` and `Client Secret` in the GUI or `config.py`).
-- **ASR Model**: Choose between `turbo`, `kotoba-whisper-v2.0` (Japanese-specialized), `large-v3`, `medium`, `small`, or `base`. The model is downloaded automatically on first run.
-- **Compute Device**: Defaults to `auto`, which registers pip-installed NVIDIA cuBLAS/cuDNN DLLs and performs a GPU warm-up pass; if CUDA is unavailable or fails at runtime, it **automatically falls back to CPU (`int8`) mode**.
+All runtime configuration and caches are stored centrally under `data/` (`data/runtime_settings.json`, `data/song_cache.json`, `data/spotify_token_cache`, `data/spotify_last_callback_url.txt`). Legacy files from `.cache/` or root `song_cache.json` are automatically migrated on startup.
+
+- **Main Lyrics Stage**:
+  - Clean ad-free `<ruby>/<rt>` furigana rendering supporting both `<p>` and `<br>` UtaTen page layouts.
+  - Active singing line glows and automatically smooth-scrolls to the center (`🎯` recenter button appears if you scroll away).
+  - Click any lyric line to jump and re-anchor ASR matching immediately (`jump_to_line`).
+  - Use the **`Aa` typography popover** to customize lyric font size, furigana size, furigana visibility, and auto-scroll.
+  - Use **🔄 Re-search** or **🔗 Fix URL** in the top bar (or open the original UtaTen page in your default browser when needed).
+- **Bottom ASR & Audio Dock**:
+  - Click **▶ Start Listening** / **⏹ Stop Listening** to control playback polling and speech recognition.
+  - **Live Audio VU Meter** (~12.5 Hz) visualizes incoming RMS/peak energy and active capture source (`Spotify.exe` Process Loopback or system loopback).
+  - Displays the active inference device badge (`CUDA GPU`, `CPU Mode`, or `CPU Fallback`), startup/model load progress bar, live recognized Japanese transcript preview, and match score badge.
+- **Slide-over Drawers**:
+  - **⚙️ Settings Drawer**: Configure Spotify `Client ID`, `Client Secret`, `Redirect URI`, one-click Spotify OAuth authorization, Audio Source (`Spotify API` / `System Media`), `Spotify Process Loopback`, ASR auto-scroll toggle, Whisper model (`turbo`, `kotoba-whisper-v2.0`, `large-v3`, `medium`, `small`, `base`), compute device (`auto` / `cuda` / `cpu`), and Polling/Recognition debug toggles.
+  - **📜 Live Logs Drawer**: Captures `stdout`, `stderr`, and Python `logging` events with level filtering (`all`, `info`, `warn`, `error`, `debug`), auto-scroll, copy, and clear actions.
 
 ### Build your own portable release package
 
 Run this in the project root:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build_portable.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\build_portable.ps1
 ```
 
 Common option example (reuse existing `python_env` cache for faster packaging):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build_portable.ps1 -SkipEnvBuild $true
+powershell -ExecutionPolicy Bypass -File .\scripts\build_portable.ps1 -SkipEnvBuild
 ```
 
 After completion, the portable folder and ZIP file will be generated under `build\portable`.
 
-## ✨ Features & Recent Updates
+## ✨ Features
 
-- **Automatic current-song detection**: Supports Windows SMTC via `system_media.py` and Spotify API via `spotify_api.py`.
-- **Spotify Process Loopback**: Native Windows 11 WASAPI Process Loopback support (`process_loopback.py`) to capture audio exclusively from `Spotify.exe`, eliminating background game, Discord, and browser noise.
-- **Automatic CUDA DLL Resolution & CPU Fallback**: Automatically loads pip-installed NVIDIA `cublas64_12.dll` / `cudnn` libraries with startup warm-up verification, and seamlessly falls back to CPU mode if GPU inference fails.
+- **Single-Window PyWebView Desktop UI**: Combines track controls, clean `<ruby>` furigana lyrics, live audio VU meter, settings drawer, and live log viewer in one lightweight dark window.
+- **Automatic current-song detection**: Supports Windows SMTC (`system_media.py`) and Spotify Web API (`spotify_api.py`).
+- **Spotify Process Loopback**: Native Windows 11 WASAPI Process Loopback (`process_loopback.py`) captures audio exclusively from `Spotify.exe`, eliminating game, Discord, and browser noise.
+- **Automatic CUDA DLL Resolution & CPU Fallback**: Preloads pip-installed NVIDIA `cublas64_12.dll` / `cudnn` libraries (`cuda_loader.py`) with startup warm-up verification, and seamlessly falls back to CPU (`int8`) mode if GPU initialization or inference fails.
 - **Enhanced Japanese ASR & Sliding-Window Matching**:
-  - Supports `kotoba-whisper-v2.0-faster` and `turbo` with polyphase resampling (`scipy.signal.resample_poly`) and sliding-window capture.
-  - Two-phase lyric matching (local lookahead + lost-position recovery) with Japanese hiragana normalization (`matching.py`) and manual jump buttons on every line.
-- **UtaTen lyric scraping & smart caching**: Automatically searches and parses lyrics from UtaTen (`web_scraper.py`) and caches results in `song_cache.py` for instant loading on repeat plays.
-- **GUI & Granular Debug Logging**: User-friendly interface (`gui_app.py` and `lyrics_browser.py`) with live model/source switching, manual lyric URL override, one-click **Re-search Lyrics** cache refresh, and separate toggles for Polling Debug and Recognition Debug logs.
+  - Supports `kotoba-whisper-v2.0-faster` and `turbo` with polyphase resampling (`scipy.signal.resample_poly`) and sliding-window capture (`asr_worker.py`).
+  - Two-phase lyric matching (local lookahead + lost-position recovery) with Japanese hiragana normalization (`matching.py`) and click-to-jump sync.
+- **Browserless UtaTen Scraper & Sanitized `<ruby>` Parser**: Fetches and parses UtaTen lyrics directly in Python (`web_scraper.py`, `parser.py`) and caches matches in `song_cache.py`.
 
-## 📁 Project structure
+## 📁 Project Structure
 
-- `gui_app.py`: Main entry point for GUI mode.
-- `auto_lyrics.py`: Core lyric automation workflow.
-- `asr.py`: Audio processing and Whisper ASR pipeline.
-- `process_loopback.py`: Native Windows 11 WASAPI process-specific audio capture module.
-- `matching.py`: Text matching logic between ASR output and lyric lines.
-- `web_scraper.py`: UtaTen scraping module.
-- `spotify_api.py` / `system_media.py`: Current media metadata providers.
-- `lyrics_browser.py`: Lyric display/browser component used by the GUI.
-- `song_cache.py`: Local cache manager for processed song records.
-- `config.py`: Environment and runtime configuration.
+```text
+utaten-lyric-finder/
+├── app.py                              # Unified entry point (PyWebView GUI default, --cli, --debug)
+├── start.bat                           # Console-less launcher (supports --console / --debug / --cli)
+├── requirements.txt                    # Pinned Python dependencies (UTF-8)
+├── assets/
+│   ├── app.ico                         # Application icon
+│   └── web/                            # PyWebView frontend (index.html, styles.css, app.js)
+├── data/                               # Runtime settings, OAuth tokens, song cache, WebView profile
+├── scripts/
+│   └── build_portable.ps1              # Windows portable ZIP build script
+├── tests/                              # Unit test suite (parser, JsApi/EventBus, Phase 3 features)
+└── src/utaten_finder/
+    ├── core/                           # config.py, events.py (EventBus + logging capture), orchestrator.py
+    ├── media/                          # spotify_api.py (API + OAuth server), system_media.py (SMTC)
+    ├── audio/                          # cuda_loader.py, process_loopback.py, asr_worker.py (ASR + VU meter)
+    ├── lyrics/                         # web_scraper.py, parser.py, matching.py, song_cache.py
+    └── ui/                             # webview_app.py (PyWebView controller & JsApi bridge)
+```
 
 ## 📝 Disclaimer
 

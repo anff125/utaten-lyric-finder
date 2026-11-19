@@ -15,9 +15,6 @@ REDIRECT_URI = "http://127.0.0.1:8888/callback"
 
 SCOPE = "user-read-currently-playing"
 
-PLAYWRIGHT_SCROLL_PIXELS = 120
-PLAYWRIGHT_NAV_TIMEOUT_MS = 15000
-
 FUZZY_LOOKAHEAD_LINES = 4
 FUZZY_NEXT_LINE_THRESHOLD = 0.75
 # 迷失恢復機制 (Phase 2 Lookahead)
@@ -71,7 +68,6 @@ CAPTURE_SPOTIFY_PROCESS_ONLY = True
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / "data"
 ASSETS_DIR = PROJECT_ROOT / "assets"
-BROWSER_PROFILE_DIR = DATA_DIR / "browser_profile"
 RUNTIME_SETTINGS_FILE = DATA_DIR / "runtime_settings.json"
 SONG_CACHE_FILE = DATA_DIR / "song_cache.json"
 SPOTIFY_TOKEN_CACHE_FILE = DATA_DIR / "spotify_token_cache"
@@ -353,8 +349,11 @@ def startup_progress_stage(
     *,
     console_only: bool = False,
 ):
-    if not STARTUP_PROGRESS_ACTIVE and (
-        console_only or _startup_progress_callback is None
+    has_bus_listeners = not console_only and bus.has_subscribers("startup_progress")
+    if (
+        not STARTUP_PROGRESS_ACTIVE
+        and not has_bus_listeners
+        and (console_only or _startup_progress_callback is None)
     ):
         yield
         return

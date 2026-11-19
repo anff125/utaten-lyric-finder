@@ -180,6 +180,8 @@ class AppController:
         self._audio_source_label = ""
         self._asr_ready = False
         self._asr_device_mode = ""
+        self._asr_fallback = False
+        self._asr_model = config.ASR_MODEL_SIZE
 
         self._bus_handlers = {
             "track_updated": self._on_track_updated,
@@ -217,6 +219,9 @@ class AppController:
             with self._state_lock:
                 self._asr_ready = bool(payload.get("ready"))
                 self._asr_device_mode = str(payload.get("device_mode") or "")
+                self._asr_fallback = bool(payload.get("fallback"))
+                if payload.get("model"):
+                    self._asr_model = str(payload["model"])
 
     def _on_audio_level(self, payload: Any) -> None:
         if isinstance(payload, dict):
@@ -236,6 +241,8 @@ class AppController:
             audio_source_label = self._audio_source_label
             asr_ready = self._asr_ready
             asr_device_mode = self._asr_device_mode
+            asr_fallback = self._asr_fallback
+            asr_model = self._asr_model
 
         try:
             token_valid = bool(
@@ -266,6 +273,8 @@ class AppController:
             "audio_source_label": audio_source_label,
             "asr_ready": asr_ready,
             "asr_device_mode": asr_device_mode,
+            "asr_fallback": asr_fallback,
+            "asr_model": asr_model,
             "current_track": current_track,
             "current_lyrics": current_lyrics,
             "current_highlight_index": highlight_index,
@@ -334,7 +343,6 @@ class AppController:
                 run_orchestrator(
                     stop_event=self._stop_event,
                     force_research_event=self._force_research_event,
-                    use_browser=False,
                     sync_engine=self._sync_engine,
                 )
             except Exception as exc:

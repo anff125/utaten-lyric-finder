@@ -2,6 +2,7 @@
 
 from collections import defaultdict, deque
 from datetime import datetime
+import logging
 import sys
 import threading
 from typing import Any, Callable, TextIO
@@ -13,6 +14,7 @@ _log_lock = threading.Lock()
 _recent_logs: deque[dict[str, str]] = deque(maxlen=_MAX_LOG_ENTRIES)
 _capture_installed = False
 _capture_guard = threading.local()
+_logging_handler: "EventBusLogHandler | None" = None
 
 
 class EventBus:
@@ -35,6 +37,11 @@ class EventBus:
             listeners = self._subscribers.get(event_name)
             if listeners and callback in listeners:
                 listeners.remove(callback)
+
+    def has_subscribers(self, event_name: str) -> bool:
+        """Return True if at least one callback is subscribed to event_name."""
+        with self._lock:
+            return bool(self._subscribers.get(event_name))
 
     def emit(self, event_name: str, payload: Any = None) -> None:
         """Broadcast an event payload to all subscribers without holding the lock."""
@@ -174,12 +181,88 @@ class _LogTeeStream:
                 pass
 
 
+class _EventLogFormatter(logging.Formatter):
+    """Format log records with logger prefix when originating outside root."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        if record.name and record.name != "root":
+            return f"[{record.name}] {rendered}"
+        return rendered
+
+
+class EventBusLogHandler(logging.Handler):
+    """Forward Python logging records into EventBus logs without stream feedback loops."""
+
+    def __init__(
+        self,
+        console_stream: TextIO | None = None,
+        level: int = logging.DEBUG,
+    ) -> None:
+        super().__init__(level=level)
+        self._console_stream = console_stream
+        self.setFormatter(_EventLogFormatter("%(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(_capture_guard, "active", False):
+            return
+        try:
+            rendered = self.format(record).strip()
+            if not rendered:
+                return
+
+            if record.levelno >= logging.ERROR:
+                level = "error"
+            elif record.levelno >= logging.WARNING:
+                level = "warn"
+            elif record.levelno <= logging.DEBUG:
+                level = "debug"
+            else:
+                level = "info"
+
+            if self._console_stream is not None:
+                try:
+                    self._console_stream.write(f"{rendered}\n")
+                    self._console_stream.flush()
+                except Exception:
+                    pass
+
+            _capture_guard.active = True
+            try:
+                emit_log(rendered, level=level)
+            finally:
+                _capture_guard.active = False
+        except Exception:
+            self.handleError(record)
+
+
+def _uninstall_console_log_capture_handler() -> None:
+    """Detach the module-level EventBusLogHandler from the root logger if attached."""
+    global _logging_handler
+    root_logger = logging.getLogger()
+    if _logging_handler is not None:
+        try:
+            root_logger.removeHandler(_logging_handler)
+        except Exception:
+            pass
+        _logging_handler = None
+
+
 def install_console_log_capture() -> None:
-    """Wrap sys.stdout and sys.stderr once to mirror console output into EventBus."""
-    global _capture_installed
+    """Wrap stdout/stderr and attach a logging handler to mirror output into EventBus."""
+    global _capture_installed, _logging_handler
     with _log_lock:
         if _capture_installed:
             return
-        sys.stdout = _LogTeeStream(sys.stdout, "info")  # type: ignore[assignment]
-        sys.stderr = _LogTeeStream(sys.stderr, "error")  # type: ignore[assignment]
+        orig_stdout = sys.stdout
+        orig_stderr = sys.stderr
+        sys.stdout = _LogTeeStream(orig_stdout, "info")  # type: ignore[assignment]
+        sys.stderr = _LogTeeStream(orig_stderr, "error")  # type: ignore[assignment]
+
+        _uninstall_console_log_capture_handler()
+        handler = EventBusLogHandler(console_stream=orig_stderr, level=logging.DEBUG)
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        logging.getLogger("utaten_finder").setLevel(logging.INFO)
+        _logging_handler = handler
         _capture_installed = True
