@@ -93,5 +93,7 @@ pwsh -NoProfile -NonInteractive -Command "Invoke-ScriptAnalyzer -Path ./scripts/
      3. Update the runtime smoke test in `.github/workflows/ci.yml` (if applicable)
 3. **Bilingual Documentation**:
    - User-facing workflow or feature changes should be reflected in both `README.md` (English) and `README.zh-TW.md` (Traditional Chinese).
-4. **Auto-Commit After Completing Tasks**:
-   - Whenever code, configuration, or documentation changes are completed and all mandatory pre-commit checks (Section 3) pass, **automatically stage and create a descriptive `git commit`** without waiting for the user to ask.
+4. **Branch, Auto-Commit & Pull Request Workflow**:
+   - Develop feature, accuracy, refactor, and issue-tracked changes on a dedicated branch off `main` (e.g., `feat/issue-<n>-<slug>` or `fix/<slug>`) and merge via Pull Request so GitHub Actions CI validates every change before it reaches `main` (protecting portable `update.bat` users who sync directly from `main`).
+   - Whenever code, configuration, or documentation changes are completed and all mandatory pre-commit checks (Section 3) pass, **automatically stage and create a descriptive `git commit`** on the working branch without waiting for the user to ask, and reference `Closes #<n>` in the PR body (and commit when applicable).
+   - Tiny low-risk documentation typos may be committed directly if the user prefers.
