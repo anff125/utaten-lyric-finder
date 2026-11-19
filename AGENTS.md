@@ -25,9 +25,10 @@ This document provides context, architecture details, and mandatory verification
   - `parser.py`: Browserless UtaTen HTML parser (`parse_utaten_lyrics`) producing sanitized `<ruby>/<rt>` lyric lines and normalized matching fields for both `<p>` and `<br>` DOM layouts.
   - `web_scraper.py`: Searches UtaTen / DuckDuckGo (`ddgs`) and fetches UtaTen lyric page HTML (`fetch_utaten_lyrics_html`).
   - `song_cache.py`: Local JSON cache (`data/song_cache.json`) mapping track keys to UtaTen URLs and match quality status.
+  - `trace.py`: Thread-safe JSONL match trace recorder (`MatchTraceRecorder`) and reader (`load_trace`) writing structured synchronization diagnostics to `data/traces/`.
 - **`src/utaten_finder/media/`**:
   - `spotify_api.py` & `system_media.py`: Track metadata providers for Spotify Web API (`spotipy`) + OAuth callback HTTP server (`wait_for_oauth_callback`) and Windows SMTC (`winrt`).
-- **`assets/`, `data/`, `scripts/build_portable.ps1`, `start.bat`, & `tests/`**: Static assets (`assets/app.ico`, `assets/web/{index.html,styles.css,app.js}`), ignored runtime data (`data/`), portable Windows packaging script, console-less launcher (`start.bat` using `pythonw.exe` by default with `--console` / `--cli` / `--debug` support), and unit tests (`tests/`).
+- **`assets/`, `data/`, `scripts/`, `start.bat`, & `tests/`**: Static assets (`assets/app.ico`, `assets/web/{index.html,styles.css,app.js}`), ignored runtime data (`data/`), Windows portable build & offline match evaluation scripts (`scripts/build_portable.ps1`, `scripts/eval_matching.py`), console-less launcher (`start.bat` using `pythonw.exe` by default with `--console` / `--cli` / `--debug` support), and unit tests (`tests/`).
 
 ---
 
@@ -65,7 +66,7 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push and pull reque
 
 ### Check 3: Runtime Smoke Test
 ```powershell
-.\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'src'); import webview; from utaten_finder.core import config, events, orchestrator; from utaten_finder.media import spotify_api, system_media; from utaten_finder.lyrics import web_scraper, parser, matching, song_cache; from utaten_finder.audio import process_loopback, cuda_loader, asr_worker; from utaten_finder.ui import webview_app; print('[SUCCESS] runtime smoke imports loaded')"
+.\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'src'); import webview; from utaten_finder.core import config, events, orchestrator; from utaten_finder.media import spotify_api, system_media; from utaten_finder.lyrics import web_scraper, parser, matching, song_cache, trace; from utaten_finder.audio import process_loopback, cuda_loader, asr_worker; from utaten_finder.ui import webview_app; print('[SUCCESS] runtime smoke imports loaded')"
 ```
 - Ensure module-level imports do not crash when optional hardware or audio devices are absent.
 

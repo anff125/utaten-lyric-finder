@@ -101,6 +101,7 @@
     settingAsrDevice: document.getElementById("setting-asr-device"),
     settingDebugPolling: document.getElementById("setting-debug-polling"),
     settingDebugRecognition: document.getElementById("setting-debug-recognition"),
+    settingMatchTrace: document.getElementById("setting-match-trace"),
     btnSaveSettings: document.getElementById("btn-save-settings"),
 
     logDrawer: document.getElementById("log-drawer"),
@@ -681,6 +682,7 @@
       asr_device: els.settingAsrDevice.value,
       debug_polling: els.settingDebugPolling.checked,
       debug_recognition: els.settingDebugRecognition.checked,
+      match_trace_enabled: els.settingMatchTrace.checked,
     };
   }
 
@@ -792,6 +794,7 @@
     els.settingAsrDevice.value = settings.asr_device || "auto";
     els.settingDebugPolling.checked = Boolean(settings.debug_polling);
     els.settingDebugRecognition.checked = Boolean(settings.debug_recognition);
+    els.settingMatchTrace.checked = Boolean(settings.match_trace_enabled);
 
     renderWorkerState({
       running: Boolean(initial.worker_running),
@@ -997,6 +1000,7 @@
       els.settingAsrDevice,
       els.settingDebugPolling,
       els.settingDebugRecognition,
+      els.settingMatchTrace,
     ]) {
       control.addEventListener("change", () => {
         persistSettings(true);

@@ -1,0 +1,979 @@
+"""Offline match trace replay and multi-strategy benchmark CLI.
+
+Examples:
+    python scripts/eval_matching.py data/traces/song.jsonl --timeline
+    python scripts/eval_matching.py data/traces/ --strategy baseline --strategy baseline:threshold=0.68 --diff
+    python scripts/eval_matching.py data/traces/ --strategy baseline --strategy baseline:threshold=0.70 --export-md report.md
+"""
+
+import argparse
+from dataclasses import dataclass, field
+import json
+from pathlib import Path
+import sys
+from typing import Any
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC_DIR = str(_REPO_ROOT / "src")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
+from utaten_finder.core import config  # noqa: E402
+from utaten_finder.lyrics.matching import LyricSyncEngine  # noqa: E402
+from utaten_finder.lyrics.trace import load_trace  # noqa: E402
+
+_BASELINE_PARAM_CASTERS: dict[str, tuple[str, Any]] = {
+    "threshold": ("fuzzy_next_line_threshold", float),
+    "recovery": ("recovery_threshold", float),
+    "lookahead": ("fuzzy_lookahead_lines", int),
+    "recovery_lookahead": ("recovery_lookahead_lines", int),
+    "min_coverage": ("min_coverage_ratio", float),
+    "max_buffer_ratio": ("max_buffer_ratio", float),
+    "duplicate_ttl": ("duplicate_ttl", float),
+    "lookahead_sec": ("lookahead_seconds_per_line", float),
+}
+
+
+class VirtualClock:
+    """Deterministic monotonic clock controlled by recorded trace timestamps."""
+
+    def __init__(self, initial: float = 0.0) -> None:
+        self.now = float(initial)
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@dataclass(frozen=True)
+class StrategySpec:
+    """Parsed CLI strategy specification (e.g. ``baseline:threshold=0.7``)."""
+
+    raw: str
+    name: str
+    params: dict[str, Any] = field(default_factory=dict)
+
+
+class ReplayStrategy:
+    """Base interface for offline lyric matching strategies."""
+
+    def __init__(self, spec: StrategySpec) -> None:
+        self.spec = spec
+
+    def reset(
+        self,
+        lyrics: list[dict[str, Any]],
+        session_start: dict[str, Any],
+        clock: VirtualClock,
+    ) -> None:
+        raise NotImplementedError
+
+    def step(
+        self,
+        recognized_text: str,
+        asr_meta: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        raise NotImplementedError
+
+    def apply_manual_jump(self, line_index: int) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+
+class BaselineStrategy(ReplayStrategy):
+    """Wraps production ``LyricSyncEngine`` with virtual time and optional overrides."""
+
+    def __init__(self, spec: StrategySpec) -> None:
+        super().__init__(spec)
+        self._engine: LyricSyncEngine | None = None
+
+    def reset(
+        self,
+        lyrics: list[dict[str, Any]],
+        session_start: dict[str, Any],
+        clock: VirtualClock,
+    ) -> None:
+        matcher_cfg = session_start.get("matcher_config") or {}
+        asr_cfg = session_start.get("asr_config") or {}
+
+        engine_kwargs: dict[str, Any] = {
+            "lookahead_seconds_per_line": float(
+                self.spec.params.get(
+                    "lookahead_seconds_per_line",
+                    matcher_cfg.get("lookahead_seconds_per_line", 1.5),
+                )
+            ),
+            "clock": clock,
+            "fuzzy_lookahead_lines": int(
+                self.spec.params.get(
+                    "fuzzy_lookahead_lines",
+                    matcher_cfg.get(
+                        "fuzzy_lookahead_lines", config.FUZZY_LOOKAHEAD_LINES
+                    ),
+                )
+            ),
+            "fuzzy_next_line_threshold": float(
+                self.spec.params.get(
+                    "fuzzy_next_line_threshold",
+                    matcher_cfg.get(
+                        "fuzzy_next_line_threshold",
+                        config.FUZZY_NEXT_LINE_THRESHOLD,
+                    ),
+                )
+            ),
+            "recovery_lookahead_lines": int(
+                self.spec.params.get(
+                    "recovery_lookahead_lines",
+                    matcher_cfg.get(
+                        "recovery_lookahead_lines",
+                        config.RECOVERY_LOOKAHEAD_LINES,
+                    ),
+                )
+            ),
+            "recovery_threshold": float(
+                self.spec.params.get(
+                    "recovery_threshold",
+                    matcher_cfg.get(
+                        "recovery_threshold", config.RECOVERY_THRESHOLD
+                    ),
+                )
+            ),
+            "duplicate_ttl": float(
+                self.spec.params.get(
+                    "duplicate_ttl",
+                    matcher_cfg.get(
+                        "duplicate_ttl",
+                        asr_cfg.get("block_seconds", config.ASR_BLOCK_SECONDS),
+                    ),
+                )
+            ),
+            "min_coverage_ratio": float(
+                self.spec.params.get(
+                    "min_coverage_ratio",
+                    matcher_cfg.get("min_coverage_ratio", 0.4),
+                )
+            ),
+            "max_buffer_ratio": float(
+                self.spec.params.get(
+                    "max_buffer_ratio",
+                    matcher_cfg.get("max_buffer_ratio", 1.8),
+                )
+            ),
+            "emit_events": False,
+        }
+        self._engine = LyricSyncEngine(**engine_kwargs)
+        self._engine.reset_with_lyrics(lyrics)
+
+    def step(
+        self,
+        recognized_text: str,
+        asr_meta: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        assert self._engine is not None
+        return self._engine.evaluate_recognized_text(
+            recognized_text, asr_meta=asr_meta
+        )
+
+    def apply_manual_jump(self, line_index: int) -> dict[str, Any] | None:
+        assert self._engine is not None
+        return self._engine.apply_manual_jump(line_index)
+
+
+STRATEGIES: dict[str, type[ReplayStrategy]] = {
+    "baseline": BaselineStrategy,
+}
+
+
+def parse_strategy_spec(raw_spec: str) -> StrategySpec:
+    """Parse ``name[:key=value,...]`` into a validated ``StrategySpec``."""
+    spec_text = (raw_spec or "").strip()
+    if not spec_text:
+        raise ValueError("策略名稱不可為空")
+
+    if ":" in spec_text:
+        name, param_str = spec_text.split(":", 1)
+    else:
+        name, param_str = spec_text, ""
+
+    name = name.strip().lower()
+    if name not in STRATEGIES:
+        available = ", ".join(sorted(STRATEGIES))
+        raise ValueError(f"不支援的策略 '{name}'，可用策略: {available}")
+
+    params: dict[str, Any] = {}
+    if param_str.strip():
+        for pair in param_str.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(f"策略參數格式錯誤 '{pair}'，應為 key=value")
+            key, value_str = pair.split("=", 1)
+            key = key.strip()
+            value_str = value_str.strip()
+            if key not in _BASELINE_PARAM_CASTERS:
+                valid_keys = ", ".join(sorted(_BASELINE_PARAM_CASTERS))
+                raise ValueError(
+                    f"策略 '{name}' 不支援參數 '{key}'，可用參數: {valid_keys}"
+                )
+            target_field, caster = _BASELINE_PARAM_CASTERS[key]
+            try:
+                params[target_field] = caster(value_str)
+            except ValueError as exc:
+                raise ValueError(
+                    f"參數 '{key}' 數值無效 '{value_str}': {exc}"
+                ) from exc
+
+    return StrategySpec(raw=spec_text, name=name, params=params)
+
+
+def resolve_trace_paths(raw_paths: list[str]) -> list[Path]:
+    """Expand files/directories into a deduplicated, sorted list of trace files."""
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+
+    for raw in raw_paths:
+        path = Path(raw)
+        if not path.exists():
+            raise FileNotFoundError(f"找不到 Trace 路徑: {path}")
+        if path.is_dir():
+            for child in sorted(path.rglob("*.jsonl")):
+                norm = child.resolve()
+                if norm not in seen:
+                    seen.add(norm)
+                    resolved.append(child)
+        else:
+            norm = path.resolve()
+            if norm not in seen:
+                seen.add(norm)
+                resolved.append(path)
+
+    if not resolved:
+        raise FileNotFoundError("指定的路徑下找不到任何 .jsonl Trace 檔案")
+    return resolved
+
+
+def format_ms(ms: int | float | None) -> str:
+    """Format milliseconds into ``m:ss`` or ``-``."""
+    if ms is None:
+        return "-"
+    total_sec = max(0, int(round(float(ms) / 1000.0)))
+    minutes, seconds = divmod(total_sec, 60)
+    return f"{minutes}:{seconds:02d}"
+
+
+def replay_trace(
+    trace_data: dict[str, Any],
+    spec: StrategySpec,
+    *,
+    anchor_mode: str = "eval",
+) -> dict[str, Any]:
+    """Replay one parsed trace through a strategy and compute evaluation metrics."""
+    if anchor_mode not in {"eval", "apply"}:
+        raise ValueError("anchor_mode 必須為 'eval' 或 'apply'")
+
+    session_start = trace_data["session_start"]
+    lyrics = list(session_start.get("lyrics") or [])
+    events_list = list(trace_data.get("events") or [])
+    asr_cfg = session_start.get("asr_config") or {}
+    step_budget_ms = float(
+        asr_cfg.get("step_seconds") or (config.ASR_BLOCK_SECONDS / 2)
+    ) * 1000.0
+
+    clock = VirtualClock(0.0)
+    strategy = STRATEGIES[spec.name](spec)
+    strategy.reset(lyrics, session_start, clock)
+
+    pred_display_index = 0 if lyrics else -1
+    prev_matched_index: int | None = None
+    matched_unique_lines: set[int] = set()
+    match_scores: list[float] = []
+    infer_ms_values: list[float] = []
+    infer_over_budget_count = 0
+
+    asr_steps = 0
+    non_empty_steps = 0
+    matches_p1 = 0
+    matches_p2 = 0
+    sequential_advances = 0
+    jump_advances = 0
+    max_jump = 0
+    parity_matches = 0
+
+    anchor_evals: list[dict[str, Any]] = []
+    timeline_rows: list[dict[str, Any]] = []
+
+    for event in events_list:
+        elapsed_sec = float(event.get("elapsed_sec") or 0.0)
+        clock.now = elapsed_sec
+        ev_type = event.get("type")
+
+        if ev_type == "asr_step":
+            asr_steps += 1
+            asr_info = dict(event.get("asr") or {})
+            raw_text = str(asr_info.get("raw_text") or "")
+            if raw_text.strip():
+                non_empty_steps += 1
+
+            infer_ms = asr_info.get("infer_ms")
+            if infer_ms is not None:
+                infer_val = float(infer_ms)
+                infer_ms_values.append(infer_val)
+                if infer_val > step_budget_ms:
+                    infer_over_budget_count += 1
+
+            match_payload, step_trace = strategy.step(raw_text, asr_info)
+            decision = str(step_trace.get("decision") or "")
+            matched_idx = step_trace.get("matched_index")
+            display_idx = step_trace.get("display_index")
+
+            if (
+                decision == event.get("decision")
+                and matched_idx == event.get("matched_index")
+            ):
+                parity_matches += 1
+
+            if match_payload is not None and matched_idx is not None:
+                matched_idx = int(matched_idx)
+                display_idx = int(display_idx)
+                pred_display_index = display_idx
+                matched_unique_lines.add(matched_idx)
+                match_scores.append(float(match_payload["score"]))
+
+                if decision == "matched_phase2_recovery":
+                    matches_p2 += 1
+                else:
+                    matches_p1 += 1
+
+                if prev_matched_index is not None:
+                    delta = matched_idx - prev_matched_index
+                    if delta == 1:
+                        sequential_advances += 1
+                    elif delta >= 2:
+                        jump_advances += 1
+                        max_jump = max(max_jump, delta)
+                prev_matched_index = matched_idx
+
+            timeline_rows.append(
+                {
+                    "type": "asr_step",
+                    "seq": event.get("seq"),
+                    "elapsed_sec": elapsed_sec,
+                    "playback": event.get("playback") or {},
+                    "asr": asr_info,
+                    "raw_text": raw_text,
+                    "buffer_after_trim": step_trace.get(
+                        "buffer_after_trim", ""
+                    ),
+                    "candidates": list(step_trace.get("candidates") or []),
+                    "decision": decision,
+                    "matched_index": matched_idx,
+                    "display_index": display_idx,
+                    "best_score": step_trace.get("best_score"),
+                    "threshold": step_trace.get("threshold"),
+                    "pred_display_index": pred_display_index,
+                    "recorded_decision": event.get("decision"),
+                    "recorded_matched_index": event.get("matched_index"),
+                }
+            )
+
+        elif ev_type == "manual_jump":
+            to_index = int(event.get("to_index", -1))
+            error = (
+                pred_display_index - to_index
+                if pred_display_index >= 0 and to_index >= 0
+                else None
+            )
+            anchor_record = {
+                "seq": event.get("seq"),
+                "elapsed_sec": elapsed_sec,
+                "to_index": to_index,
+                "pred_display_index": pred_display_index,
+                "error": error,
+                "abs_error": abs(error) if error is not None else None,
+                "from_index_recorded": event.get("from_index"),
+                "current_line_text": event.get("current_line_text", ""),
+                "playback": event.get("playback") or {},
+            }
+            anchor_evals.append(anchor_record)
+
+            if anchor_mode == "apply" and to_index >= 0:
+                jump_res = strategy.apply_manual_jump(to_index)
+                if jump_res is not None:
+                    pred_display_index = to_index
+                    prev_matched_index = to_index
+
+            timeline_rows.append(
+                {
+                    "type": "manual_jump",
+                    "seq": event.get("seq"),
+                    "elapsed_sec": elapsed_sec,
+                    "playback": event.get("playback") or {},
+                    "to_index": to_index,
+                    "pred_display_index": anchor_record["pred_display_index"],
+                    "error": error,
+                    "current_line_text": event.get("current_line_text", ""),
+                    "applied": anchor_mode == "apply",
+                }
+            )
+
+    total_transitions = sequential_advances + jump_advances
+    abs_errors = [
+        a["abs_error"] for a in anchor_evals if a["abs_error"] is not None
+    ]
+    anchor_exact = sum(1 for err in abs_errors if err == 0)
+    anchor_within_1 = sum(1 for err in abs_errors if err <= 1)
+
+    total_matches = matches_p1 + matches_p2
+    total_lines = len(lyrics)
+
+    summary = {
+        "trace_path": trace_data["path"],
+        "track": session_start.get("track") or {},
+        "strategy": spec.raw,
+        "anchor_mode": anchor_mode,
+        "total_lines": total_lines,
+        "asr_steps": asr_steps,
+        "non_empty_steps": non_empty_steps,
+        "matches_p1": matches_p1,
+        "matches_p2": matches_p2,
+        "total_matches": total_matches,
+        "unique_lines_matched": len(matched_unique_lines),
+        "line_coverage": round(len(matched_unique_lines) / total_lines, 4)
+        if total_lines > 0
+        else 0.0,
+        "sequential_advances": sequential_advances,
+        "jump_advances": jump_advances,
+        "sequential_rate": round(sequential_advances / total_transitions, 4)
+        if total_transitions > 0
+        else None,
+        "max_jump": max_jump,
+        "mean_match_score": round(sum(match_scores) / len(match_scores), 4)
+        if match_scores
+        else None,
+        "anchors_total": len(abs_errors),
+        "anchor_exact": anchor_exact,
+        "anchor_within_1": anchor_within_1,
+        "anchor_mae": round(sum(abs_errors) / len(abs_errors), 4)
+        if abs_errors
+        else None,
+        "avg_infer_ms": round(sum(infer_ms_values) / len(infer_ms_values), 1)
+        if infer_ms_values
+        else None,
+        "max_infer_ms": round(max(infer_ms_values), 1)
+        if infer_ms_values
+        else None,
+        "infer_over_budget_count": infer_over_budget_count,
+        "step_budget_ms": round(step_budget_ms, 1),
+        "live_parity_rate": round(parity_matches / asr_steps, 4)
+        if asr_steps > 0
+        else 1.0,
+        "parity_matches": parity_matches,
+        "_score_sum": sum(match_scores),
+        "_score_count": len(match_scores),
+        "_anchor_err_sum": sum(abs_errors),
+        "_infer_sum": sum(infer_ms_values),
+        "_infer_count": len(infer_ms_values),
+    }
+
+    return {
+        "summary": summary,
+        "anchors": anchor_evals,
+        "timeline": timeline_rows,
+    }
+
+
+def aggregate_summaries(
+    runs: list[dict[str, Any]], strategy_raw: str, anchor_mode: str
+) -> dict[str, Any]:
+    """Aggregate per-trace summaries for a single strategy across multiple traces."""
+    summaries = [run["summary"] for run in runs]
+    total_lines = sum(s["total_lines"] for s in summaries)
+    unique_matched = sum(s["unique_lines_matched"] for s in summaries)
+    asr_steps = sum(s["asr_steps"] for s in summaries)
+    non_empty_steps = sum(s["non_empty_steps"] for s in summaries)
+    matches_p1 = sum(s["matches_p1"] for s in summaries)
+    matches_p2 = sum(s["matches_p2"] for s in summaries)
+    seq_adv = sum(s["sequential_advances"] for s in summaries)
+    jmp_adv = sum(s["jump_advances"] for s in summaries)
+    total_transitions = seq_adv + jmp_adv
+    score_sum = sum(s["_score_sum"] for s in summaries)
+    score_count = sum(s["_score_count"] for s in summaries)
+    anchors_total = sum(s["anchors_total"] for s in summaries)
+    anchor_exact = sum(s["anchor_exact"] for s in summaries)
+    anchor_within_1 = sum(s["anchor_within_1"] for s in summaries)
+    anchor_err_sum = sum(s["_anchor_err_sum"] for s in summaries)
+    infer_sum = sum(s["_infer_sum"] for s in summaries)
+    infer_count = sum(s["_infer_count"] for s in summaries)
+    max_infers = [s["max_infer_ms"] for s in summaries if s["max_infer_ms"] is not None]
+    parity_matches = sum(s["parity_matches"] for s in summaries)
+
+    return {
+        "traces_count": len(summaries),
+        "strategy": strategy_raw,
+        "anchor_mode": anchor_mode,
+        "total_lines": total_lines,
+        "asr_steps": asr_steps,
+        "non_empty_steps": non_empty_steps,
+        "matches_p1": matches_p1,
+        "matches_p2": matches_p2,
+        "total_matches": matches_p1 + matches_p2,
+        "unique_lines_matched": unique_matched,
+        "line_coverage": round(unique_matched / total_lines, 4)
+        if total_lines > 0
+        else 0.0,
+        "sequential_advances": seq_adv,
+        "jump_advances": jmp_adv,
+        "sequential_rate": round(seq_adv / total_transitions, 4)
+        if total_transitions > 0
+        else None,
+        "max_jump": max((s["max_jump"] for s in summaries), default=0),
+        "mean_match_score": round(score_sum / score_count, 4)
+        if score_count > 0
+        else None,
+        "anchors_total": anchors_total,
+        "anchor_exact": anchor_exact,
+        "anchor_within_1": anchor_within_1,
+        "anchor_mae": round(anchor_err_sum / anchors_total, 4)
+        if anchors_total > 0
+        else None,
+        "avg_infer_ms": round(infer_sum / infer_count, 1)
+        if infer_count > 0
+        else None,
+        "max_infer_ms": round(max(max_infers), 1) if max_infers else None,
+        "infer_over_budget_count": sum(
+            s["infer_over_budget_count"] for s in summaries
+        ),
+        "live_parity_rate": round(parity_matches / asr_steps, 4)
+        if asr_steps > 0
+        else 1.0,
+    }
+
+
+def _fmt_pct(val: float | None) -> str:
+    return f"{val * 100:.1f}%" if val is not None else "-"
+
+
+def _fmt_num(val: float | None, digits: int = 2) -> str:
+    return f"{val:.{digits}f}" if val is not None else "-"
+
+
+def format_comparison_markdown(rows: list[dict[str, Any]]) -> str:
+    """Render strategy summary rows as a GitHub-flavored Markdown table."""
+    headers = [
+        "Strategy",
+        "Steps (NonEmpty)",
+        "Matches (P1+P2)",
+        "Line Cov",
+        "Seq (+1)",
+        "Jumps (>=2)",
+        "Max Jump",
+        "Mean Score",
+        "Anchor Exact / ±1 / MAE",
+        "Infer Avg/Max (Over)",
+        "Live Parity",
+    ]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join([":---"] + ["---:"] * (len(headers) - 1)) + " |",
+    ]
+    for row in rows:
+        anchor_str = (
+            f"{row['anchor_exact']}/{row['anchor_within_1']}/{row['anchors_total']} "
+            f"(MAE {_fmt_num(row['anchor_mae'], 2)})"
+            if row["anchors_total"] > 0
+            else "-"
+        )
+        infer_str = (
+            f"{_fmt_num(row['avg_infer_ms'], 0)}/{_fmt_num(row['max_infer_ms'], 0)}ms "
+            f"({row['infer_over_budget_count']})"
+            if row["avg_infer_ms"] is not None
+            else "-"
+        )
+        cols = [
+            f"`{row['strategy']}`",
+            f"{row['asr_steps']} ({row['non_empty_steps']})",
+            f"{row['total_matches']} ({row['matches_p1']}+{row['matches_p2']})",
+            f"{row['unique_lines_matched']}/{row['total_lines']} ({_fmt_pct(row['line_coverage'])})",
+            _fmt_pct(row["sequential_rate"]),
+            str(row["jump_advances"]),
+            str(row["max_jump"]),
+            _fmt_num(row["mean_match_score"], 3),
+            anchor_str,
+            infer_str,
+            _fmt_pct(row["live_parity_rate"]),
+        ]
+        lines.append("| " + " | ".join(cols) + " |")
+    return "\n".join(lines)
+
+
+def format_comparison_table(rows: list[dict[str, Any]]) -> str:
+    """Render an aligned plain-text table for terminal display."""
+    headers = [
+        "Strategy",
+        "Steps",
+        "P1+P2",
+        "LineCov",
+        "Seq%",
+        "Jump",
+        "MaxJ",
+        "Score",
+        "Anchor(Exact/±1/MAE)",
+        "Infer(Avg/Max/Over)",
+        "Parity",
+    ]
+    table_rows: list[list[str]] = []
+    for row in rows:
+        anchor_str = (
+            f"{row['anchor_exact']}/{row['anchor_within_1']}/{row['anchors_total']}"
+            f" ({_fmt_num(row['anchor_mae'], 2)})"
+            if row["anchors_total"] > 0
+            else "-"
+        )
+        infer_str = (
+            f"{_fmt_num(row['avg_infer_ms'], 0)}/{_fmt_num(row['max_infer_ms'], 0)}ms"
+            f" ({row['infer_over_budget_count']})"
+            if row["avg_infer_ms"] is not None
+            else "-"
+        )
+        table_rows.append(
+            [
+                str(row["strategy"]),
+                f"{row['asr_steps']}({row['non_empty_steps']})",
+                f"{row['matches_p1']}+{row['matches_p2']}",
+                f"{row['unique_lines_matched']}/{row['total_lines']} ({_fmt_pct(row['line_coverage'])})",
+                _fmt_pct(row["sequential_rate"]),
+                str(row["jump_advances"]),
+                str(row["max_jump"]),
+                _fmt_num(row["mean_match_score"], 3),
+                anchor_str,
+                infer_str,
+                _fmt_pct(row["live_parity_rate"]),
+            ]
+        )
+
+    widths = [
+        max(len(headers[i]), *(len(r[i]) for r in table_rows))
+        for i in range(len(headers))
+    ]
+    sep = " | "
+    out = [
+        sep.join(headers[i].ljust(widths[i]) for i in range(len(headers))),
+        "-+-".join("-" * widths[i] for i in range(len(headers))),
+    ]
+    for r in table_rows:
+        out.append(sep.join(r[i].ljust(widths[i]) for i in range(len(headers))))
+    return "\n".join(out)
+
+
+def format_timeline(run: dict[str, Any]) -> str:
+    """Format a step-by-step timeline for one trace and strategy."""
+    summary = run["summary"]
+    track = summary["track"]
+    title = track.get("title") or track.get("song_name") or Path(summary["trace_path"]).name
+    artist = track.get("artist") or track.get("artist_name") or ""
+    header = f"--- Timeline: {artist} - {title} [{summary['strategy']}] ---"
+    lines = [header]
+
+    for item in run["timeline"]:
+        t_str = f"{item['elapsed_sec']:6.2f}s"
+        pb = item.get("playback") or {}
+        sp_str = format_ms(pb.get("estimated_progress_ms"))
+        if item["type"] == "manual_jump":
+            err = item.get("error")
+            err_txt = f"{err:+d}" if err is not None else "-"
+            tag = "APPLIED" if item.get("applied") else "EVAL"
+            lines.append(
+                f"  #{item['seq']:<3} {t_str} [SP {sp_str}] [MANUAL_JUMP:{tag}] "
+                f"to_line={item['to_index'] + 1} (pred={item['pred_display_index'] + 1}, err={err_txt}) "
+                f"'{item.get('current_line_text', '')}'"
+            )
+            continue
+
+        asr = item.get("asr") or {}
+        infer = asr.get("infer_ms")
+        nsp = asr.get("no_speech_prob_max")
+        logp = asr.get("avg_logprob_mean")
+        meta_parts = []
+        if infer is not None:
+            meta_parts.append(f"infer={infer:.0f}ms")
+        if nsp is not None:
+            meta_parts.append(f"nsp={nsp:.2f}")
+        if logp is not None:
+            meta_parts.append(f"logp={logp:.2f}")
+        meta_str = " ".join(meta_parts)
+
+        top_cands = sorted(
+            item.get("candidates") or [],
+            key=lambda c: float(c.get("score", 0.0)),
+            reverse=True,
+        )[:3]
+        cand_str = ", ".join(
+            f"L{int(c['index']) + 1}:{float(c['score']):.2f}"
+            for c in top_cands
+        )
+
+        decision = item["decision"]
+        if item["matched_index"] is not None:
+            dec_str = (
+                f"{decision}->L{int(item['matched_index']) + 1} "
+                f"(disp=L{int(item['display_index']) + 1}, "
+                f"score={item['best_score']:.2f})"
+            )
+        else:
+            best = (
+                f"{item['best_score']:.2f}"
+                if item.get("best_score") is not None
+                else "-"
+            )
+            dec_str = f"{decision} (best={best})"
+
+        lines.append(
+            f"  #{item['seq']:<3} {t_str} [SP {sp_str}] "
+            f"ASR='{item['raw_text']}' | buf='{item['buffer_after_trim']}' | "
+            f"{meta_str} | top=[{cand_str}] | {dec_str}"
+        )
+
+    return "\n".join(lines)
+
+
+def format_strategy_diffs(
+    trace_path: str, runs_by_strategy: list[dict[str, Any]]
+) -> str:
+    """Format steps where two or more strategies produced different decisions."""
+    if len(runs_by_strategy) < 2:
+        return ""
+
+    timelines = [run["timeline"] for run in runs_by_strategy]
+    names = [run["summary"]["strategy"] for run in runs_by_strategy]
+    step_count = min(len(tl) for tl in timelines)
+
+    diff_blocks: list[str] = []
+    for idx in range(step_count):
+        items = [tl[idx] for tl in timelines]
+        if items[0]["type"] != "asr_step":
+            continue
+        signatures = {
+            (it["decision"], it["matched_index"], it["display_index"])
+            for it in items
+        }
+        if len(signatures) <= 1:
+            continue
+
+        sample = items[0]
+        block = [
+            f"  Step #{sample['seq']} @ {sample['elapsed_sec']:.2f}s | ASR='{sample['raw_text']}'"
+        ]
+        for strat_name, it in zip(names, items):
+            matched_lbl = (
+                f"L{int(it['matched_index']) + 1}"
+                if it["matched_index"] is not None
+                else "-"
+            )
+            score_lbl = (
+                f"{it['best_score']:.3f}"
+                if it.get("best_score") is not None
+                else "-"
+            )
+            block.append(
+                f"    - {strat_name}: {it['decision']} matched={matched_lbl} "
+                f"score={score_lbl} buf='{it['buffer_after_trim']}'"
+            )
+        diff_blocks.append("\n".join(block))
+
+    header = f"--- Strategy Diffs ({Path(trace_path).name}) ---"
+    if not diff_blocks:
+        return f"{header}\n  (無決策差異)"
+    return header + "\n" + "\n".join(diff_blocks)
+
+
+def _strip_internal_fields(summary: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in summary.items() if not k.startswith("_")}
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Replay match trace JSONL files and benchmark lyric matching strategies."
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="Trace .jsonl files or directories containing trace files.",
+    )
+    parser.add_argument(
+        "--strategy",
+        action="append",
+        dest="strategies",
+        default=[],
+        help=(
+            "Strategy spec to evaluate (repeatable), e.g. 'baseline' or "
+            "'baseline:threshold=0.70,recovery=0.55,lookahead=5'. Defaults to 'baseline'."
+        ),
+    )
+    parser.add_argument(
+        "--anchor-mode",
+        choices=("eval", "apply"),
+        default="eval",
+        help=(
+            "'eval' treats manual_jump events as ground-truth error checkpoints; "
+            "'apply' replays manual jumps into the engine state."
+        ),
+    )
+    parser.add_argument(
+        "--timeline",
+        action="store_true",
+        help="Print per-step timeline details for each trace and strategy.",
+    )
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        help="When comparing >= 2 strategies, print steps where decisions differ.",
+    )
+    parser.add_argument(
+        "--export-md",
+        type=str,
+        default="",
+        help="Write Markdown comparison report to the specified file path.",
+    )
+    parser.add_argument(
+        "--export-json",
+        type=str,
+        default="",
+        help="Write structured evaluation results JSON to the specified file path.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    raw_strategies = args.strategies or ["baseline"]
+    try:
+        strategy_specs = [parse_strategy_spec(s) for s in raw_strategies]
+        trace_paths = resolve_trace_paths(args.paths)
+        traces = [load_trace(path) for path in trace_paths]
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
+
+    runs_by_trace: list[list[dict[str, Any]]] = []
+    runs_by_strategy: dict[str, list[dict[str, Any]]] = {
+        spec.raw: [] for spec in strategy_specs
+    }
+
+    for trace in traces:
+        per_trace_runs: list[dict[str, Any]] = []
+        for spec in strategy_specs:
+            run = replay_trace(trace, spec, anchor_mode=args.anchor_mode)
+            per_trace_runs.append(run)
+            runs_by_strategy[spec.raw].append(run)
+        runs_by_trace.append(per_trace_runs)
+
+    for trace, per_trace_runs in zip(traces, runs_by_trace):
+        track = trace["session_start"].get("track") or {}
+        title = track.get("title") or track.get("song_name") or Path(trace["path"]).name
+        artist = track.get("artist") or track.get("artist_name") or "Unknown"
+        print(
+            f"\n=== Trace: {artist} - {title} ({Path(trace['path']).name}) "
+            f"[anchor_mode={args.anchor_mode}] ==="
+        )
+        print(
+            format_comparison_table(
+                [_strip_internal_fields(r["summary"]) for r in per_trace_runs]
+            )
+        )
+        if args.timeline:
+            for run in per_trace_runs:
+                print()
+                print(format_timeline(run))
+        if args.diff and len(per_trace_runs) >= 2:
+            print()
+            print(format_strategy_diffs(trace["path"], per_trace_runs))
+
+    aggregated_rows = [
+        aggregate_summaries(
+            runs_by_strategy[spec.raw], spec.raw, args.anchor_mode
+        )
+        for spec in strategy_specs
+    ]
+    if len(traces) > 1:
+        print(
+            f"\n=== Overall Summary ({len(traces)} traces, anchor_mode={args.anchor_mode}) ==="
+        )
+        print(format_comparison_table(aggregated_rows))
+
+    if args.export_md:
+        md_sections = [
+            f"# Match Evaluation Report (`anchor_mode={args.anchor_mode}`)",
+            "",
+            f"- Traces evaluated: {len(traces)}",
+            "",
+            "## Overall Comparison",
+            "",
+            format_comparison_markdown(aggregated_rows),
+        ]
+        if len(traces) > 1:
+            md_sections.extend(["", "## Per-Trace Results"])
+            for trace, per_trace_runs in zip(traces, runs_by_trace):
+                track = trace["session_start"].get("track") or {}
+                title = (
+                    track.get("title")
+                    or track.get("song_name")
+                    or Path(trace["path"]).name
+                )
+                artist = track.get("artist") or track.get("artist_name") or ""
+                md_sections.extend(
+                    [
+                        "",
+                        f"### {artist} - {title} (`{Path(trace['path']).name}`)",
+                        "",
+                        format_comparison_markdown(
+                            [
+                                _strip_internal_fields(r["summary"])
+                                for r in per_trace_runs
+                            ]
+                        ),
+                    ]
+                )
+        md_path = Path(args.export_md)
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+        md_path.write_text("\n".join(md_sections) + "\n", encoding="utf-8")
+        print(f"\n[OK] 已匯出 Markdown 報表: {md_path}")
+
+    if args.export_json:
+        json_payload = {
+            "anchor_mode": args.anchor_mode,
+            "overall": aggregated_rows,
+            "traces": [
+                {
+                    "path": trace["path"],
+                    "track": trace["session_start"].get("track") or {},
+                    "results": [
+                        {
+                            "summary": _strip_internal_fields(run["summary"]),
+                            "anchors": run["anchors"],
+                        }
+                        for run in per_trace_runs
+                    ],
+                }
+                for trace, per_trace_runs in zip(traces, runs_by_trace)
+            ],
+        }
+        json_path = Path(args.export_json)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(
+            json.dumps(json_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"[OK] 已匯出 JSON 報表: {json_path}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,5 +1,6 @@
 """Audio capture loop and faster-whisper ASR worker."""
 
+import inspect
 import math
 import os
 import threading
@@ -187,6 +188,49 @@ def _emit_asr_status(
             "fallback": bool(fallback),
         },
     )
+
+
+def _safe_float(value: Any, digits: int = 4) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(numeric) or math.isinf(numeric):
+        return None
+    return round(numeric, digits)
+
+
+def _callback_accepts_meta(callback: Any) -> bool:
+    if callback is None:
+        return False
+    try:
+        sig = inspect.signature(callback)
+    except (ValueError, TypeError):
+        return False
+
+    positional_count = 0
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional_count += 1
+    return positional_count >= 2
+
+
+def _invoke_asr_callback(
+    callback: Any, text: str, asr_meta: dict[str, Any] | None = None
+) -> None:
+    if callback is None:
+        return
+    if asr_meta is not None and _callback_accepts_meta(callback):
+        callback(text, asr_meta)
+    else:
+        callback(text)
 
 
 def _asr_worker_loop(
@@ -396,7 +440,10 @@ def _asr_worker_loop(
                 print("🔇 [靜音] 目前無音訊輸入，跳過本輪辨識。")
             return
 
+        audio_rms, audio_peak, _ = compute_audio_level(audio_data)
+
         try:
+            t0 = time.perf_counter()
             segments, _ = model.transcribe(
                 audio_data,
                 language=config.ASR_LANGUAGE,
@@ -406,15 +453,59 @@ def _asr_worker_loop(
             )
 
             try:
-                result_text = "".join(
-                    segment.text for segment in segments if segment and segment.text
-                ).strip()
+                seg_list = [
+                    segment for segment in segments if segment is not None
+                ]
             except Exception as e:
                 error_text = str(e)
                 if "cublas" in error_text.lower() or "cuda" in error_text.lower():
                     raise
                 print(f"⚠️ Whisper 迭代 segment 時發生錯誤: {e}")
-                result_text = ""
+                seg_list = []
+
+            infer_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+
+            segment_details: list[dict[str, Any]] = []
+            for segment in seg_list:
+                seg_text = str(getattr(segment, "text", "") or "")
+                segment_details.append(
+                    {
+                        "text": seg_text,
+                        "start": _safe_float(
+                            getattr(segment, "start", None), 3
+                        ),
+                        "end": _safe_float(getattr(segment, "end", None), 3),
+                        "avg_logprob": _safe_float(
+                            getattr(segment, "avg_logprob", None), 4
+                        ),
+                        "no_speech_prob": _safe_float(
+                            getattr(segment, "no_speech_prob", None), 4
+                        ),
+                        "compression_ratio": _safe_float(
+                            getattr(segment, "compression_ratio", None), 4
+                        ),
+                    }
+                )
+
+            logprobs = [
+                s["avg_logprob"]
+                for s in segment_details
+                if s["avg_logprob"] is not None
+            ]
+            no_speeches = [
+                s["no_speech_prob"]
+                for s in segment_details
+                if s["no_speech_prob"] is not None
+            ]
+            comp_ratios = [
+                s["compression_ratio"]
+                for s in segment_details
+                if s["compression_ratio"] is not None
+            ]
+
+            raw_text_before_filter = "".join(
+                s["text"] for s in segment_details if s["text"]
+            ).strip()
 
             hallucinations = [
                 "ご視聴ありがとうございました",
@@ -423,17 +514,47 @@ def _asr_worker_loop(
                 "高評価",
                 "よろしくお願いします",
             ]
+            hallucinations_removed = [
+                h for h in hallucinations if h in raw_text_before_filter
+            ]
+            result_text = raw_text_before_filter
             for h in hallucinations:
                 result_text = result_text.replace(h, "")
             result_text = result_text.strip()
 
+            asr_meta: dict[str, Any] = {
+                "raw_text": result_text,
+                "raw_text_before_filter": raw_text_before_filter,
+                "hallucinations_removed": hallucinations_removed,
+                "infer_ms": infer_ms,
+                "audio_rms": round(audio_rms, 4),
+                "audio_peak": round(audio_peak, 4),
+                "device_mode": _asr_active_device,
+                "model": config.ASR_MODEL_SIZE,
+                "segments": segment_details,
+                "avg_logprob_mean": round(sum(logprobs) / len(logprobs), 4)
+                if logprobs
+                else None,
+                "no_speech_prob_max": round(max(no_speeches), 4)
+                if no_speeches
+                else None,
+                "compression_ratio_max": round(max(comp_ratios), 4)
+                if comp_ratios
+                else None,
+            }
+
+            callback = _asr_callback or on_recognized_text
             if result_text:
                 recognition_count += 1
                 if config.DEBUG_RECOGNITION:
                     print(f"🎤 [#{recognition_count}] 識別: {result_text}")
-                callback = _asr_callback or on_recognized_text
-                if callback is not None:
-                    callback(result_text)
+                _invoke_asr_callback(callback, result_text, asr_meta)
+            elif (
+                config.MATCH_TRACE_ENABLED
+                and callback is not None
+                and _callback_accepts_meta(callback)
+            ):
+                callback("", asr_meta)
 
         except Exception as e:
             error_text = str(e)
