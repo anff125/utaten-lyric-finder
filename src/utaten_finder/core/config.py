@@ -60,6 +60,8 @@ MAIN_LOOP_SLEEP_SECONDS = 0.5
 DEBUG_POLLING = False
 DEBUG_RECOGNITION = False
 DEBUG = False
+MATCH_TRACE_ENABLED = False
+MATCH_TRACE_MAX_FILES = 50
 # 支援: spotify / system_media
 AUDIO_SOURCE_MODE = "spotify"
 # 當音源為 spotify 時，是否只錄製 Spotify 程序的獨立音訊 (Windows 11 Process Loopback)
@@ -68,6 +70,7 @@ CAPTURE_SPOTIFY_PROCESS_ONLY = True
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / "data"
 ASSETS_DIR = PROJECT_ROOT / "assets"
+TRACES_DIR = DATA_DIR / "traces"
 RUNTIME_SETTINGS_FILE = DATA_DIR / "runtime_settings.json"
 SONG_CACHE_FILE = DATA_DIR / "song_cache.json"
 SPOTIFY_TOKEN_CACHE_FILE = DATA_DIR / "spotify_token_cache"
@@ -80,6 +83,7 @@ _PERSISTED_KEYS = {
     "DEBUG_POLLING",
     "DEBUG_RECOGNITION",
     "DEBUG",
+    "MATCH_TRACE_ENABLED",
     "AUDIO_SOURCE_MODE",
     "CAPTURE_SPOTIFY_PROCESS_ONLY",
     "ASR_ENABLED",
@@ -168,6 +172,9 @@ def _load_runtime_settings() -> None:
     recognition_debug = data.get("DEBUG_RECOGNITION", data.get("DEBUG", DEBUG))
     set_polling_debug(polling_debug, persist=False)
     set_recognition_debug(recognition_debug, persist=False)
+    set_match_trace_enabled(
+        data.get("MATCH_TRACE_ENABLED", MATCH_TRACE_ENABLED), persist=False
+    )
     set_asr_enabled(data.get("ASR_ENABLED", ASR_ENABLED), persist=False)
 
     model_size = data.get("ASR_MODEL_SIZE", ASR_MODEL_SIZE)
@@ -216,6 +223,13 @@ def set_recognition_debug(enabled: bool, persist: bool = True) -> None:
 def set_debug(enabled: bool, persist: bool = True) -> None:
     set_polling_debug(enabled, persist=False)
     set_recognition_debug(enabled, persist=False)
+    if persist:
+        _save_runtime_settings()
+
+
+def set_match_trace_enabled(enabled: bool, persist: bool = True) -> None:
+    global MATCH_TRACE_ENABLED
+    MATCH_TRACE_ENABLED = bool(enabled)
     if persist:
         _save_runtime_settings()
 

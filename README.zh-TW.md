@@ -112,8 +112,20 @@ pip install -r requirements.txt
   - **即時音訊能量條 (Live Audio VU Meter)**：以約 12.5 Hz 節流顯示目前擷取的音訊 RMS/Peak 能量動態與來源裝置（`Spotify.exe` 獨立進程或系統混音）。
   - 顯示目前 ASR 運算裝置徽章（`CUDA GPU`、`CPU 模式` 或 `CPU 降級`）、模型載入/暖身進度條、最新辨識日文字串預覽與比對相似度分數。
 - **滑出式抽屜面板**：
-  - **⚙️ 設定抽屜**：設定 Spotify `Client ID`、`Client Secret`、`Redirect URI` 與一鍵 OAuth 授權、切換音源模式（`Spotify API` / `System Media`）、開關 `Spotify Process Loopback`、啟停 ASR 自動捲動、選擇 Whisper 模型（`turbo`、`kotoba-whisper-v2.0`、`large-v3`、`medium`、`small`、`base`）、運算裝置（`auto` / `cuda` / `cpu`）及 Polling / Recognition Debug 日誌開關。
+  - **⚙️ 設定抽屜**：設定 Spotify `Client ID`、`Client Secret`、`Redirect URI` 與一鍵 OAuth 授權、切換音源模式（`Spotify API` / `System Media`）、開關 `Spotify Process Loopback`、啟停 ASR 自動捲動、選擇 Whisper 模型（`turbo`、`kotoba-whisper-v2.0`、`large-v3`、`medium`、`small`、`base`）、運算裝置（`auto` / `cuda` / `cpu`）、Polling / Recognition Debug 日誌開關，以及 **比對過程 Trace 記錄 (`data/traces/*.jsonl`)**。
   - **📜 即時日誌抽屜**：統一收集 `stdout`、`stderr` 與 Python `logging` 紀錄，支援依等級篩選（全部 / 資訊 / 警告 / 錯誤 / 除錯）、自動捲動、一鍵複製與清空。
+
+### 離線比對過程檢視與策略評測
+
+在 **⚙️ 設定** 勾選 **「記錄比對過程 Trace (`data/traces/*.jsonl`)」** 後播放歌曲（途中任何手動點擊歌詞定位也會一併記錄為基準錨點），即可離線檢視每步分數或比較不同比對策略／門檻的效果：
+
+```powershell
+# 檢視單首歌曲的每步 ASR 識別、候選行分數與手動定位時間軸
+.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\<檔名>.jsonl --timeline
+
+# 針對錄製好的 Trace 並列比較不同參數或策略，並列出決策分歧點
+.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy baseline:threshold=0.70,recovery=0.55 --diff
+```
 
 ### 自行建立 Release 可攜包
 
@@ -154,13 +166,14 @@ utaten-lyric-finder/
 │   └── web/                            # PyWebView 前端介面 (index.html, styles.css, app.js)
 ├── data/                               # 執行期設定、Spotify Token、歌曲快取與 WebView 設定檔
 ├── scripts/
-│   └── build_portable.ps1              # Windows 可攜版 ZIP 打包腳本
-├── tests/                              # 單元測試 (歌詞解析器、JsApi/EventBus、Phase 3 功能)
+│   ├── build_portable.ps1              # Windows 可攜版 ZIP 打包腳本
+│   └── eval_matching.py                # 離線 JSONL 比對 Trace 重播與評測腳本
+├── tests/                              # 單元測試 (歌詞解析器、JsApi/EventBus、Trace/評測、Phase 3)
 └── src/utaten_finder/
     ├── core/                           # config.py, events.py (EventBus + logging 擷取), orchestrator.py
     ├── media/                          # spotify_api.py (API + OAuth 伺服器), system_media.py (SMTC)
     ├── audio/                          # cuda_loader.py, process_loopback.py, asr_worker.py (ASR + VU Meter)
-    ├── lyrics/                         # web_scraper.py, parser.py, matching.py, song_cache.py
+    ├── lyrics/                         # web_scraper.py, parser.py, matching.py, song_cache.py, trace.py
     └── ui/                             # webview_app.py (PyWebView 視窗控制器與 JsApi 橋接)
 ```
 

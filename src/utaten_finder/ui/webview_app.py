@@ -18,6 +18,7 @@ from utaten_finder.core.orchestrator import (
 )
 from utaten_finder.lyrics.matching import LyricSyncEngine
 from utaten_finder.lyrics.song_cache import set_cached_data
+from utaten_finder.lyrics.trace import MatchTraceRecorder
 from utaten_finder.lyrics.web_scraper import normalize_utaten_url
 from utaten_finder.media.spotify_api import (
     exchange_callback_url_for_token,
@@ -165,8 +166,10 @@ class WebViewBridge:
 class AppController:
     """Backend state and action coordinator for the PyWebView window."""
 
-    def __init__(self) -> None:
-        self._sync_engine = LyricSyncEngine()
+    def __init__(
+        self, *, trace_recorder: MatchTraceRecorder | None = None
+    ) -> None:
+        self._sync_engine = LyricSyncEngine(trace_recorder=trace_recorder)
         self._state_lock = threading.Lock()
         self._worker_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -265,6 +268,7 @@ class AppController:
                 "asr_device": config.ASR_DEVICE,
                 "debug_polling": config.DEBUG_POLLING,
                 "debug_recognition": config.DEBUG_RECOGNITION,
+                "match_trace_enabled": config.MATCH_TRACE_ENABLED,
             },
             "asr_models": dict(config.ASR_MODEL_MAP),
             "token_valid": token_valid,
@@ -317,6 +321,12 @@ class AppController:
 
             if "debug_recognition" in data:
                 config.set_recognition_debug(bool(data["debug_recognition"]))
+
+            if "match_trace_enabled" in data:
+                enabled = bool(data["match_trace_enabled"])
+                config.set_match_trace_enabled(enabled)
+                if not enabled:
+                    self._sync_engine.close_trace_session("disabled")
 
             return {"ok": True}
         except Exception as exc:
@@ -372,6 +382,7 @@ class AppController:
         asr_mod = sys.modules.get("utaten_finder.audio.asr_worker")
         if asr_mod is not None and hasattr(asr_mod, "set_asr_listening"):
             asr_mod.set_asr_listening(False)
+        self._sync_engine.close_trace_session("stopped", clear_pending=True)
         return {"ok": True, "running": False}
 
     def jump_to_line(self, lyric_index: int) -> dict[str, Any]:
@@ -429,8 +440,10 @@ class AppController:
             load_lyrics_into_engine(
                 normalized_url,
                 self._sync_engine,
+                song_id=str(song_id or ""),
                 song_name=song_name,
                 artist_name=artist_name,
+                source=str(track.get("source", "")),
                 cache_status="perfect",
             )
 
@@ -609,6 +622,7 @@ class AppController:
         if self._worker_thread is not None and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=2.0)
 
+        self._sync_engine.close_trace_session("shutdown", clear_pending=True)
         for name, fn in self._bus_handlers.items():
             events.bus.unsubscribe(name, fn)
         self._bus_handlers.clear()
@@ -665,7 +679,7 @@ def main(debug: bool = False) -> None:
     if not index_path.is_file():
         raise FileNotFoundError(f"找不到前端頁面檔案: {index_path}")
 
-    controller = AppController()
+    controller = AppController(trace_recorder=MatchTraceRecorder())
     api = JsApi(controller)
 
     config.report_startup_progress(0.90, "正在建立 PyWebView 單一視窗介面...")

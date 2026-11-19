@@ -25,9 +25,10 @@ This document provides context, architecture details, and mandatory verification
   - `parser.py`: Browserless UtaTen HTML parser (`parse_utaten_lyrics`) producing sanitized `<ruby>/<rt>` lyric lines and normalized matching fields for both `<p>` and `<br>` DOM layouts.
   - `web_scraper.py`: Searches UtaTen / DuckDuckGo (`ddgs`) and fetches UtaTen lyric page HTML (`fetch_utaten_lyrics_html`).
   - `song_cache.py`: Local JSON cache (`data/song_cache.json`) mapping track keys to UtaTen URLs and match quality status.
+  - `trace.py`: Thread-safe JSONL match trace recorder (`MatchTraceRecorder`) and reader (`load_trace`) writing structured synchronization diagnostics to `data/traces/`.
 - **`src/utaten_finder/media/`**:
   - `spotify_api.py` & `system_media.py`: Track metadata providers for Spotify Web API (`spotipy`) + OAuth callback HTTP server (`wait_for_oauth_callback`) and Windows SMTC (`winrt`).
-- **`assets/`, `data/`, `scripts/build_portable.ps1`, `start.bat`, & `tests/`**: Static assets (`assets/app.ico`, `assets/web/{index.html,styles.css,app.js}`), ignored runtime data (`data/`), portable Windows packaging script, console-less launcher (`start.bat` using `pythonw.exe` by default with `--console` / `--cli` / `--debug` support), and unit tests (`tests/`).
+- **`assets/`, `data/`, `scripts/`, `start.bat`, & `tests/`**: Static assets (`assets/app.ico`, `assets/web/{index.html,styles.css,app.js}`), ignored runtime data (`data/`), Windows portable build & offline match evaluation scripts (`scripts/build_portable.ps1`, `scripts/eval_matching.py`), console-less launcher (`start.bat` using `pythonw.exe` by default with `--console` / `--cli` / `--debug` support), and unit tests (`tests/`).
 
 ---
 
@@ -35,6 +36,7 @@ This document provides context, architecture details, and mandatory verification
 
 - **Virtual Environment**: Local Python environment is located at `.venv\` (`.venv\Scripts\python.exe`, `.venv\Scripts\pythonw.exe`, `.venv\Scripts\ruff.exe`).
 - **Git Executable**: If `git` is not on the default PowerShell `PATH`, use `"$env:LOCALAPPDATA\Programs\Git\cmd\git.exe"` or `"C:\Program Files\Git\cmd\git.exe"`.
+- **Shell & Non-Interactive Execution**: Tool shells spawn Windows PowerShell 5.1 by default even when PowerShell 7 (`pwsh`) is installed. Never execute interactive commands that may block waiting for prompts or `stdin`; always pass non-interactive flags (`-NoProfile -NonInteractive`) and explicitly invoke `pwsh -NoProfile -NonInteractive` for PowerShell 7 / `PSScriptAnalyzer` checks.
 - **File Encodings & Line Endings**:
   - **`*.bat` files (`start.bat`, `update.bat`)**: MUST use Windows **`CRLF` (`\r\n`)** line endings and **UTF-8 without BOM** (or pure ASCII). `cmd.exe` misparses byte offsets if a batch file uses `LF` line endings or UTF-8 BOM without `chcp 65001 >nul`.
   - **`*.ps1` files (`scripts/build_portable.ps1`)**: Must include a **UTF-8 BOM** if it contains non-ASCII characters (such as Traditional Chinese comments), as required by Windows PowerShell 5.1 and `PSScriptAnalyzer`.
@@ -65,14 +67,14 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push and pull reque
 
 ### Check 3: Runtime Smoke Test
 ```powershell
-.\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'src'); import webview; from utaten_finder.core import config, events, orchestrator; from utaten_finder.media import spotify_api, system_media; from utaten_finder.lyrics import web_scraper, parser, matching, song_cache; from utaten_finder.audio import process_loopback, cuda_loader, asr_worker; from utaten_finder.ui import webview_app; print('[SUCCESS] runtime smoke imports loaded')"
+.\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'src'); import webview; from utaten_finder.core import config, events, orchestrator; from utaten_finder.media import spotify_api, system_media; from utaten_finder.lyrics import web_scraper, parser, matching, song_cache, trace; from utaten_finder.audio import process_loopback, cuda_loader, asr_worker; from utaten_finder.ui import webview_app; print('[SUCCESS] runtime smoke imports loaded')"
 ```
 - Ensure module-level imports do not crash when optional hardware or audio devices are absent.
 
 ### Check 4: PowerShell Script Analyzer (when editing `*.ps1`)
 If `scripts/build_portable.ps1` is modified:
 ```powershell
-Invoke-ScriptAnalyzer -Path ./scripts/build_portable.ps1 -EnableExit
+pwsh -NoProfile -NonInteractive -Command "Invoke-ScriptAnalyzer -Path ./scripts/build_portable.ps1 -EnableExit"
 ```
 - Also ensure `scripts/build_portable.ps1` retains its UTF-8 with BOM encoding and that any newly added `.py` module in `app.py` or `src/utaten_finder/` or asset in `assets/web/` is covered by `$filesToCopy` / the `src/utaten_finder` recursive copy and the `files = [...]` list in `update.bat` inside `scripts/build_portable.ps1`.
 
@@ -91,5 +93,7 @@ Invoke-ScriptAnalyzer -Path ./scripts/build_portable.ps1 -EnableExit
      3. Update the runtime smoke test in `.github/workflows/ci.yml` (if applicable)
 3. **Bilingual Documentation**:
    - User-facing workflow or feature changes should be reflected in both `README.md` (English) and `README.zh-TW.md` (Traditional Chinese).
-4. **Auto-Commit After Completing Tasks**:
-   - Whenever code, configuration, or documentation changes are completed and all mandatory pre-commit checks (Section 3) pass, **automatically stage and create a descriptive `git commit`** without waiting for the user to ask.
+4. **Branch, Auto-Commit & Pull Request Workflow**:
+   - Develop feature, accuracy, refactor, and issue-tracked changes on a dedicated branch off `main` (e.g., `feat/issue-<n>-<slug>` or `fix/<slug>`) and merge via Pull Request so GitHub Actions CI validates every change before it reaches `main` (protecting portable `update.bat` users who sync directly from `main`).
+   - Whenever code, configuration, or documentation changes are completed and all mandatory pre-commit checks (Section 3) pass, **automatically stage and create a descriptive `git commit`** on the working branch without waiting for the user to ask, and reference `Closes #<n>` in the PR body (and commit when applicable).
+   - Tiny low-risk documentation typos may be committed directly if the user prefers.

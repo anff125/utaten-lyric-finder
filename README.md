@@ -110,8 +110,20 @@ All runtime configuration and caches are stored centrally under `data/` (`data/r
   - **Live Audio VU Meter** (~12.5 Hz) visualizes incoming RMS/peak energy and active capture source (`Spotify.exe` Process Loopback or system loopback).
   - Displays the active inference device badge (`CUDA GPU`, `CPU Mode`, or `CPU Fallback`), startup/model load progress bar, live recognized Japanese transcript preview, and match score badge.
 - **Slide-over Drawers**:
-  - **⚙️ Settings Drawer**: Configure Spotify `Client ID`, `Client Secret`, `Redirect URI`, one-click Spotify OAuth authorization, Audio Source (`Spotify API` / `System Media`), `Spotify Process Loopback`, ASR auto-scroll toggle, Whisper model (`turbo`, `kotoba-whisper-v2.0`, `large-v3`, `medium`, `small`, `base`), compute device (`auto` / `cuda` / `cpu`), and Polling/Recognition debug toggles.
+  - **⚙️ Settings Drawer**: Configure Spotify `Client ID`, `Client Secret`, `Redirect URI`, one-click Spotify OAuth authorization, Audio Source (`Spotify API` / `System Media`), `Spotify Process Loopback`, ASR auto-scroll toggle, Whisper model (`turbo`, `kotoba-whisper-v2.0`, `large-v3`, `medium`, `small`, `base`), compute device (`auto` / `cuda` / `cpu`), Polling/Recognition debug toggles, and **Match Trace JSONL recording** (`data/traces/*.jsonl`).
   - **📜 Live Logs Drawer**: Captures `stdout`, `stderr`, and Python `logging` events with level filtering (`all`, `info`, `warn`, `error`, `debug`), auto-scroll, copy, and clear actions.
+
+### Offline Match Evaluation & Strategy Comparison
+
+Enable **Record match trace (`data/traces/*.jsonl`)** in **⚙️ Settings** while playing songs (any manual lyric clicks are also recorded as ground-truth anchors). You can then inspect timelines and compare matcher strategies/thresholds offline:
+
+```powershell
+# Inspect step-by-step ASR scores and manual jump anchors
+.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\<trace>.jsonl --timeline
+
+# Compare multiple strategies or thresholds on recorded traces
+.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy baseline:threshold=0.70,recovery=0.55 --diff
+```
 
 ### Build your own portable release package
 
@@ -152,13 +164,14 @@ utaten-lyric-finder/
 │   └── web/                            # PyWebView frontend (index.html, styles.css, app.js)
 ├── data/                               # Runtime settings, OAuth tokens, song cache, WebView profile
 ├── scripts/
-│   └── build_portable.ps1              # Windows portable ZIP build script
-├── tests/                              # Unit test suite (parser, JsApi/EventBus, Phase 3 features)
+│   ├── build_portable.ps1              # Windows portable ZIP build script
+│   └── eval_matching.py                # Offline JSONL match trace replay & benchmark CLI
+├── tests/                              # Unit test suite (parser, JsApi/EventBus, trace/eval, Phase 3)
 └── src/utaten_finder/
     ├── core/                           # config.py, events.py (EventBus + logging capture), orchestrator.py
     ├── media/                          # spotify_api.py (API + OAuth server), system_media.py (SMTC)
     ├── audio/                          # cuda_loader.py, process_loopback.py, asr_worker.py (ASR + VU meter)
-    ├── lyrics/                         # web_scraper.py, parser.py, matching.py, song_cache.py
+    ├── lyrics/                         # web_scraper.py, parser.py, matching.py, song_cache.py, trace.py
     └── ui/                             # webview_app.py (PyWebView controller & JsApi bridge)
 ```
 

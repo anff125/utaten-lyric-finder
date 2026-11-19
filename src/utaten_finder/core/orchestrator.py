@@ -16,6 +16,7 @@ config.report_startup_progress(0.08, "載入歌詞比對與解析模組...")
 from utaten_finder.lyrics.matching import LyricSyncEngine  # noqa: E402
 from utaten_finder.lyrics.parser import parse_utaten_lyrics  # noqa: E402
 from utaten_finder.lyrics.song_cache import get_cached_data, set_cached_data  # noqa: E402
+from utaten_finder.lyrics.trace import MatchTraceRecorder  # noqa: E402
 from utaten_finder.media.spotify_api import get_spotify_client  # noqa: E402
 
 config.report_startup_progress(0.14, "載入系統媒體與歌詞爬蟲模組...")
@@ -38,8 +39,10 @@ def load_lyrics_into_engine(
     url: str,
     sync_engine: LyricSyncEngine,
     *,
+    song_id: str = "",
     song_name: str = "",
     artist_name: str = "",
+    source: str = "",
     cache_status: str = "",
 ) -> dict[str, Any]:
     """Fetch and parse a UtaTen lyric page (or clear lyrics) and publish to EventBus."""
@@ -50,7 +53,22 @@ def load_lyrics_into_engine(
             html_text = fetch_utaten_lyrics_html(normalized_url)
             parsed = parse_utaten_lyrics(html_text)
             lines = parsed.get("lines", [])
-            sync_engine.reset_with_lyrics(lines)
+            track_title = parsed.get("title") or song_name
+            track_artist = parsed.get("artist") or artist_name
+            resolved_status = cache_status or "perfect"
+            sync_engine.reset_with_lyrics(
+                lines,
+                track_meta={
+                    "song_id": song_id,
+                    "song_name": song_name,
+                    "artist_name": artist_name,
+                    "title": track_title,
+                    "artist": track_artist,
+                    "url": normalized_url,
+                    "cache_status": resolved_status,
+                    "source": source,
+                },
+            )
 
             ui_lines = [
                 {
@@ -63,10 +81,10 @@ def load_lyrics_into_engine(
             ]
 
             payload: dict[str, Any] = {
-                "title": parsed.get("title") or song_name,
-                "artist": parsed.get("artist") or artist_name,
+                "title": track_title,
+                "artist": track_artist,
                 "url": normalized_url,
-                "cache_status": cache_status or "perfect",
+                "cache_status": resolved_status,
                 "lines": ui_lines,
                 "error": ""
                 if ui_lines
@@ -81,7 +99,16 @@ def load_lyrics_into_engine(
                 print(f"⚠️ UtaTen 頁面未解析到歌詞內容: {normalized_url}")
             return payload
         except Exception as exc:
-            sync_engine.reset_with_lyrics([])
+            sync_engine.reset_with_lyrics(
+                [],
+                track_meta={
+                    "song_id": song_id,
+                    "song_name": song_name,
+                    "artist_name": artist_name,
+                    "url": normalized_url,
+                    "source": source,
+                },
+            )
             error_msg = f"載入歌詞失敗: {exc}"
             print(f"⚠️ {error_msg}")
             payload = {
@@ -95,7 +122,16 @@ def load_lyrics_into_engine(
             events.bus.emit("lyrics_loaded", payload)
             return payload
 
-    sync_engine.reset_with_lyrics([])
+    sync_engine.reset_with_lyrics(
+        [],
+        track_meta={
+            "song_id": song_id,
+            "song_name": song_name,
+            "artist_name": artist_name,
+            "url": normalized_url,
+            "source": source,
+        },
+    )
     payload = {
         "title": song_name,
         "artist": artist_name,
@@ -137,11 +173,24 @@ def main(
     set_asr_listening_fn = None
     asr_listening_started = False
 
-    engine = sync_engine if sync_engine is not None else LyricSyncEngine()
+    engine = (
+        sync_engine
+        if sync_engine is not None
+        else LyricSyncEngine(trace_recorder=MatchTraceRecorder())
+    )
     get_device_fn = None
 
-    def _on_asr_recognized(recognized_text: str) -> None:
-        match_payload = engine.process_recognized_text(recognized_text)
+    def _on_asr_recognized(
+        recognized_text: str, asr_meta: dict[str, Any] | None = None
+    ) -> None:
+        if not (recognized_text or "").strip():
+            if config.MATCH_TRACE_ENABLED and asr_meta is not None:
+                engine.evaluate_recognized_text("", asr_meta=asr_meta)
+            return
+
+        match_payload = engine.process_recognized_text(
+            recognized_text, asr_meta=asr_meta
+        )
         device_mode = get_device_fn() if get_device_fn is not None else ""
         events.bus.emit(
             "asr_preview",
@@ -254,6 +303,9 @@ def main(
                     last_track_info = None
                     if source_mode != "spotify":
                         sp = None
+                        engine.update_playback_progress(
+                            None, None, is_playing=False
+                        )
 
                 if source_mode == "spotify":
                     debug_log("來源模式: spotify")
@@ -268,8 +320,18 @@ def main(
                     if sp is not None:
                         try:
                             sp_track = sp.current_user_playing_track()
-                            if sp_track is not None and sp_track.get("is_playing"):
+                            if (
+                                sp_track is not None
+                                and sp_track.get("is_playing")
+                                and sp_track.get("item")
+                            ):
                                 track = sp_track["item"]
+                                engine.update_playback_progress(
+                                    sp_track.get("progress_ms"),
+                                    track.get("duration_ms"),
+                                    song_id=track.get("id"),
+                                    is_playing=True,
+                                )
                                 current_track_info = {
                                     "id": track["id"],
                                     "song_name": track["name"],
@@ -280,12 +342,16 @@ def main(
                                     f"-> 命中 Spotify: {current_track_info['song_name']}"
                                 )
                             else:
+                                engine.update_playback_progress(
+                                    None, None, is_playing=False
+                                )
                                 debug_log("-> Spotify 沒有在播放音樂。")
                         except Exception as e:
                             debug_log(f"⚠️ Spotify API 發生錯誤: {e}")
 
                 elif source_mode == "system_media":
                     debug_log("來源模式: system_media")
+                    engine.update_playback_progress(None, None, is_playing=False)
                     sys_media = get_system_media_info()
                     if sys_media:
                         if sys_media.get("ignored"):
@@ -377,8 +443,10 @@ def main(
                             load_lyrics_into_engine(
                                 cached_data["url"],
                                 engine,
+                                song_id=song_id,
                                 song_name=song_name,
                                 artist_name=artist_name,
+                                source=track_source,
                                 cache_status=cached_data.get("status", "perfect"),
                             )
                             _open_url_if_requested(
@@ -414,8 +482,10 @@ def main(
                                 load_lyrics_into_engine(
                                     url,
                                     engine,
+                                    song_id=_song_id,
                                     song_name=_song_name,
                                     artist_name=_artist_name,
+                                    source=_source,
                                     cache_status=status,
                                 )
                                 _open_url_if_requested(url, open_external_browser)
@@ -445,6 +515,7 @@ def main(
             else:
                 time.sleep(MAIN_LOOP_SLEEP_SECONDS)
     finally:
+        engine.close_trace_session("worker_stopped", clear_pending=True)
         if asr_listening_started and set_asr_listening_fn is not None:
             set_asr_listening_fn(False)
 
