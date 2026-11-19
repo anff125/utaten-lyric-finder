@@ -7,7 +7,7 @@ import time
 from typing import Any, cast
 
 from utaten_finder.audio.cuda_loader import prepare_windows_cuda_dll_paths
-from utaten_finder.core import config
+from utaten_finder.core import config, events
 
 with config.startup_progress_stage(0.20, 0.30, "載入音訊重採樣模組 (SciPy)..."):
     from scipy.signal import resample_poly
@@ -60,31 +60,81 @@ except Exception:
 _asr_thread = None
 _asr_started = False
 _asr_disabled_logged = False
+_asr_callback = None
+_asr_listening_active = True
+_asr_stop_event = threading.Event()
+_asr_active_device = ""
+
+
+def set_asr_listening(active: bool) -> None:
+    """Enable or pause ASR transcription without tearing down the loaded model."""
+    global _asr_listening_active
+    _asr_listening_active = bool(active)
+
+
+def request_asr_stop() -> None:
+    """Signal the ASR capture loops to terminate cleanly."""
+    global _asr_listening_active
+    _asr_listening_active = False
+    _asr_stop_event.set()
+
+
+def get_asr_device_mode() -> str:
+    """Return the active inference device mode ('cuda', 'cpu', or '')."""
+    return _asr_active_device
+
+
+def _resolve_model_device(model_obj: Any, fallback: str = "cpu") -> str:
+    inner = getattr(model_obj, "model", None)
+    detected = getattr(inner, "device", None)
+    if isinstance(detected, str) and detected.strip():
+        return detected.strip().lower()
+    if config.ASR_DEVICE in {"cuda", "cpu"}:
+        return config.ASR_DEVICE
+    return fallback
+
+
+def _emit_asr_status(ready: bool, device_mode: str, error: str = "") -> None:
+    events.bus.emit(
+        "asr_status",
+        {
+            "ready": ready,
+            "device_mode": device_mode,
+            "model": config.ASR_MODEL_SIZE,
+            "error": error,
+        },
+    )
 
 
 def _asr_worker_loop(
     on_recognized_text, init_done_event: threading.Event | None = None
 ):
-    global _asr_disabled_logged
+    global _asr_disabled_logged, _asr_active_device, _asr_started
 
     prepare_windows_cuda_dll_paths()
 
     if not ASR_CORE_DEPS_AVAILABLE:
+        _asr_active_device = ""
+        _emit_asr_status(False, "", error=ASR_DEPS_ERROR)
         config.report_startup_progress(
             1.0, f"未啟用 ASR：缺少套件 ({ASR_DEPS_ERROR})", newline=True
         )
         print(f"ℹ️ 未啟用 ASR：缺少套件 ({ASR_DEPS_ERROR})")
         if init_done_event is not None:
             init_done_event.set()
+        _asr_started = False
         return
 
     if not (PYAUDIO_LOOPBACK_AVAILABLE or SOUNDCARD_AVAILABLE):
+        _asr_active_device = ""
+        _emit_asr_status(False, "", error="缺少音訊錄製套件")
         config.report_startup_progress(
             1.0, "未啟用 ASR：缺少音訊錄製套件", newline=True
         )
         print("ℹ️ 未啟用 ASR：需要 pyaudiowpatch 或 soundcard 其中之一")
         if init_done_event is not None:
             init_done_event.set()
+        _asr_started = False
         return
 
     try:
@@ -127,10 +177,12 @@ def _asr_worker_loop(
             warmup_segs, _ = model.transcribe(dummy_audio, language="ja")
             _ = list(warmup_segs)
 
+        _asr_active_device = _resolve_model_device(model)
+        _emit_asr_status(True, _asr_active_device)
         config.report_startup_progress(
             1.0, f"Whisper-{config.ASR_MODEL_SIZE} 模型已就緒！", newline=True
         )
-        print(f"✅ Whisper-{config.ASR_MODEL_SIZE} 模型已加載")
+        print(f"✅ Whisper-{config.ASR_MODEL_SIZE} 模型已加載 ({_asr_active_device})")
     except Exception as e:
         error_text = str(e)
         # If CUDA runtime/DLL is not available, retry once on CPU to keep ASR usable.
@@ -156,6 +208,8 @@ def _asr_worker_loop(
                         device="cpu",
                         compute_type="int8",
                     )
+                _asr_active_device = "cpu"
+                _emit_asr_status(True, "cpu")
                 config.report_startup_progress(
                     1.0,
                     f"Whisper-{config.ASR_MODEL_SIZE} (CPU 模式) 已就緒！",
@@ -163,20 +217,26 @@ def _asr_worker_loop(
                 )
                 print(f"✅ Whisper-{config.ASR_MODEL_SIZE} 已以 CPU 模式加載")
             except Exception as cpu_e:
+                _asr_active_device = ""
+                _emit_asr_status(False, "", error=str(cpu_e))
                 config.report_startup_progress(
                     1.0, "CPU 模式也無法加載 Whisper 模型", newline=True
                 )
                 print(f"❌ CPU 模式也無法加載 Whisper 模型: {cpu_e}")
                 if init_done_event is not None:
                     init_done_event.set()
+                _asr_started = False
                 return
         else:
+            _asr_active_device = ""
+            _emit_asr_status(False, "", error=error_text)
             config.report_startup_progress(
                 1.0, "無法加載 Whisper 模型", newline=True
             )
             print(f"❌ 無法加載 Whisper 模型: {e}")
             if init_done_event is not None:
                 init_done_event.set()
+            _asr_started = False
             return
     finally:
         if init_done_event is not None:
@@ -225,7 +285,10 @@ def _asr_worker_loop(
 
     def _process_audio_chunk(mono_float32):
         nonlocal model, recognition_count, chunk_counter
-        global _asr_disabled_logged
+        global _asr_disabled_logged, _asr_active_device
+
+        if not _asr_listening_active or _asr_stop_event.is_set():
+            return
 
         if not config.ASR_ENABLED:
             if not _asr_disabled_logged:
@@ -278,7 +341,9 @@ def _asr_worker_loop(
                 recognition_count += 1
                 if config.DEBUG_RECOGNITION:
                     print(f"🎤 [#{recognition_count}] 識別: {result_text}")
-                on_recognized_text(result_text)
+                callback = _asr_callback or on_recognized_text
+                if callback is not None:
+                    callback(result_text)
 
         except Exception as e:
             error_text = str(e)
@@ -290,6 +355,8 @@ def _asr_worker_loop(
                         device="cpu",
                         compute_type="int8",
                     )
+                    _asr_active_device = "cpu"
+                    _emit_asr_status(True, "cpu")
                     print("✅ 已切換為 CPU 模式運作")
                 except Exception as cpu_e:
                     print(f"❌ 切換 CPU 模式失敗: {cpu_e}")
@@ -302,7 +369,7 @@ def _asr_worker_loop(
         capture = SpotifyProcessAudioCapture(target_sample_rate=sample_rate)
 
         try:
-            while True:
+            while not _asr_stop_event.is_set():
                 if (
                     config.AUDIO_SOURCE_MODE != "spotify"
                     or not getattr(config, "CAPTURE_SPOTIFY_PROCESS_ONLY", True)
@@ -318,7 +385,7 @@ def _asr_worker_loop(
                         if now - last_missing_logged > 5.0:
                             print("🎧 [Process Loopback] 等待 Spotify 啟動中...")
                             last_missing_logged = now
-                        time.sleep(1.0)
+                        _asr_stop_event.wait(1.0)
                         continue
 
                     if not capture.start(pid):
@@ -328,7 +395,7 @@ def _asr_worker_loop(
                                 f"⚠️ [Process Loopback] 初始化 Spotify 音訊捕獲失敗 (PID={pid})，重試中..."
                             )
                             last_missing_logged = now
-                        time.sleep(1.0)
+                        _asr_stop_event.wait(1.0)
                         continue
 
                     source_name = f"Spotify.exe (PID: {pid})"
@@ -340,7 +407,7 @@ def _asr_worker_loop(
                 audio_buffer = np.zeros(block_frames, dtype=np.float32)
                 buffered_frames = 0
 
-                while capture.is_target_alive():
+                while capture.is_target_alive() and not _asr_stop_event.is_set():
                     if (
                         config.AUDIO_SOURCE_MODE != "spotify"
                         or not getattr(config, "CAPTURE_SPOTIFY_PROCESS_ONLY", True)
@@ -409,7 +476,7 @@ def _asr_worker_loop(
                 audio_buffer = np.zeros(block_frames, dtype=np.float32)
                 buffered_frames = 0
 
-                while True:
+                while not _asr_stop_event.is_set():
                     if (
                         config.AUDIO_SOURCE_MODE == "spotify"
                         and getattr(
@@ -447,7 +514,7 @@ def _asr_worker_loop(
             speaker = sc.default_speaker()
             if speaker is None:
                 print("ℹ️ 未啟用 ASR：找不到預設喇叭(loopback來源)")
-                time.sleep(2.0)
+                _asr_stop_event.wait(2.0)
                 return
 
             loopback_mic = None
@@ -466,7 +533,7 @@ def _asr_worker_loop(
 
             if loopback_mic is None:
                 print("ℹ️ 未啟用 ASR：找不到對應的 loopback 錄音裝置")
-                time.sleep(2.0)
+                _asr_stop_event.wait(2.0)
                 return
 
             print(f"🎙️ ASR 已啟動，來源: {speaker.name} [全系統混音 Loopback]")
@@ -480,7 +547,7 @@ def _asr_worker_loop(
                 channels=1,
                 blocksize=step_frames,
             ) as recorder:
-                while True:
+                while not _asr_stop_event.is_set():
                     if (
                         config.AUDIO_SOURCE_MODE == "spotify"
                         and getattr(
@@ -504,7 +571,7 @@ def _asr_worker_loop(
                     if buffered_frames >= block_frames:
                         _process_audio_chunk(audio_buffer.copy())
 
-    while True:
+    while not _asr_stop_event.is_set():
         mode = config.AUDIO_SOURCE_MODE
         spotify_only = getattr(config, "CAPTURE_SPOTIFY_PROCESS_ONLY", True)
 
@@ -513,19 +580,29 @@ def _asr_worker_loop(
         else:
             _run_default_loopback_loop()
 
-        time.sleep(0.5)
+        _asr_stop_event.wait(0.5)
+
+    _asr_started = False
 
 
 def ensure_asr_worker_started(on_recognized_text):
-    global _asr_thread, _asr_started
+    global _asr_thread, _asr_started, _asr_callback, _asr_listening_active
+
+    _asr_callback = on_recognized_text
 
     if not config.ASR_ENABLED:
         return
 
-    if _asr_started:
+    _asr_stop_event.clear()
+    _asr_listening_active = True
+
+    if _asr_thread is not None and _asr_thread.is_alive():
+        _asr_started = True
         config.report_startup_progress(
             1.0, f"Whisper-{config.ASR_MODEL_SIZE} 模型已就緒！", newline=True
         )
+        if _asr_active_device:
+            _emit_asr_status(True, _asr_active_device)
         return
 
     init_done_event = threading.Event()

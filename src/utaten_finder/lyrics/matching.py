@@ -183,6 +183,16 @@ class LyricSyncEngine:
                 return int(self._lyrics[index].get("locator_index", index))
             return -1
 
+    def get_buffer_length(self) -> int:
+        """Return current length of the normalized ASR sliding buffer."""
+        with self._lock:
+            return len(self._agent.asr_buffer)
+
+    def get_current_index(self) -> int:
+        """Return the current matched/jumped lyric index, or -1 if none."""
+        with self._lock:
+            return self._current_index
+
     def apply_manual_jump(self, lyric_index: int) -> dict[str, Any] | None:
         """Jump synchronization anchor to a user-selected lyric line."""
         with self._lock:

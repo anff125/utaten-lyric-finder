@@ -268,10 +268,15 @@ set "TEMP_PY=%~dp0temp_update.py"
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/__init__.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/browser_sync.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/matching.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/parser.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/song_cache.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/web_scraper.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/ui/__init__.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/ui/legacy_gui.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/ui/webview_app.py',
+>> "%TEMP_PY%" echo     'assets/web/index.html',
+>> "%TEMP_PY%" echo     'assets/web/styles.css',
+>> "%TEMP_PY%" echo     'assets/web/app.js',
 >> "%TEMP_PY%" echo ]
 >> "%TEMP_PY%" echo def download(f):
 >> "%TEMP_PY%" echo     try:

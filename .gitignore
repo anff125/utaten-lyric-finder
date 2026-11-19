@@ -29,6 +29,8 @@ song_cache.json
 .github/*
 !.github/workflows/
 *test*
+!tests/
+!tests/*.py
 
 # PyInstaller spec
 auto_lyrics.spec

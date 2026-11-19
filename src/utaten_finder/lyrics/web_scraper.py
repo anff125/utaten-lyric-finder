@@ -1,5 +1,6 @@
 import re
 import sys
+import time
 import urllib.parse
 from urllib.parse import urlparse
 
@@ -163,7 +164,7 @@ def _to_phonetic_romaji(text):
     return s
 
 
-def _extract_clean_page_title(title_elem):
+def extract_clean_page_title(title_elem):
     if title_elem is None:
         return ""
     # 複製節點內容或排除 UtaTen 附加的「歌詞」與副標 span
@@ -175,6 +176,72 @@ def _extract_clean_page_title(title_elem):
     cleaned = clone.get_text(" ", strip=True)
     cleaned = re.sub(r"\s*歌詞\s*$", "", cleaned).strip()
     return cleaned or title_elem.get_text(" ", strip=True)
+
+
+_extract_clean_page_title = extract_clean_page_title
+
+
+def _decode_html_response(response: requests.Response) -> str:
+    raw_bytes = response.content or b""
+    encoding = (response.encoding or "").strip()
+    decoded: str | None = None
+    if encoding and encoding.lower() not in {"iso-8859-1", "latin-1", "latin1"}:
+        try:
+            decoded = raw_bytes.decode(encoding, errors="replace")
+        except LookupError:
+            decoded = None
+
+    if decoded is None:
+        head_ascii = raw_bytes[:4096].decode("ascii", errors="ignore")
+        meta_match = re.search(
+            r"""<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9._-]+)""",
+            head_ascii,
+            flags=re.IGNORECASE,
+        )
+        if meta_match:
+            try:
+                decoded = raw_bytes.decode(meta_match.group(1), errors="replace")
+            except LookupError:
+                decoded = None
+
+    if decoded is None:
+        try:
+            decoded = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            fallback = (response.apparent_encoding or "utf-8").strip()
+            try:
+                decoded = raw_bytes.decode(fallback, errors="replace")
+            except LookupError:
+                decoded = raw_bytes.decode("utf-8", errors="replace")
+
+    if not decoded.strip():
+        raise ValueError("UtaTen 回傳空白頁面")
+    return decoded
+
+
+def fetch_utaten_lyrics_html(url: str, timeout: float = 10.0, retries: int = 2) -> str:
+    """Fetch raw HTML of a UtaTen lyric detail page with retries and Japanese encoding handling."""
+    normalized_url = normalize_utaten_url((url or "").strip())
+    if not is_utaten_lyric_detail_url(normalized_url):
+        raise ValueError(f"無效的 UtaTen 歌詞頁網址: {url}")
+
+    attempts = max(1, int(retries) + 1)
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            response = requests.get(
+                normalized_url,
+                headers=_HTTP_HEADERS,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            return _decode_html_response(response)
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(0.4 * (attempt + 1))
+
+    raise RuntimeError(f"抓取 UtaTen 歌詞頁失敗 ({normalized_url}): {last_error}") from last_error
 
 
 def _extract_page_kana(soup):

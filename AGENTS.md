@@ -9,24 +9,27 @@ This document provides context, architecture details, and mandatory verification
 `utaten-lyric-finder` is a Windows desktop application that detects the currently playing song (via Spotify Web API or Windows SMTC), scrapes Japanese lyrics with furigana/hiragana from [UtaTen](https://utaten.com/), opens an interactive Microsoft Edge window via Playwright, and uses `faster-whisper` ASR to automatically scroll and highlight the current lyric line in real time.
 
 ### Core Modules
-- **`app.py`**: Unified application entry point. Configures `src/` on `sys.path`, supports `--cli` headless mode, and defaults to launching `utaten_finder.ui.legacy_gui`.
-- **`src/utaten_finder/ui/legacy_gui.py`**: CustomTkinter GUI controller. Manages user settings, console log redirection, OAuth setup, and background worker startup.
+- **`app.py`**: Unified application entry point. Configures `src/` on `sys.path`, supports `--cli`, `--legacy-ui`, and `--debug`, and defaults to launching `utaten_finder.ui.webview_app`.
+- **`src/utaten_finder/ui/`**:
+  - `webview_app.py`: PyWebView single-window desktop controller, `JsApi` bridge, and thread-safe `EventBus` -> `evaluate_js` dispatcher.
+  - `legacy_gui.py`: Legacy CustomTkinter GUI controller (kept accessible via `--legacy-ui` during migration).
 - **`src/utaten_finder/core/`**:
   - `config.py`: Global configuration, path constants (`PROJECT_ROOT`, `DATA_DIR`, `ASSETS_DIR`, `BROWSER_PROFILE_DIR`), legacy data auto-migration from `.cache/` / `_cache/` / root `song_cache.json` to `data/`, and persistent settings (`data/runtime_settings.json`).
-  - `events.py`: Thread-safe `EventBus` singleton (`bus`) for startup progress, track updates, lyric highlight changes, and status events.
-  - `orchestrator.py`: Core orchestration loop (polls current track, looks up cache/scraper, triggers lyric display and ASR worker).
+  - `events.py`: Thread-safe `EventBus` singleton (`bus`) and `install_console_log_capture()` for startup progress, track updates, lyric highlight changes, and live log streaming.
+  - `orchestrator.py`: Core orchestration loop (polls current track, looks up cache/scraper, loads parsed lyrics or triggers browser sync, and manages ASR worker).
 - **`src/utaten_finder/audio/`**:
   - `cuda_loader.py`: Dynamically registers pip-installed NVIDIA CUDA DLL directories (`nvidia/cublas/bin`, `nvidia/cudnn/bin`) into both `os.add_dll_directory` and `os.environ["PATH"]` before importing `faster_whisper` / `ctranslate2`, with `SetErrorMode` popup suppression and `WinError 577` preloading retries.
   - `asr_worker.py`: Audio capture loop + `faster-whisper` (`ctranslate2`) transcription pipeline with 1-second silent warm-up and automatic CPU (`compute_type="int8"`) fallback.
   - `process_loopback.py`: Windows 11 native WASAPI Process Loopback (`ActivateAudioInterfaceAsync` via `ctypes`/COM) to capture audio exclusively from `Spotify.exe` without system/game/Discord noise.
 - **`src/utaten_finder/lyrics/`**:
   - `matching.py`: Japanese text normalization (`pykakasi` / `jaconv` to hiragana), `LyricsAgent` two-phase fuzzy matching (local lookahead + lost-position recovery), and `LyricSyncEngine` decoupled state machine.
-  - `browser_sync.py`: Playwright (`channel="msedge"`) persistent browser controller using `data/browser_profile` and delegating lyric matching state to `LyricSyncEngine`.
-  - `web_scraper.py`: Searches DuckDuckGo (`ddgs`) / UtaTen and parses lyric HTML (`BeautifulSoup`).
+  - `parser.py`: Browserless UtaTen HTML parser (`parse_utaten_lyrics`) producing sanitized `<ruby>/<rt>` lyric lines and normalized matching fields for both `<p>` and `<br>` DOM layouts.
+  - `browser_sync.py`: Legacy Playwright (`channel="msedge"`) persistent browser controller using `data/browser_profile` and delegating lyric matching state to `LyricSyncEngine`.
+  - `web_scraper.py`: Searches DuckDuckGo (`ddgs`) / UtaTen and fetches UtaTen lyric page HTML (`fetch_utaten_lyrics_html`).
   - `song_cache.py`: Local JSON cache (`data/song_cache.json`) mapping track keys to UtaTen URLs and match quality status.
 - **`src/utaten_finder/media/`**:
   - `spotify_api.py` & `system_media.py`: Track metadata providers for Spotify Web API (`spotipy`) + OAuth callback HTTP server (`wait_for_oauth_callback`) and Windows SMTC (`winrt`).
-- **`assets/`, `data/`, `scripts/build_portable.ps1`, & `start.bat`**: Static assets (`assets/app.ico`), ignored runtime data (`data/`), portable Windows packaging script, and launcher batch script.
+- **`assets/`, `data/`, `scripts/build_portable.ps1`, & `start.bat`**: Static assets (`assets/app.ico`, `assets/web/{index.html,styles.css,app.js}`), ignored runtime data (`data/`), portable Windows packaging script, and launcher batch script.
 
 ---
 
@@ -58,7 +61,7 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push and pull reque
 
 ### Check 2: Runtime Smoke Test
 ```powershell
-.\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'src'); import tkinter; import customtkinter; from utaten_finder.core import config, events, orchestrator; from utaten_finder.media import spotify_api, system_media; from utaten_finder.lyrics import web_scraper, matching, song_cache, browser_sync; from utaten_finder.audio import process_loopback, cuda_loader, asr_worker; from utaten_finder.ui import legacy_gui; print('[SUCCESS] runtime smoke imports loaded')"
+.\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'src'); import tkinter; import customtkinter; import webview; from utaten_finder.core import config, events, orchestrator; from utaten_finder.media import spotify_api, system_media; from utaten_finder.lyrics import web_scraper, parser, matching, song_cache, browser_sync; from utaten_finder.audio import process_loopback, cuda_loader, asr_worker; from utaten_finder.ui import legacy_gui, webview_app; print('[SUCCESS] runtime smoke imports loaded')"
 ```
 - Ensure module-level imports do not crash when optional hardware or audio devices are absent.
 

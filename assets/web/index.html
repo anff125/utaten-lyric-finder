@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UtaTen Lyric Finder</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Header Bar -->
+    <header id="top-bar" class="top-bar">
+      <div class="track-summary">
+        <div class="track-heading">
+          <h1 id="track-title" class="track-title">尚未偵測到播放曲目</h1>
+          <span id="source-badge" class="badge badge-neutral">待機中</span>
+          <span id="status-badge" class="badge badge-muted">-</span>
+        </div>
+        <div id="track-artist" class="track-artist">請啟動監聽並播放日語歌曲</div>
+      </div>
+
+      <div class="toolbar">
+        <button id="btn-research" class="tool-btn" type="button" title="強制繞過快取重新搜尋歌詞" disabled>
+          <span class="btn-icon">🔄</span>
+          <span class="btn-label">重新搜尋</span>
+        </button>
+
+        <button id="btn-url-fix" class="tool-btn" type="button" title="手動修正 UtaTen 歌詞網址">
+          <span class="btn-icon">🔗</span>
+          <span class="btn-label">修正網址</span>
+        </button>
+
+        <div class="popover-anchor">
+          <button id="btn-typography" class="tool-btn" type="button" title="歌詞排版與振假名設定" aria-expanded="false">
+            <span class="btn-icon">Aa</span>
+          </button>
+
+          <div id="typography-popover" class="popover hidden" role="dialog" aria-label="歌詞排版設定">
+            <div class="popover-header">
+              <span>歌詞排版設定</span>
+              <button id="btn-reset-typography" class="link-btn" type="button">重設</button>
+            </div>
+            <div class="popover-row">
+              <div class="popover-label">
+                <span>歌詞字號</span>
+                <span id="val-font-size" class="mono-val">28px</span>
+              </div>
+              <input id="pref-font-size" type="range" min="20" max="44" step="1" value="28" />
+            </div>
+            <div class="popover-row">
+              <div class="popover-label">
+                <span>振假名大小</span>
+                <span id="val-ruby-size" class="mono-val">52%</span>
+              </div>
+              <input id="pref-ruby-size" type="range" min="38" max="75" step="1" value="52" />
+            </div>
+            <label class="switch-row">
+              <span>顯示振假名 (ふりがな)</span>
+              <input id="pref-show-ruby" type="checkbox" checked />
+            </label>
+            <label class="switch-row">
+              <span>自動置中捲動</span>
+              <input id="pref-auto-scroll" type="checkbox" checked />
+            </label>
+          </div>
+        </div>
+
+        <button id="btn-settings" class="tool-btn" type="button" title="開啟設定面板">
+          <span class="btn-icon">⚙️</span>
+          <span class="btn-label">設定</span>
+        </button>
+
+        <button id="btn-logs" class="tool-btn" type="button" title="開啟即時日誌">
+          <span class="btn-icon">📜</span>
+          <span class="btn-label">日誌</span>
+          <span id="log-unread-dot" class="unread-dot hidden" aria-hidden="true"></span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Collapsible Manual URL Fix Bar -->
+    <section id="url-fix-bar" class="url-fix-bar hidden" aria-label="手動網址修正列">
+      <div class="url-fix-inner">
+        <span class="url-fix-label">UtaTen 歌詞網址</span>
+        <input
+          id="manual-url-input"
+          class="text-input url-input"
+          type="url"
+          placeholder="貼上正確的 https://utaten.com/lyric/... 網址"
+        />
+        <button id="btn-apply-url" class="btn btn-primary" type="button">套用並更新快取</button>
+        <button id="btn-open-external" class="btn btn-secondary" type="button" title="使用系統預設瀏覽器開啟">在瀏覽器開啟</button>
+        <button id="btn-close-url-bar" class="icon-btn" type="button" title="收合">✕</button>
+      </div>
+    </section>
+
+    <!-- Main Lyrics Stage -->
+    <main id="lyrics-stage" class="lyrics-stage">
+      <div id="state-empty" class="stage-state">
+        <div class="hero-orb" aria-hidden="true">♪</div>
+        <h2>純淨日語歌詞同步舞台</h2>
+        <p class="stage-desc">
+          點擊左下角「▶ 開始監聽」後，播放 Spotify 或 YouTube 日語歌曲，系統將自動解析並顯示無廣告的振假名歌詞與即時語音高亮。
+        </p>
+        <div class="stage-tips">
+          <span>💡 首次使用請先在右上角「⚙️ 設定」填入 Spotify 憑證並授權，或切換為 System Media 模式。</span>
+        </div>
+      </div>
+
+      <div id="state-loading" class="stage-state hidden">
+        <div class="spinner" aria-hidden="true"></div>
+        <h2 id="loading-title">正在搜尋並解析歌詞...</h2>
+        <p id="loading-subtitle" class="stage-desc">請稍候，正在從 UtaTen 擷取純淨振假名資料</p>
+      </div>
+
+      <div id="state-not-found" class="stage-state hidden">
+        <div class="hero-orb hero-orb-warn" aria-hidden="true">?</div>
+        <h2 id="not-found-title">尚未取得可渲染的歌詞內容</h2>
+        <p id="not-found-desc" class="stage-desc">
+          請嘗試使用上方輸入框貼上正確的 UtaTen 歌詞網址，或點擊下方按鈕透過瀏覽器手動查找。
+        </p>
+        <div class="stage-actions">
+          <button id="btn-fallback-search" class="btn btn-primary" type="button">🔍 前往外部網頁搜尋</button>
+          <button id="btn-stage-research" class="btn btn-secondary" type="button">🔄 重新搜尋</button>
+        </div>
+      </div>
+
+      <div id="lyrics-scroll-container" class="lyrics-scroll-container hidden">
+        <div class="lyrics-hint-banner">點擊任一行歌詞可立即手動定位同步起點</div>
+        <ol id="lyrics-list" class="lyrics-list"></ol>
+      </div>
+
+      <button id="btn-recenter" class="recenter-btn hidden" type="button">
+        🎯 回到目前演唱行
+      </button>
+    </main>
+
+    <!-- Bottom ASR & Audio Dock -->
+    <footer id="asr-dock" class="asr-dock">
+      <div id="startup-progress-track" class="startup-progress-track" aria-hidden="true">
+        <div id="startup-progress-fill" class="startup-progress-fill"></div>
+      </div>
+
+      <div class="dock-content">
+        <div class="dock-left">
+          <button id="btn-toggle-listen" class="btn-listen" type="button">
+            <span id="listen-icon">▶</span>
+            <span id="listen-label">開始監聽</span>
+          </button>
+
+          <div class="vu-panel" title="即時音訊輸入能量">
+            <div class="vu-meta">
+              <span id="vu-source-label" class="vu-source">待命</span>
+              <span id="startup-status-text" class="startup-status-text">就緒</span>
+            </div>
+            <div class="vu-meter-track">
+              <div id="vu-bar-fill" class="vu-bar-fill"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="dock-right">
+          <span id="asr-device-badge" class="badge badge-muted">ASR 待命</span>
+          <div class="asr-preview-box">
+            <span id="asr-preview-text" class="asr-preview-text">等待語音辨識結果...</span>
+            <span id="asr-match-badge" class="asr-match-badge hidden"></span>
+          </div>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Drawer Backdrop -->
+  <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
+
+  <!-- Settings Slide-over Drawer -->
+  <aside id="settings-drawer" class="drawer hidden" aria-label="系統設定">
+    <div class="drawer-header">
+      <h2>⚙️ 系統設定</h2>
+      <button id="btn-close-settings" class="icon-btn" type="button" title="關閉設定">✕</button>
+    </div>
+
+    <div class="drawer-body">
+      <section class="settings-section">
+        <div class="section-title-row">
+          <h3>Spotify Web API 與 OAuth 授權</h3>
+          <span id="token-status-badge" class="badge badge-muted">未授權</span>
+        </div>
+
+        <label class="field-label" for="setting-client-id">Client ID</label>
+        <input id="setting-client-id" class="text-input" type="text" placeholder="輸入 Spotify App Client ID" autocomplete="off" />
+
+        <label class="field-label" for="setting-client-secret">Client Secret</label>
+        <div class="input-with-action">
+          <input id="setting-client-secret" class="text-input" type="password" placeholder="輸入 Spotify App Client Secret" autocomplete="off" />
+          <button id="btn-toggle-secret" class="btn btn-secondary btn-compact" type="button">顯示</button>
+        </div>
+
+        <label class="field-label" for="setting-redirect-uri">Redirect URI</label>
+        <input id="setting-redirect-uri" class="text-input" type="text" placeholder="http://127.0.0.1:8888/callback" />
+
+        <div class="button-row">
+          <button id="btn-spotify-auth" class="btn btn-primary" type="button">開始 Spotify 授權</button>
+        </div>
+
+        <label class="field-label" for="input-callback-url">Callback URL (自動接收或手動貼上)</label>
+        <div class="input-with-action">
+          <input id="input-callback-url" class="text-input" type="text" placeholder="http://127.0.0.1:8888/callback?code=..." />
+          <button id="btn-exchange-token" class="btn btn-secondary btn-compact" type="button">交換 Token</button>
+        </div>
+        <div id="auth-feedback" class="helper-text"></div>
+      </section>
+
+      <section class="settings-section">
+        <h3>音訊來源與擷取模式</h3>
+        <div class="segmented-control" role="radiogroup" aria-label="音源模式">
+          <button id="source-opt-spotify" class="seg-btn active" type="button" data-source="spotify">Spotify API</button>
+          <button id="source-opt-system" class="seg-btn" type="button" data-source="system_media">System Media (YouTube)</button>
+        </div>
+
+        <label class="switch-row">
+          <span>Spotify Process Loopback (僅擷取 Spotify 聲音)</span>
+          <input id="setting-process-only" type="checkbox" checked />
+        </label>
+      </section>
+
+      <section class="settings-section">
+        <h3>語音辨識引擎 (Faster-Whisper ASR)</h3>
+        <label class="switch-row">
+          <span>啟用 ASR 自動高亮捲動</span>
+          <input id="setting-asr-enabled" type="checkbox" checked />
+        </label>
+
+        <label class="field-label" for="setting-asr-model">ASR 模型選擇 (變更後於下次啟動生效)</label>
+        <select id="setting-asr-model" class="select-input"></select>
+
+        <label class="field-label" for="setting-asr-device">運算裝置 (變更後於下次啟動生效)</label>
+        <select id="setting-asr-device" class="select-input">
+          <option value="auto">auto (自動偵測 CUDA / CPU)</option>
+          <option value="cuda">cuda (強制 NVIDIA GPU)</option>
+          <option value="cpu">cpu (僅使用處理器)</option>
+        </select>
+      </section>
+
+      <section class="settings-section">
+        <h3>除錯日誌選項</h3>
+        <label class="switch-row">
+          <span>輪詢 Debug 日誌 (DEBUG_POLLING)</span>
+          <input id="setting-debug-polling" type="checkbox" />
+        </label>
+        <label class="switch-row">
+          <span>ASR 辨識 Debug 日誌 (DEBUG_RECOGNITION)</span>
+          <input id="setting-debug-recognition" type="checkbox" />
+        </label>
+      </section>
+    </div>
+
+    <div class="drawer-footer">
+      <button id="btn-save-settings" class="btn btn-primary btn-full" type="button">儲存設定至 runtime_settings.json</button>
+    </div>
+  </aside>
+
+  <!-- Logs Slide-over Drawer -->
+  <aside id="log-drawer" class="drawer drawer-wide hidden" aria-label="即時日誌">
+    <div class="drawer-header">
+      <h2>📜 即時系統日誌</h2>
+      <button id="btn-close-logs" class="icon-btn" type="button" title="關閉日誌">✕</button>
+    </div>
+
+    <div class="log-toolbar">
+      <div class="log-filters" role="group" aria-label="日誌等級篩選">
+        <button class="filter-pill active" type="button" data-level="all">全部</button>
+        <button class="filter-pill" type="button" data-level="info">資訊</button>
+        <button class="filter-pill" type="button" data-level="warn">警告</button>
+        <button class="filter-pill" type="button" data-level="error">錯誤</button>
+        <button class="filter-pill" type="button" data-level="debug">除錯</button>
+      </div>
+      <div class="log-actions">
+        <label class="inline-check">
+          <input id="log-autoscroll" type="checkbox" checked />
+          <span>捲動</span>
+        </label>
+        <button id="btn-copy-logs" class="btn btn-secondary btn-compact" type="button">複製</button>
+        <button id="btn-clear-logs" class="btn btn-secondary btn-compact" type="button">清空</button>
+      </div>
+    </div>
+
+    <div id="log-list" class="log-list"></div>
+  </aside>
+
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

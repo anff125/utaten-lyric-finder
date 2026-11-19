@@ -20,13 +20,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run in console/headless orchestrator mode without opening the GUI.",
     )
+    parser.add_argument(
+        "--legacy-ui",
+        action="store_true",
+        help="Launch the legacy CustomTkinter + Playwright control panel.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable WebView DevTools in the PyWebView UI.",
+    )
     args = parser.parse_args(argv)
 
     if args.cli:
         from utaten_finder.core.orchestrator import main as run_cli
 
         try:
-            run_cli()
+            run_cli(use_browser=True)
         except KeyboardInterrupt:
             print("\n🛑 收到終止訊號，正在關閉程式...")
         return 0
@@ -37,9 +47,16 @@ def main(argv: list[str] | None = None) -> int:
     config.report_startup_progress(
         0.20, "正在載入基礎設定與快取模組...", console_only=True
     )
-    from utaten_finder.ui.legacy_gui import main as run_gui
 
-    run_gui()
+    if args.legacy_ui:
+        from utaten_finder.ui.legacy_gui import main as run_legacy_gui
+
+        run_legacy_gui()
+        return 0
+
+    from utaten_finder.ui.webview_app import main as run_webview
+
+    run_webview(debug=args.debug)
     return 0
 
 

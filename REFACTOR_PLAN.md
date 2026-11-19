@@ -202,18 +202,18 @@ utaten-lyric-finder/
 ### Phase 2：無瀏覽器歌詞解析器與 PyWebView 單一視窗建置
 **目標**：實作 UtaTen HTML 純淨振假名解析器與 PyWebView 前端介面，建立完整雙向橋接。
 
-- [ ] **2.1 新增依賴與環境確認**
+- [x] **2.1 新增依賴與環境確認**
   - 安裝並鎖定 `pywebview`（Windows 預設使用 Edge WebView2 `edgechromium` 後端）至 `requirements.txt`。
   - 確認 Windows 攜帶版環境（`scripts/build_portable.ps1`）能正常匯入 `webview`（`pythonnet` / `clr_loader` 或 `pywebview` 相依套件無缺漏）。
-- [ ] **2.2 實作後端歌詞抓取與 `<ruby>` 清洗解析器 (`lyrics/parser.py`, `lyrics/web_scraper.py`)**
+- [x] **2.2 實作後端歌詞抓取與 `<ruby>` 清洗解析器 (`lyrics/parser.py`, `lyrics/web_scraper.py`)**
   - 新增 `fetch_utaten_lyrics_html(url)`，支援請求標頭、逾時與日文編碼正確處理。
   - 實作 `parse_utaten_lyrics(html_text)`，解析 `<p>` 與 `<br>` 兩種 UtaTen 版型，產出乾淨白名單 `<ruby>` HTML、`original` 與 `normalized`。
   - 撰寫單元測試（或驗證腳本）覆蓋：含 `<p>` 歌詞、僅 `<br>` 歌詞、無振假名純假名/英文歌詞、含 `<script>` 或廣告節點的 HTML 清洗。
-- [ ] **2.3 實作 PyWebView 前端介面 (`assets/web/index.html`, `styles.css`, `app.js`)**
+- [x] **2.3 實作 PyWebView 前端介面 (`assets/web/index.html`, `styles.css`, `app.js`)**
   - 實作頂部曲目與狀態列、中央 `<ruby>` 純淨歌詞主舞台、底部即時語音監控列。
   - 實作設定抽屜（Spotify 憑證/OAuth、音源選擇、ASR 模型與裝置、Debug 開關）與日誌抽屜。
   - 實作字體大小、振假名顯示開關、振假名尺寸等前端排版偏好（可存於 `localStorage` 或 `runtime_settings.json`）。
-- [ ] **2.4 實作 `ui/webview_app.py` 與 `JsApi` 雙向橋接**
+- [x] **2.4 實作 `ui/webview_app.py` 與 `JsApi` 雙向橋接**
   - 將 `core/events.py` 事件推送至 `window.evaluate_js(...)`，確保跨執行緒呼叫安全與閉窗清理（優雅關閉 `orchestrator` 與 ASR 執行緒）。
   - 實作前端呼叫 `jump_to_line`、`research_lyrics`、`update_manual_url`、`start_spotify_auth` 等 API。
   - **Phase 2 驗收**：執行 `python app.py` 可在單一 PyWebView 視窗內完成 Spotify 授權、搜尋 UtaTen、顯示純淨 `<ruby>` 歌詞並支援點擊任一行即時定位。

@@ -52,10 +52,15 @@ jobs:
           Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
           Invoke-ScriptAnalyzer -Path ./scripts/build_portable.ps1 -EnableExit
 
+      - name: Run unit tests
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -v
+
       - name: Runtime smoke test
         shell: pwsh
         run: |
-          python -c "import sys; sys.path.insert(0, 'src'); import tkinter; import customtkinter; from utaten_finder.core import config, events, orchestrator; from utaten_finder.media import spotify_api, system_media; from utaten_finder.lyrics import web_scraper, matching, song_cache, browser_sync; from utaten_finder.audio import process_loopback, cuda_loader, asr_worker; from utaten_finder.ui import legacy_gui; print('[SUCCESS] runtime smoke imports loaded')"
+          python -c "import sys; sys.path.insert(0, 'src'); import tkinter; import customtkinter; import webview; from utaten_finder.core import config, events, orchestrator; from utaten_finder.media import spotify_api, system_media; from utaten_finder.lyrics import web_scraper, parser, matching, song_cache, browser_sync; from utaten_finder.audio import process_loopback, cuda_loader, asr_worker; from utaten_finder.ui import legacy_gui, webview_app; print('[SUCCESS] runtime smoke imports loaded')"
 
       - name: Dry-run portable build script
         shell: pwsh
