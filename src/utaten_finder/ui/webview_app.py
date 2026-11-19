@@ -382,7 +382,7 @@ class AppController:
         asr_mod = sys.modules.get("utaten_finder.audio.asr_worker")
         if asr_mod is not None and hasattr(asr_mod, "set_asr_listening"):
             asr_mod.set_asr_listening(False)
-        self._sync_engine.close_trace_session("stopped")
+        self._sync_engine.close_trace_session("stopped", clear_pending=True)
         return {"ok": True, "running": False}
 
     def jump_to_line(self, lyric_index: int) -> dict[str, Any]:
@@ -622,7 +622,7 @@ class AppController:
         if self._worker_thread is not None and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=2.0)
 
-        self._sync_engine.close_trace_session("shutdown")
+        self._sync_engine.close_trace_session("shutdown", clear_pending=True)
         for name, fn in self._bus_handlers.items():
             events.bus.unsubscribe(name, fn)
         self._bus_handlers.clear()

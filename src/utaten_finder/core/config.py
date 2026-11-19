@@ -61,6 +61,7 @@ DEBUG_POLLING = False
 DEBUG_RECOGNITION = False
 DEBUG = False
 MATCH_TRACE_ENABLED = False
+MATCH_TRACE_MAX_FILES = 50
 # 支援: spotify / system_media
 AUDIO_SOURCE_MODE = "spotify"
 # 當音源為 spotify 時，是否只錄製 Spotify 程序的獨立音訊 (Windows 11 Process Loopback)

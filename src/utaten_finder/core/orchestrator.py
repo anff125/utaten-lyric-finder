@@ -515,7 +515,7 @@ def main(
             else:
                 time.sleep(MAIN_LOOP_SLEEP_SECONDS)
     finally:
-        engine.close_trace_session("worker_stopped")
+        engine.close_trace_session("worker_stopped", clear_pending=True)
         if asr_listening_started and set_asr_listening_fn is not None:
             set_asr_listening_fn(False)
 

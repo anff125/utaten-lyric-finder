@@ -1,5 +1,6 @@
 """Audio capture loop and faster-whisper ASR worker."""
 
+import functools
 import inspect
 import math
 import os
@@ -202,9 +203,8 @@ def _safe_float(value: Any, digits: int = 4) -> float | None:
     return round(numeric, digits)
 
 
-def _callback_accepts_meta(callback: Any) -> bool:
-    if callback is None:
-        return False
+@functools.lru_cache(maxsize=64)
+def _inspect_callback_accepts_meta(callback: Any) -> bool:
     try:
         sig = inspect.signature(callback)
     except (ValueError, TypeError):
@@ -220,6 +220,15 @@ def _callback_accepts_meta(callback: Any) -> bool:
         ):
             positional_count += 1
     return positional_count >= 2
+
+
+def _callback_accepts_meta(callback: Any) -> bool:
+    if callback is None:
+        return False
+    try:
+        return _inspect_callback_accepts_meta(callback)
+    except TypeError:
+        return _inspect_callback_accepts_meta.__wrapped__(callback)
 
 
 def _invoke_asr_callback(
@@ -523,7 +532,7 @@ def _asr_worker_loop(
             result_text = result_text.strip()
 
             asr_meta: dict[str, Any] = {
-                "raw_text": result_text,
+                "text": result_text,
                 "raw_text_before_filter": raw_text_before_filter,
                 "hallucinations_removed": hallucinations_removed,
                 "infer_ms": infer_ms,

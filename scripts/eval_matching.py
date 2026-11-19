@@ -162,6 +162,27 @@ class BaselineStrategy(ReplayStrategy):
         self._engine = LyricSyncEngine(**engine_kwargs)
         self._engine.reset_with_lyrics(lyrics)
 
+        init_state = session_start.get("initial_state") or {}
+        if init_state and (
+            init_state.get("lazy_opened")
+            or int(init_state.get("current_index", -1)) >= 0
+            or init_state.get("buffer")
+            or init_state.get("last_success_normalized")
+        ):
+            self._engine.restore_state(
+                current_index=int(init_state.get("current_index", -1)),
+                buffer=str(init_state.get("buffer") or ""),
+                last_success_normalized=str(
+                    init_state.get("last_success_normalized") or ""
+                ),
+                elapsed_since_last_success=init_state.get(
+                    "elapsed_since_last_success"
+                ),
+                elapsed_since_buffer_start=init_state.get(
+                    "elapsed_since_buffer_start"
+                ),
+            )
+
     def step(
         self,
         recognized_text: str,
@@ -278,12 +299,25 @@ def replay_trace(
         asr_cfg.get("step_seconds") or (config.ASR_BLOCK_SECONDS / 2)
     ) * 1000.0
 
-    clock = VirtualClock(0.0)
+    base_time = 1000.0
+    clock = VirtualClock(base_time)
     strategy = STRATEGIES[spec.name](spec)
     strategy.reset(lyrics, session_start, clock)
 
-    pred_display_index = 0 if lyrics else -1
-    prev_matched_index: int | None = None
+    init_state = session_start.get("initial_state") or {}
+    init_idx = int(init_state.get("current_index", -1))
+    lazy_opened = bool(init_state.get("lazy_opened", False))
+    if lyrics:
+        if init_idx >= 0:
+            clamped_idx = min(init_idx, len(lyrics) - 1)
+            pred_display_index = min(clamped_idx + 1, len(lyrics) - 1)
+            prev_matched_index: int | None = clamped_idx
+        else:
+            pred_display_index = 0
+            prev_matched_index = None
+    else:
+        pred_display_index = -1
+        prev_matched_index = None
     matched_unique_lines: set[int] = set()
     match_scores: list[float] = []
     infer_ms_values: list[float] = []
@@ -303,13 +337,16 @@ def replay_trace(
 
     for event in events_list:
         elapsed_sec = float(event.get("elapsed_sec") or 0.0)
-        clock.now = elapsed_sec
+        clock.now = base_time + elapsed_sec
         ev_type = event.get("type")
 
         if ev_type == "asr_step":
             asr_steps += 1
             asr_info = dict(event.get("asr") or {})
-            raw_text = str(asr_info.get("raw_text") or "")
+            if "text" in asr_info:
+                raw_text = str(asr_info.get("text") or "")
+            else:
+                raw_text = str(asr_info.get("raw_text") or "")
             if raw_text.strip():
                 non_empty_steps += 1
 
@@ -424,12 +461,19 @@ def replay_trace(
 
     total_matches = matches_p1 + matches_p2
     total_lines = len(lyrics)
+    parity_applicable = not (anchor_mode == "eval" and len(abs_errors) > 0)
+    live_parity_rate = (
+        round(parity_matches / asr_steps, 4)
+        if (parity_applicable and asr_steps > 0)
+        else (1.0 if parity_applicable else None)
+    )
 
     summary = {
         "trace_path": trace_data["path"],
         "track": session_start.get("track") or {},
         "strategy": spec.raw,
         "anchor_mode": anchor_mode,
+        "lazy_opened": lazy_opened,
         "total_lines": total_lines,
         "asr_steps": asr_steps,
         "non_empty_steps": non_empty_steps,
@@ -463,10 +507,10 @@ def replay_trace(
         else None,
         "infer_over_budget_count": infer_over_budget_count,
         "step_budget_ms": round(step_budget_ms, 1),
-        "live_parity_rate": round(parity_matches / asr_steps, 4)
-        if asr_steps > 0
-        else 1.0,
+        "live_parity_rate": live_parity_rate,
         "parity_matches": parity_matches,
+        "_parity_steps": asr_steps if parity_applicable else 0,
+        "_parity_matches": parity_matches if parity_applicable else 0,
         "_score_sum": sum(match_scores),
         "_score_count": len(match_scores),
         "_anchor_err_sum": sum(abs_errors),
@@ -504,7 +548,9 @@ def aggregate_summaries(
     infer_sum = sum(s["_infer_sum"] for s in summaries)
     infer_count = sum(s["_infer_count"] for s in summaries)
     max_infers = [s["max_infer_ms"] for s in summaries if s["max_infer_ms"] is not None]
-    parity_matches = sum(s["parity_matches"] for s in summaries)
+    parity_steps = sum(s["_parity_steps"] for s in summaries)
+    parity_matches = sum(s["_parity_matches"] for s in summaries)
+    has_any_parity_trace = any(s["live_parity_rate"] is not None for s in summaries)
 
     return {
         "traces_count": len(summaries),
@@ -542,14 +588,14 @@ def aggregate_summaries(
         "infer_over_budget_count": sum(
             s["infer_over_budget_count"] for s in summaries
         ),
-        "live_parity_rate": round(parity_matches / asr_steps, 4)
-        if asr_steps > 0
-        else 1.0,
+        "live_parity_rate": round(parity_matches / parity_steps, 4)
+        if parity_steps > 0
+        else (1.0 if has_any_parity_trace else None),
     }
 
 
-def _fmt_pct(val: float | None) -> str:
-    return f"{val * 100:.1f}%" if val is not None else "-"
+def _fmt_pct(val: float | None, *, none_text: str = "-") -> str:
+    return f"{val * 100:.1f}%" if val is not None else none_text
 
 
 def _fmt_num(val: float | None, digits: int = 2) -> str:
@@ -599,7 +645,7 @@ def format_comparison_markdown(rows: list[dict[str, Any]]) -> str:
             _fmt_num(row["mean_match_score"], 3),
             anchor_str,
             infer_str,
-            _fmt_pct(row["live_parity_rate"]),
+            _fmt_pct(row["live_parity_rate"], none_text="n/a"),
         ]
         lines.append("| " + " | ".join(cols) + " |")
     return "\n".join(lines)
@@ -646,7 +692,7 @@ def format_comparison_table(rows: list[dict[str, Any]]) -> str:
                 _fmt_num(row["mean_match_score"], 3),
                 anchor_str,
                 infer_str,
-                _fmt_pct(row["live_parity_rate"]),
+                _fmt_pct(row["live_parity_rate"], none_text="n/a"),
             ]
         )
 
@@ -856,9 +902,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         strategy_specs = [parse_strategy_spec(s) for s in raw_strategies]
         trace_paths = resolve_trace_paths(args.paths)
-        traces = [load_trace(path) for path in trace_paths]
     except (ValueError, FileNotFoundError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
+
+    traces: list[dict[str, Any]] = []
+    for path in trace_paths:
+        try:
+            traces.append(load_trace(path))
+        except (ValueError, OSError) as exc:
+            print(
+                f"[WARN] 略過損毀或無法讀取的 Trace 檔案 ({path}): {exc}",
+                file=sys.stderr,
+            )
+
+    if not traces:
+        print("[ERROR] 沒有可重播的有效 Trace 檔案", file=sys.stderr)
         return 2
 
     runs_by_trace: list[list[dict[str, Any]]] = []
@@ -878,9 +937,15 @@ def main(argv: list[str] | None = None) -> int:
         track = trace["session_start"].get("track") or {}
         title = track.get("title") or track.get("song_name") or Path(trace["path"]).name
         artist = track.get("artist") or track.get("artist_name") or "Unknown"
+        flags = []
+        if (trace["session_start"].get("initial_state") or {}).get("lazy_opened"):
+            flags.append("lazy")
+        if trace.get("truncated"):
+            flags.append("truncated")
+        flag_str = f" [{','.join(flags)}]" if flags else ""
         print(
             f"\n=== Trace: {artist} - {title} ({Path(trace['path']).name}) "
-            f"[anchor_mode={args.anchor_mode}] ==="
+            f"[anchor_mode={args.anchor_mode}]{flag_str} ==="
         )
         print(
             format_comparison_table(

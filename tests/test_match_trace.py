@@ -169,6 +169,60 @@ class TestMatchTraceRecorder(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_trace(bad_path)
 
+    def test_prune_old_traces_keeps_active_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            clock = _FakeClock(10.0)
+            recorder = MatchTraceRecorder(
+                traces_dir=tmp,
+                is_enabled_fn=lambda: True,
+                clock=clock,
+                max_files=2,
+            )
+            lyrics = _sample_lyrics()[:2]
+
+            p1 = recorder.start_session({"song_name": "Track1"}, lyrics)
+            clock.now = 11.0
+            p2 = recorder.start_session({"song_name": "Track2"}, lyrics)
+            clock.now = 12.0
+            p3 = recorder.start_session({"song_name": "Track3"}, lyrics)
+            recorder.close_session("done", clear_pending=True)
+
+            assert p1 is not None and p2 is not None and p3 is not None
+            remaining = sorted(p.name for p in tmp.glob("*.jsonl"))
+            self.assertEqual(len(remaining), 2)
+            self.assertIn(p3.name, remaining)
+            self.assertFalse(p1.exists())
+
+    def test_load_trace_tolerates_truncated_trailing_line_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            clock = _FakeClock(10.0)
+            recorder = MatchTraceRecorder(
+                traces_dir=tmp,
+                is_enabled_fn=lambda: True,
+                clock=clock,
+            )
+            path = recorder.start_session({"song_name": "Truncated"}, _sample_lyrics()[:2])
+            recorder.record_asr_step({"decision": "no_match"})
+            recorder.close_session("done", clear_pending=True)
+            assert path is not None
+
+            # Replace session_end with a crash-truncated trailing line.
+            lines = path.read_text(encoding="utf-8").splitlines()
+            lines[-1] = '{"type": "asr_step", "seq": 2, "broken'
+            path.write_text("\n".join(lines), encoding="utf-8")
+
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                loaded = load_trace(path)
+            self.assertTrue(loaded["truncated"])
+            self.assertEqual(len(loaded["events"]), 1)
+            self.assertIn("偵測到結尾不完整行", err_buf.getvalue())
+
+            with self.assertRaises(ValueError):
+                load_trace(path, tolerant=False)
+
 
 class TestEngineDiagnosticsAndProgress(unittest.TestCase):
     def test_engine_records_all_decision_paths_and_progress(self) -> None:
@@ -193,17 +247,31 @@ class TestEngineDiagnosticsAndProgress(unittest.TestCase):
                 clock.now = 1002.0
                 payload, trace_ev = engine.evaluate_recognized_text(
                     "",
-                    asr_meta={"raw_text": "", "raw_text_before_filter": "ご視聴ありがとうございました", "infer_ms": 120.0},
+                    asr_meta={"text": "", "raw_text_before_filter": "ご視聴ありがとうございました", "infer_ms": 120.0},
                 )
                 self.assertIsNone(payload)
                 self.assertEqual(trace_ev["decision"], "asr_empty_or_filtered")
                 self.assertEqual(trace_ev["playback"]["estimated_progress_ms"], 14000)
 
+                # Punctuation-only without asr_meta does NOT write trace; with asr_meta DOES write trace
+                clock.now = 1003.0
+                p_punct_no_meta, t_punct_no_meta = engine.evaluate_recognized_text("、。")
+                self.assertIsNone(p_punct_no_meta)
+                self.assertEqual(t_punct_no_meta["decision"], "ignored_empty")
+
+                clock.now = 1003.5
+                p_punct_meta, t_punct_meta = engine.evaluate_recognized_text(
+                    "、。",
+                    asr_meta={"text": "、。", "infer_ms": 50.0},
+                )
+                self.assertIsNone(p_punct_meta)
+                self.assertEqual(t_punct_meta["decision"], "ignored_empty")
+
                 # 2. Phase 1 match on line 0
                 clock.now = 1004.0
                 m1, t1 = engine.evaluate_recognized_text(
                     "優しい嘘をついてくれよ",
-                    asr_meta={"raw_text": "優しい嘘をついてくれよ", "infer_ms": 210.5},
+                    asr_meta={"text": "優しい嘘をついてくれよ", "infer_ms": 210.5},
                 )
                 self.assertIsNotNone(m1)
                 assert m1 is not None
@@ -255,12 +323,46 @@ class TestEngineDiagnosticsAndProgress(unittest.TestCase):
 
             assert first_trace_path is not None
             loaded = load_trace(first_trace_path)
-            decisions = [e["decision"] for e in loaded["events"] if e["type"] == "asr_step"]
+            asr_events = [e for e in loaded["events"] if e["type"] == "asr_step"]
+            decisions = [e["decision"] for e in asr_events]
             self.assertIn("asr_empty_or_filtered", decisions)
             self.assertIn("matched_phase1", decisions)
             self.assertIn("skipped_duplicate_ttl", decisions)
             self.assertIn("no_match", decisions)
             self.assertIn("matched_phase2_recovery", decisions)
+            # Only the punctuation call WITH asr_meta should be persisted as ignored_empty.
+            self.assertEqual(decisions.count("ignored_empty"), 1)
+
+    def test_zero_clock_and_clear_pending_on_stop_prevent_stub_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            clock = _FakeClock(0.0)
+            recorder = MatchTraceRecorder(
+                traces_dir=tmp,
+                is_enabled_fn=lambda: True,
+                clock=clock,
+            )
+            engine = LyricSyncEngine(trace_recorder=recorder, clock=clock, emit_events=False)
+            lyrics = _sample_lyrics()
+
+            engine.reset_with_lyrics(lyrics, track_meta={"song_name": "ZeroClock"})
+            # Event right at t=0.0 must still record buffer_start_at without 0.0 sentinel bug.
+            engine.process_recognized_text("ぜんぜんちがう")
+            clock.now = 10.0
+            m, t_step = engine.evaluate_recognized_text("光がさす方へ歩き出す")
+            # Because elapsed_since_success is 10.0s (not 0.0), lookahead expanded to 4 lines -> line 4 matched!
+            self.assertIsNotNone(m)
+            assert m is not None
+            self.assertEqual(m["matched_index"], 4)
+            self.assertEqual(t_step["phase1_lookahead_lines"], 4)
+
+            # Stop session with clear_pending=True -> in-flight callback must NOT open a new stub file.
+            engine.close_trace_session("stopped", clear_pending=True)
+            files_before = set(tmp.glob("*.jsonl"))
+            engine.process_recognized_text("青い空を見上げながら")
+            files_after = set(tmp.glob("*.jsonl"))
+            self.assertEqual(files_before, files_after)
+            self.assertFalse(recorder.is_active)
 
 
 class TestAsrCallbackAndSettingsIntegration(unittest.TestCase):
@@ -274,14 +376,24 @@ class TestAsrCallbackAndSettingsIntegration(unittest.TestCase):
         def cb_two(text: str, meta: dict) -> None:
             calls_two.append((text, meta))
 
+        class _UnhashableCallable:
+            __hash__ = None  # type: ignore[assignment]
+
+            def __call__(self, text: str, meta: dict) -> None:
+                calls_two.append((text, meta))
+
+        unhashable_cb = _UnhashableCallable()
         self.assertFalse(asr_worker._callback_accepts_meta(cb_one))
         self.assertTrue(asr_worker._callback_accepts_meta(cb_two))
+        self.assertTrue(asr_worker._callback_accepts_meta(cb_two))
         self.assertTrue(asr_worker._callback_accepts_meta(lambda *args: None))
+        self.assertTrue(asr_worker._callback_accepts_meta(unhashable_cb))
 
         asr_worker._invoke_asr_callback(cb_one, "hello", {"infer_ms": 10})
         asr_worker._invoke_asr_callback(cb_two, "hello", {"infer_ms": 10})
+        asr_worker._invoke_asr_callback(unhashable_cb, "hi", {"infer_ms": 5})
         self.assertEqual(calls_one, ["hello"])
-        self.assertEqual(calls_two, [("hello", {"infer_ms": 10})])
+        self.assertEqual(calls_two, [("hello", {"infer_ms": 10}), ("hi", {"infer_ms": 5})])
 
     @patch("utaten_finder.ui.webview_app.has_valid_cached_token", return_value=False)
     def test_config_and_app_controller_persist_match_trace_setting(self, _mock_token) -> None:
@@ -347,19 +459,19 @@ class TestEvalMatchingReplay(unittest.TestCase):
         clock.now = 2.0
         engine.process_recognized_text(
             "優しい嘘をついてくれよ",
-            asr_meta={"raw_text": "優しい嘘をついてくれよ", "infer_ms": 250.0, "no_speech_prob_max": 0.05, "avg_logprob_mean": -0.2},
+            asr_meta={"text": "優しい嘘をついてくれよ", "infer_ms": 250.0, "no_speech_prob_max": 0.05, "avg_logprob_mean": -0.2},
         )
         clock.now = 4.0
         engine.process_recognized_text(
             "げんじつわさんこくだもの",
-            asr_meta={"raw_text": "げんじつわさんこくだもの", "infer_ms": 300.0, "no_speech_prob_max": 0.04, "avg_logprob_mean": -0.25},
+            asr_meta={"text": "げんじつわさんこくだもの", "infer_ms": 300.0, "no_speech_prob_max": 0.04, "avg_logprob_mean": -0.25},
         )
         clock.now = 6.0
         engine.apply_manual_jump(2)
         clock.now = 8.0
         engine.process_recognized_text(
             "夜が明けるまで踊り明かそう",
-            asr_meta={"raw_text": "夜が明けるまで踊り明かそう", "infer_ms": 2200.0, "no_speech_prob_max": 0.03, "avg_logprob_mean": -0.18},
+            asr_meta={"text": "夜が明けるまで踊り明かそう", "infer_ms": 2200.0, "no_speech_prob_max": 0.03, "avg_logprob_mean": -0.18},
         )
 
         trace_path = recorder.current_trace_path
@@ -424,10 +536,86 @@ class TestEvalMatchingReplay(unittest.TestCase):
 
             json_data = json.loads(json_out.read_text(encoding="utf-8"))
             self.assertEqual(len(json_data["overall"]), 2)
+            # In eval mode with anchors, live_parity_rate is reported as None (n/a).
+            self.assertIsNone(json_data["overall"][0]["live_parity_rate"])
+            self.assertIn("n/a", md_text)
             self.assertGreater(
                 json_data["overall"][0]["total_matches"],
                 json_data["overall"][1]["total_matches"],
             )
+
+    def test_lazy_opened_mid_song_trace_replays_with_full_parity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            enabled = False
+            clock = _FakeClock(100.0)
+            recorder = MatchTraceRecorder(
+                traces_dir=Path(tmpdir),
+                is_enabled_fn=lambda: enabled,
+                clock=clock,
+            )
+            engine = LyricSyncEngine(trace_recorder=recorder, clock=clock, emit_events=False)
+            lyrics = _sample_lyrics()
+
+            engine.reset_with_lyrics(
+                lyrics,
+                track_meta={"song_name": "LazySong", "artist_name": "Artist"},
+            )
+
+            # Advance to line 0 and build partial buffer BEFORE enabling trace.
+            clock.now = 102.0
+            engine.process_recognized_text("優しい嘘をついてくれよ")
+            clock.now = 104.0
+            engine.process_recognized_text("げん")
+            clock.now = 105.0
+            engine.process_recognized_text("ちょっとまちがえた")
+            self.assertFalse(recorder.is_active)
+
+            # Now enable trace mid-song -> next event triggers lazy open capturing initial_state!
+            enabled = True
+            clock.now = 107.0
+            engine.process_recognized_text("現実は残酷だもの")
+            clock.now = 108.5
+            engine.process_recognized_text("現実は残酷だもの")  # within duplicate TTL!
+            clock.now = 114.0
+            engine.process_recognized_text("夢の中で君を探してる")
+
+            trace_path = recorder.current_trace_path
+            self.assertIsNotNone(trace_path)
+            engine.close_trace_session("done", clear_pending=True)
+
+            assert trace_path is not None
+            loaded = load_trace(trace_path)
+            init_state = loaded["session_start"]["initial_state"]
+            self.assertTrue(init_state["lazy_opened"])
+            self.assertEqual(init_state["current_index"], 0)
+            self.assertIn("げん", init_state["buffer"])
+
+            replayed = eval_matching.replay_trace(
+                loaded,
+                eval_matching.parse_strategy_spec("baseline"),
+                anchor_mode="eval",
+            )
+            summary = replayed["summary"]
+            self.assertTrue(summary["lazy_opened"])
+            self.assertEqual(summary["live_parity_rate"], 1.0)
+
+    def test_directory_run_skips_malformed_trace_without_aborting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            self._record_synthetic_trace(tmp)
+            corrupt = tmp / "99999999_corrupt.jsonl"
+            corrupt.write_text('{"type": "asr_step"}\n', encoding="utf-8")
+
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            with (
+                contextlib.redirect_stdout(out_buf),
+                contextlib.redirect_stderr(err_buf),
+            ):
+                rc = eval_matching.main([str(tmp), "--strategy", "baseline"])
+            self.assertEqual(rc, 0)
+            self.assertIn("EvalSong", out_buf.getvalue())
+            self.assertIn("略過損毀或無法讀取的 Trace 檔案", err_buf.getvalue())
 
 
 if __name__ == "__main__":
