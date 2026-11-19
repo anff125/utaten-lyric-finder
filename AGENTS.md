@@ -36,6 +36,7 @@ This document provides context, architecture details, and mandatory verification
 
 - **Virtual Environment**: Local Python environment is located at `.venv\` (`.venv\Scripts\python.exe`, `.venv\Scripts\pythonw.exe`, `.venv\Scripts\ruff.exe`).
 - **Git Executable**: If `git` is not on the default PowerShell `PATH`, use `"$env:LOCALAPPDATA\Programs\Git\cmd\git.exe"` or `"C:\Program Files\Git\cmd\git.exe"`.
+- **Shell & Non-Interactive Execution**: Tool shells spawn Windows PowerShell 5.1 by default even when PowerShell 7 (`pwsh`) is installed. Never execute interactive commands that may block waiting for prompts or `stdin`; always pass non-interactive flags (`-NoProfile -NonInteractive`) and explicitly invoke `pwsh -NoProfile -NonInteractive` for PowerShell 7 / `PSScriptAnalyzer` checks.
 - **File Encodings & Line Endings**:
   - **`*.bat` files (`start.bat`, `update.bat`)**: MUST use Windows **`CRLF` (`\r\n`)** line endings and **UTF-8 without BOM** (or pure ASCII). `cmd.exe` misparses byte offsets if a batch file uses `LF` line endings or UTF-8 BOM without `chcp 65001 >nul`.
   - **`*.ps1` files (`scripts/build_portable.ps1`)**: Must include a **UTF-8 BOM** if it contains non-ASCII characters (such as Traditional Chinese comments), as required by Windows PowerShell 5.1 and `PSScriptAnalyzer`.
@@ -73,7 +74,7 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push and pull reque
 ### Check 4: PowerShell Script Analyzer (when editing `*.ps1`)
 If `scripts/build_portable.ps1` is modified:
 ```powershell
-Invoke-ScriptAnalyzer -Path ./scripts/build_portable.ps1 -EnableExit
+pwsh -NoProfile -NonInteractive -Command "Invoke-ScriptAnalyzer -Path ./scripts/build_portable.ps1 -EnableExit"
 ```
 - Also ensure `scripts/build_portable.ps1` retains its UTF-8 with BOM encoding and that any newly added `.py` module in `app.py` or `src/utaten_finder/` or asset in `assets/web/` is covered by `$filesToCopy` / the `src/utaten_finder` recursive copy and the `files = [...]` list in `update.bat` inside `scripts/build_portable.ps1`.
 
