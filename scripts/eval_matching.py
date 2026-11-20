@@ -23,6 +23,24 @@ from utaten_finder.lyrics.matching import LyricSyncEngine  # noqa: E402
 from utaten_finder.lyrics.parser import extract_ruby_reading  # noqa: E402
 from utaten_finder.lyrics.trace import load_trace  # noqa: E402
 
+def _parse_bool(value: str) -> bool:
+    normalized = (value or "").strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"布林參數必須為 true/false，收到: {value!r}")
+
+
+def _parse_display_mode(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized not in {"adaptive", "next", "current"}:
+        raise ValueError(
+            f"display_mode 必須為 adaptive/next/current，收到: {value!r}"
+        )
+    return normalized
+
+
 _BASELINE_PARAM_CASTERS: dict[str, tuple[str, Any]] = {
     "threshold": ("fuzzy_next_line_threshold", float),
     "recovery": ("recovery_threshold", float),
@@ -32,6 +50,12 @@ _BASELINE_PARAM_CASTERS: dict[str, tuple[str, Any]] = {
     "max_buffer_ratio": ("max_buffer_ratio", float),
     "duplicate_ttl": ("duplicate_ttl", float),
     "lookahead_sec": ("lookahead_seconds_per_line", float),
+    "retain_tail": ("retain_tail", _parse_bool),
+    "short_guard": ("short_line_guard", _parse_bool),
+    "short_len": ("short_line_max_len", int),
+    "smart_dup": ("smart_duplicate_ttl", _parse_bool),
+    "display_mode": ("display_mode", _parse_display_mode),
+    "early_progress": ("early_display_progress_threshold", float),
 }
 
 
@@ -82,9 +106,20 @@ class ReplayStrategy:
 class BaselineStrategy(ReplayStrategy):
     """Wraps production ``LyricSyncEngine`` with virtual time and optional overrides."""
 
+    _DEFAULT_OVERRIDES: dict[str, Any] = {}
+
     def __init__(self, spec: StrategySpec) -> None:
         super().__init__(spec)
         self._engine: LyricSyncEngine | None = None
+
+    def _resolve_param(
+        self, key: str, matcher_cfg: dict[str, Any], legacy_default: Any
+    ) -> Any:
+        if key in self.spec.params:
+            return self.spec.params[key]
+        if key in self._DEFAULT_OVERRIDES:
+            return self._DEFAULT_OVERRIDES[key]
+        return matcher_cfg.get(key, legacy_default)
 
     def reset(
         self,
@@ -158,6 +193,26 @@ class BaselineStrategy(ReplayStrategy):
                     matcher_cfg.get("max_buffer_ratio", 1.8),
                 )
             ),
+            "retain_tail": bool(
+                self._resolve_param("retain_tail", matcher_cfg, False)
+            ),
+            "short_line_guard": bool(
+                self._resolve_param("short_line_guard", matcher_cfg, False)
+            ),
+            "short_line_max_len": int(
+                self._resolve_param("short_line_max_len", matcher_cfg, 4)
+            ),
+            "smart_duplicate_ttl": bool(
+                self._resolve_param("smart_duplicate_ttl", matcher_cfg, False)
+            ),
+            "display_mode": str(
+                self._resolve_param("display_mode", matcher_cfg, "next")
+            ),
+            "early_display_progress_threshold": float(
+                self._resolve_param(
+                    "early_display_progress_threshold", matcher_cfg, 0.75
+                )
+            ),
             "emit_events": False,
         }
         self._engine = LyricSyncEngine(**engine_kwargs)
@@ -169,12 +224,16 @@ class BaselineStrategy(ReplayStrategy):
             or int(init_state.get("current_index", -1)) >= 0
             or init_state.get("buffer")
             or init_state.get("last_success_normalized")
+            or init_state.get("last_success_recognized")
         ):
             self._engine.restore_state(
                 current_index=int(init_state.get("current_index", -1)),
                 buffer=str(init_state.get("buffer") or ""),
                 last_success_normalized=str(
                     init_state.get("last_success_normalized") or ""
+                ),
+                last_success_recognized=str(
+                    init_state.get("last_success_recognized") or ""
                 ),
                 elapsed_since_last_success=init_state.get(
                     "elapsed_since_last_success"
@@ -239,9 +298,33 @@ class RtReadingStrategy(BaselineStrategy):
         super().reset(updated_lyrics, updated_session, clock)
 
 
+class SmartSyncStrategy(BaselineStrategy):
+    """Preset enabling tail retention, short-line guard, smart duplicate TTL, and adaptive display."""
+
+    _DEFAULT_OVERRIDES = {
+        "retain_tail": True,
+        "short_line_guard": True,
+        "smart_duplicate_ttl": True,
+        "display_mode": "adaptive",
+    }
+
+
+class RtSmartSyncStrategy(RtReadingStrategy):
+    """Preset combining UtaTen ``<rt>`` readings with all Issue #3 matcher improvements."""
+
+    _DEFAULT_OVERRIDES = {
+        "retain_tail": True,
+        "short_line_guard": True,
+        "smart_duplicate_ttl": True,
+        "display_mode": "adaptive",
+    }
+
+
 STRATEGIES: dict[str, type[ReplayStrategy]] = {
     "baseline": BaselineStrategy,
     "rt_reading": RtReadingStrategy,
+    "smart_sync": SmartSyncStrategy,
+    "rt_smart_sync": RtSmartSyncStrategy,
 }
 
 
@@ -373,6 +456,8 @@ def replay_trace(
     jump_advances = 0
     max_jump = 0
     parity_matches = 0
+    tails_retained = 0
+    early_display_holds = 0
 
     anchor_evals: list[dict[str, Any]] = []
     timeline_rows: list[dict[str, Any]] = []
@@ -421,6 +506,11 @@ def replay_trace(
                     matches_p2 += 1
                 else:
                     matches_p1 += 1
+
+                if step_trace.get("retained_tail"):
+                    tails_retained += 1
+                if step_trace.get("early_display_hold"):
+                    early_display_holds += 1
 
                 if prev_matched_index is not None:
                     delta = matched_idx - prev_matched_index
@@ -551,6 +641,8 @@ def replay_trace(
         "step_budget_ms": round(step_budget_ms, 1),
         "live_parity_rate": live_parity_rate,
         "parity_matches": parity_matches,
+        "tails_retained": tails_retained,
+        "early_display_holds": early_display_holds,
         "_parity_steps": asr_steps if parity_applicable else 0,
         "_parity_matches": parity_matches if parity_applicable else 0,
         "_score_sum": sum(match_scores),
@@ -633,6 +725,10 @@ def aggregate_summaries(
         "live_parity_rate": round(parity_matches / parity_steps, 4)
         if parity_steps > 0
         else (1.0 if has_any_parity_trace else None),
+        "tails_retained": sum(s.get("tails_retained", 0) for s in summaries),
+        "early_display_holds": sum(
+            s.get("early_display_holds", 0) for s in summaries
+        ),
     }
 
 
@@ -655,6 +751,7 @@ def format_comparison_markdown(rows: list[dict[str, Any]]) -> str:
         "Jumps (>=2)",
         "Max Jump",
         "Mean Score",
+        "Tail/Hold",
         "Anchor Exact / ±1 / MAE",
         "Infer Avg/Max (Over)",
         "Live Parity",
@@ -676,6 +773,9 @@ def format_comparison_markdown(rows: list[dict[str, Any]]) -> str:
             if row["avg_infer_ms"] is not None
             else "-"
         )
+        tail_hold_str = (
+            f"{row.get('tails_retained', 0)}/{row.get('early_display_holds', 0)}"
+        )
         cols = [
             f"`{row['strategy']}`",
             f"{row['asr_steps']} ({row['non_empty_steps']})",
@@ -685,6 +785,7 @@ def format_comparison_markdown(rows: list[dict[str, Any]]) -> str:
             str(row["jump_advances"]),
             str(row["max_jump"]),
             _fmt_num(row["mean_match_score"], 3),
+            tail_hold_str,
             anchor_str,
             infer_str,
             _fmt_pct(row["live_parity_rate"], none_text="n/a"),
@@ -704,6 +805,7 @@ def format_comparison_table(rows: list[dict[str, Any]]) -> str:
         "Jump",
         "MaxJ",
         "Score",
+        "Tail/Hold",
         "Anchor(Exact/±1/MAE)",
         "Infer(Avg/Max/Over)",
         "Parity",
@@ -722,6 +824,9 @@ def format_comparison_table(rows: list[dict[str, Any]]) -> str:
             if row["avg_infer_ms"] is not None
             else "-"
         )
+        tail_hold_str = (
+            f"{row.get('tails_retained', 0)}/{row.get('early_display_holds', 0)}"
+        )
         table_rows.append(
             [
                 str(row["strategy"]),
@@ -732,6 +837,7 @@ def format_comparison_table(rows: list[dict[str, Any]]) -> str:
                 str(row["jump_advances"]),
                 str(row["max_jump"]),
                 _fmt_num(row["mean_match_score"], 3),
+                tail_hold_str,
                 anchor_str,
                 infer_str,
                 _fmt_pct(row["live_parity_rate"], none_text="n/a"),
@@ -892,8 +998,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="strategies",
         default=[],
         help=(
-            "Strategy spec to evaluate (repeatable), e.g. 'baseline', 'rt_reading', or "
-            "'baseline:threshold=0.70,recovery=0.55,lookahead=5'. Defaults to 'baseline'."
+            "Strategy spec to evaluate (repeatable), e.g. 'baseline', 'rt_reading', "
+            "'smart_sync', 'rt_smart_sync', or "
+            "'rt_smart_sync:threshold=0.70,retain_tail=true,display_mode=adaptive'. "
+            "Defaults to 'baseline'."
         ),
     )
     parser.add_argument(
