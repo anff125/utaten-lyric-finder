@@ -125,6 +125,9 @@ pip install -r requirements.txt
 
 # 針對錄製好的 Trace 並列比較不同參數或策略，並列出決策分歧點
 .\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy baseline:threshold=0.70,recovery=0.55 --diff
+
+# 比較舊版 pykakasi 推估讀音與優先採用 UtaTen <rt> 振假名讀音的差異
+.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy rt_reading --diff
 ```
 
 ### 自行建立 Release 可攜包
@@ -152,7 +155,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_portable.ps1 -SkipEnvBu
 - **高精準度日文語音辨識與滑動視窗匹配**：
   - 支援 `kotoba-whisper-v2.0-faster` 與 `turbo` 等模型，使用多相濾波重採樣 (`scipy.signal.resample_poly`) 與滑動視窗收音 (`asr_worker.py`)。
   - 內建兩階段歌詞匹配（局部前瞻 + 迷失恢復機制）與日文平假名正規化 (`matching.py`)，並支援點擊歌詞任意行手動跳轉定位。
-- **無瀏覽器 UtaTen 爬蟲與 `<ruby>` 解析器**：直接由 Python 後端抓取並清洗 UtaTen HTML (`web_scraper.py`、`parser.py`)，並透過本地快取 (`song_cache.py`) 秒開已聽過的歌曲。
+- **無瀏覽器 UtaTen 爬蟲與 `<ruby>` 解析器**：直接由 Python 後端抓取並清洗 UtaTen HTML (`web_scraper.py`、`parser.py`)，優先採用 `<rt>` 振假名讀音（支援義訓／当て字）產生正規化比對目標，並透過本地快取 (`song_cache.py`) 秒開已聽過的歌曲。
 
 ## 📁 專案架構 (Project Structure)
 

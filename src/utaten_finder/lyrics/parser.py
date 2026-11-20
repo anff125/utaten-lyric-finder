@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+import jaconv
 
 from utaten_finder.lyrics.matching import normalize_match_text, normalize_to_hiragana
 from utaten_finder.lyrics.web_scraper import extract_clean_page_title
@@ -65,6 +66,12 @@ _AD_ATTR_PATTERN = re.compile(
     r"(?:^|[-_])(ad|ads|adsense|adsbygoogle|advert|advertisement|banner|sponsor|promo|widget|sns|share|recommend)(?:$|[-_0-9])",
     re.IGNORECASE,
 )
+
+_HAS_KANJI_RE = re.compile(
+    r"[\u3005-\u3007\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]"
+)
+
+_RT_IGNORABLE_SYMBOLS = "・•●○◦▪▫*＊"
 
 
 def _has_class(tag: Tag, class_name: str) -> bool:
@@ -137,8 +144,65 @@ def _extract_plain_text_without_rt(node: Tag) -> str:
     return re.sub(r"[\r\n\t]+", "", "".join(parts)).strip()
 
 
+def _kana_to_hiragana(text: str) -> str:
+    if not text:
+        return ""
+    fullwidth_kana = jaconv.h2z(text, kana=True, digit=False, ascii=False)
+    return jaconv.kata2hira(fullwidth_kana)
+
+
+def _convert_text_to_hiragana(text: str) -> str:
+    if not text:
+        return ""
+    stripped = text.strip()
+    if not stripped:
+        return text
+
+    leading_len = len(text) - len(text.lstrip())
+    trailing_len = len(text) - len(text.rstrip())
+    prefix = text[:leading_len]
+    suffix = text[len(text) - trailing_len :] if trailing_len else ""
+
+    converted = _kana_to_hiragana(stripped)
+    if _HAS_KANJI_RE.search(converted):
+        converted = normalize_to_hiragana(converted)
+    return f"{prefix}{converted}{suffix}"
+
+
+def _is_usable_rt_reading(rt_text: str) -> bool:
+    if not rt_text:
+        return False
+    normalized_rt = normalize_match_text(_kana_to_hiragana(rt_text))
+    return bool(normalized_rt.strip(_RT_IGNORABLE_SYMBOLS))
+
+
+def _build_reading_from_tokens(tokens: list[tuple[str, bool]]) -> str:
+    parts: list[str] = []
+    plain_buf: list[str] = []
+
+    def _flush_plain() -> None:
+        if plain_buf:
+            parts.append(_convert_text_to_hiragana("".join(plain_buf)))
+            plain_buf.clear()
+
+    for text, is_rt in tokens:
+        if not text:
+            continue
+        if is_rt:
+            _flush_plain()
+            parts.append(_convert_text_to_hiragana(text))
+        else:
+            plain_buf.append(text)
+
+    _flush_plain()
+    return re.sub(r" {2,}", " ", "".join(parts)).strip()
+
+
 def _serialize_utaten_ruby_span(
-    span: Tag, original_parts: list[str], ruby_parts: list[str]
+    span: Tag,
+    original_parts: list[str],
+    ruby_parts: list[str],
+    reading_tokens: list[tuple[str, bool]],
 ) -> None:
     rb_elem = span.select_one(".rb, rb")
     if rb_elem is not None:
@@ -164,9 +228,17 @@ def _serialize_utaten_ruby_span(
     else:
         ruby_parts.append(escaped_rb)
 
+    if _is_usable_rt_reading(rt_text):
+        reading_tokens.append((rt_text, True))
+    else:
+        reading_tokens.append((rb_text, False))
+
 
 def _serialize_native_ruby(
-    ruby_tag: Tag, original_parts: list[str], ruby_parts: list[str]
+    ruby_tag: Tag,
+    original_parts: list[str],
+    ruby_parts: list[str],
+    reading_tokens: list[tuple[str, bool]],
 ) -> None:
     pairs: list[tuple[str, str]] = []
     pending_base_parts: list[str] = []
@@ -210,6 +282,11 @@ def _serialize_native_ruby(
         else:
             ruby_inner.append(escaped_base)
 
+        if _is_usable_rt_reading(rt_text):
+            reading_tokens.append((rt_text, True))
+        else:
+            reading_tokens.append((base_text, False))
+
     if has_rt:
         ruby_parts.append(f"<ruby>{''.join(ruby_inner)}</ruby>")
     else:
@@ -217,7 +294,10 @@ def _serialize_native_ruby(
 
 
 def _serialize_inline_node(
-    node: Any, original_parts: list[str], ruby_parts: list[str]
+    node: Any,
+    original_parts: list[str],
+    ruby_parts: list[str],
+    reading_tokens: list[tuple[str, bool]],
 ) -> None:
     if isinstance(node, Comment):
         return
@@ -227,6 +307,7 @@ def _serialize_inline_node(
         if cleaned:
             original_parts.append(cleaned)
             ruby_parts.append(html.escape(cleaned, quote=False))
+            reading_tokens.append((cleaned, False))
         return
 
     if not isinstance(node, Tag):
@@ -237,26 +318,38 @@ def _serialize_inline_node(
         return
 
     if _has_class(node, "ruby"):
-        _serialize_utaten_ruby_span(node, original_parts, ruby_parts)
+        _serialize_utaten_ruby_span(node, original_parts, ruby_parts, reading_tokens)
         return
 
     if tag_name == "ruby":
-        _serialize_native_ruby(node, original_parts, ruby_parts)
+        _serialize_native_ruby(node, original_parts, ruby_parts, reading_tokens)
         return
 
     for child in node.children:
-        _serialize_inline_node(child, original_parts, ruby_parts)
+        _serialize_inline_node(child, original_parts, ruby_parts, reading_tokens)
 
 
-def _serialize_line_nodes(nodes: list[Any]) -> tuple[str, str]:
+def _serialize_line_nodes(nodes: list[Any]) -> tuple[str, str, str]:
     original_parts: list[str] = []
     ruby_parts: list[str] = []
+    reading_tokens: list[tuple[str, bool]] = []
     for node in nodes:
-        _serialize_inline_node(node, original_parts, ruby_parts)
+        _serialize_inline_node(node, original_parts, ruby_parts, reading_tokens)
 
     original = re.sub(r" {2,}", " ", "".join(original_parts)).strip()
     ruby_html = re.sub(r" {2,}", " ", "".join(ruby_parts)).strip()
-    return original, ruby_html
+    reading = _build_reading_from_tokens(reading_tokens)
+    return original, ruby_html, reading
+
+
+def extract_ruby_reading(ruby_html: str) -> tuple[str, str]:
+    """Extract hiragana reading and normalized match key from sanitized <ruby> HTML."""
+    if not ruby_html:
+        return ("", "")
+    soup = BeautifulSoup(ruby_html, "html.parser")
+    _, _, reading = _serialize_line_nodes(list(soup.contents))
+    normalized = normalize_match_text(reading) if reading else ""
+    return reading, normalized
 
 
 def _collect_segments_from_children(
@@ -367,10 +460,8 @@ def parse_utaten_lyrics(html_text: str) -> dict[str, Any]:
         if stanza_hint and lines:
             pending_stanza_break = True
 
-        original, ruby_html = _serialize_line_nodes(nodes)
-        normalized = (
-            normalize_match_text(normalize_to_hiragana(original)) if original else ""
-        )
+        original, ruby_html, reading = _serialize_line_nodes(nodes)
+        normalized = normalize_match_text(reading) if reading else ""
 
         if not normalized:
             if lines:
@@ -381,6 +472,7 @@ def parse_utaten_lyrics(html_text: str) -> dict[str, Any]:
             {
                 "index": len(lines),
                 "original": original,
+                "reading": reading,
                 "normalized": normalized,
                 "ruby_html": ruby_html,
                 "stanza_break": bool(pending_stanza_break and lines),

@@ -10,7 +10,7 @@ Trace format (``schema_version: 1``), one JSON object per line:
                        "elapsed_since_last_success": float | None,
                        "elapsed_since_buffer_start": float | None},
      "lyrics": [{"index": int, "original": str, "normalized": str,
-                 "ruby_html": str, "stanza_break": bool}]}``
+                 "ruby_html": str, "stanza_break": bool, "reading": str (optional)}]}``
 - ``asr_step``:
   ``{"type": "asr_step", "seq": int, "elapsed_sec": float, "ts_utc": str,
      "playback": {"spotify_progress_ms": int | None, "estimated_progress_ms": int | None,
@@ -72,15 +72,16 @@ def _utc_now_iso() -> str:
 def _snapshot_lyrics_for_trace(lyrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
     snapshot: list[dict[str, Any]] = []
     for pos, line in enumerate(lyrics):
-        snapshot.append(
-            {
-                "index": int(line.get("index", pos)),
-                "original": str(line.get("original") or ""),
-                "normalized": str(line.get("normalized") or ""),
-                "ruby_html": str(line.get("ruby_html") or ""),
-                "stanza_break": bool(line.get("stanza_break", False)),
-            }
-        )
+        entry = {
+            "index": int(line.get("index", pos)),
+            "original": str(line.get("original") or ""),
+            "normalized": str(line.get("normalized") or ""),
+            "ruby_html": str(line.get("ruby_html") or ""),
+            "stanza_break": bool(line.get("stanza_break", False)),
+        }
+        if "reading" in line:
+            entry["reading"] = str(line.get("reading") or "")
+        snapshot.append(entry)
     return snapshot
 
 
