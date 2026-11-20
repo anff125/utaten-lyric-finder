@@ -126,8 +126,8 @@ pip install -r requirements.txt
 # 針對錄製好的 Trace 並列比較不同參數或策略，並列出決策分歧點
 .\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy baseline:threshold=0.70,recovery=0.55 --diff
 
-# 比較舊版 pykakasi、UtaTen <rt> 振假名與 RapidFuzz 智慧同步（保留尾端／短句與重複句修正／自適應高亮時機）
-.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy rt_reading --strategy rt_smart_sync --strategy rt_smart_sync:display_mode=next --diff
+# 比較舊版 pykakasi、UtaTen <rt> 振假名、Issue #3 智慧同步，以及 Issue #4 歌唱音韻正規化／加權編輯距離／相鄰跨行／連續字元 Beam 對齊策略
+.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy rt_reading --strategy rt_smart_sync --strategy phono_sync --strategy phono_weighted --strategy pair_sync --strategy phono_pair_sync --strategy beam_align --diff
 ```
 
 ### 自行建立 Release 可攜包
@@ -154,7 +154,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_portable.ps1 -SkipEnvBu
 - **GPU 自動加速與智慧 CPU 降級**：自動掛載虛擬環境中的 NVIDIA CUDA (`cublas64_12.dll` / `cudnn`) 路徑並於啟動時進行暖身推理驗證；若 GPU 不可用或發生執行期錯誤，自動無縫切換為 CPU (`int8`) 模式不中斷辨識。
 - **高精準度日文語音辨識與滑動視窗匹配**：
   - 支援 `kotoba-whisper-v2.0-faster` 與 `turbo` 等模型，使用多相濾波重採樣 (`scipy.signal.resample_poly`) 與滑動視窗收音 (`asr_worker.py`)。
-  - 內建 RapidFuzz 兩階段歌詞匹配（局部前瞻 + 迷失恢復機制），支援 `partial_ratio_alignment` 未消耗尾端保留、短句誤觸防護、連續重複句智慧去重、自適應高亮時機、日文平假名正規化 (`matching.py`)，以及點擊歌詞任意行手動跳轉定位。
+  - 內建連續字元時間軸 Top-K Beam 追蹤與清濁音加權 Smith-Waterman 局部對齊 (`matching.py`、`phonology.py`)，整合日文歌唱音韻正規化（助詞、四假名、長音、促音）、未消耗尾端保留、短句誤觸防護、連續重複句智慧去重、自適應高亮時機與點擊歌詞任意行手動跳轉定位（亦支援 RapidFuzz 單行／相鄰跨行拼接模式）。
 - **無瀏覽器 UtaTen 爬蟲與 `<ruby>` 解析器**：直接由 Python 後端抓取並清洗 UtaTen HTML (`web_scraper.py`、`parser.py`)，優先採用 `<rt>` 振假名讀音（支援義訓／当て字）產生正規化比對目標，並透過本地快取 (`song_cache.py`) 秒開已聽過的歌曲。
 
 ## 📁 專案架構 (Project Structure)
@@ -176,7 +176,7 @@ utaten-lyric-finder/
     ├── core/                           # config.py, events.py (EventBus + logging 擷取), orchestrator.py
     ├── media/                          # spotify_api.py (API + OAuth 伺服器), system_media.py (SMTC)
     ├── audio/                          # cuda_loader.py, process_loopback.py, asr_worker.py (ASR + VU Meter)
-    ├── lyrics/                         # web_scraper.py, parser.py, matching.py, song_cache.py, trace.py
+    ├── lyrics/                         # web_scraper.py, parser.py, phonology.py, matching.py, song_cache.py, trace.py
     └── ui/                             # webview_app.py (PyWebView 視窗控制器與 JsApi 橋接)
 ```
 

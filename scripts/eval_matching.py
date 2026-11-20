@@ -41,6 +41,15 @@ def _parse_display_mode(value: str) -> str:
     return normalized
 
 
+def _parse_alignment_mode(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized not in {"line", "beam"}:
+        raise ValueError(
+            f"align_mode 必須為 line/beam，收到: {value!r}"
+        )
+    return normalized
+
+
 _BASELINE_PARAM_CASTERS: dict[str, tuple[str, Any]] = {
     "threshold": ("fuzzy_next_line_threshold", float),
     "recovery": ("recovery_threshold", float),
@@ -56,6 +65,20 @@ _BASELINE_PARAM_CASTERS: dict[str, tuple[str, Any]] = {
     "smart_dup": ("smart_duplicate_ttl", _parse_bool),
     "display_mode": ("display_mode", _parse_display_mode),
     "early_progress": ("early_display_progress_threshold", float),
+    "align_mode": ("alignment_mode", _parse_alignment_mode),
+    "phono": ("phonological_norm", _parse_bool),
+    "phono_particles": ("phono_particles", _parse_bool),
+    "phono_long": ("phono_long_vowels", _parse_bool),
+    "phono_sokuon": ("phono_drop_sokuon", _parse_bool),
+    "weighted_dakuten": ("weighted_dakuten", _parse_bool),
+    "dakuten_cost": ("dakuten_cost", float),
+    "pair": ("adjacent_pair", _parse_bool),
+    "pair_threshold": ("pair_threshold", float),
+    "beam_width": ("beam_width", int),
+    "beam_min_sim": ("beam_min_sim", float),
+    "beam_dakuten": ("beam_dakuten_score", float),
+    "beam_forward": ("beam_forward_bonus", float),
+    "beam_jump_pen": ("beam_jump_penalty_per_char", float),
 }
 
 
@@ -129,6 +152,24 @@ class BaselineStrategy(ReplayStrategy):
     ) -> None:
         matcher_cfg = session_start.get("matcher_config") or {}
         asr_cfg = session_start.get("asr_config") or {}
+
+        alignment_mode = str(
+            self._resolve_param("alignment_mode", matcher_cfg, "line")
+        )
+        if "beam_min_sim" in self.spec.params:
+            beam_min_sim = float(self.spec.params["beam_min_sim"])
+        elif (
+            alignment_mode == "beam"
+            and "fuzzy_next_line_threshold" in self.spec.params
+        ):
+            beam_min_sim = float(self.spec.params["fuzzy_next_line_threshold"])
+        else:
+            beam_min_sim = float(
+                self._resolve_param("beam_min_sim", matcher_cfg, 0.73)
+            )
+        pair_threshold_raw = self._resolve_param(
+            "pair_threshold", matcher_cfg, None
+        )
 
         engine_kwargs: dict[str, Any] = {
             "lookahead_seconds_per_line": float(
@@ -213,6 +254,73 @@ class BaselineStrategy(ReplayStrategy):
                     "early_display_progress_threshold", matcher_cfg, 0.75
                 )
             ),
+            "alignment_mode": alignment_mode,
+            "phonological_norm": bool(
+                self._resolve_param("phonological_norm", matcher_cfg, False)
+            ),
+            "phono_particles": bool(
+                self._resolve_param("phono_particles", matcher_cfg, True)
+            ),
+            "phono_long_vowels": bool(
+                self._resolve_param("phono_long_vowels", matcher_cfg, True)
+            ),
+            "phono_drop_sokuon": bool(
+                self._resolve_param("phono_drop_sokuon", matcher_cfg, True)
+            ),
+            "weighted_dakuten": bool(
+                self._resolve_param("weighted_dakuten", matcher_cfg, False)
+            ),
+            "dakuten_cost": float(
+                self._resolve_param("dakuten_cost", matcher_cfg, 0.35)
+            ),
+            "adjacent_pair": bool(
+                self._resolve_param("adjacent_pair", matcher_cfg, False)
+            ),
+            "pair_threshold": (
+                float(pair_threshold_raw)
+                if pair_threshold_raw is not None
+                else None
+            ),
+            "beam_width": int(
+                self._resolve_param("beam_width", matcher_cfg, 4)
+            ),
+            "beam_min_sim": beam_min_sim,
+            "beam_dakuten_score": float(
+                self._resolve_param("beam_dakuten_score", matcher_cfg, 1.2)
+            ),
+            "beam_forward_bonus": float(
+                self._resolve_param("beam_forward_bonus", matcher_cfg, 3.5)
+            ),
+            "beam_jump_penalty_per_char": float(
+                self._resolve_param(
+                    "beam_jump_penalty_per_char", matcher_cfg, 0.10
+                )
+            ),
+            "beam_jump_penalty_per_line": float(
+                self._resolve_param(
+                    "beam_jump_penalty_per_line", matcher_cfg, 2.0
+                )
+            ),
+            "beam_max_jump_penalty": float(
+                self._resolve_param("beam_max_jump_penalty", matcher_cfg, 8.0)
+            ),
+            "beam_recovery_penalty": float(
+                self._resolve_param("beam_recovery_penalty", matcher_cfg, 6.5)
+            ),
+            "beam_decay": float(
+                self._resolve_param("beam_decay", matcher_cfg, 0.78)
+            ),
+            "beam_back_slack": int(
+                self._resolve_param("beam_back_slack", matcher_cfg, 16)
+            ),
+            "beam_max_buffer_chars": int(
+                self._resolve_param("beam_max_buffer_chars", matcher_cfg, 32)
+            ),
+            "beam_buffer_stale_seconds": float(
+                self._resolve_param(
+                    "beam_buffer_stale_seconds", matcher_cfg, 6.5
+                )
+            ),
             "emit_events": False,
         }
         self._engine = LyricSyncEngine(**engine_kwargs)
@@ -241,6 +349,11 @@ class BaselineStrategy(ReplayStrategy):
                 elapsed_since_buffer_start=init_state.get(
                     "elapsed_since_buffer_start"
                 ),
+                beam_pos=init_state.get("beam_pos"),
+                elapsed_since_beam_buffer=init_state.get(
+                    "elapsed_since_beam_buffer"
+                ),
+                beam=init_state.get("beam"),
             )
 
     def step(
@@ -298,25 +411,78 @@ class RtReadingStrategy(BaselineStrategy):
         super().reset(updated_lyrics, updated_session, clock)
 
 
+_ISSUE3_LINE_OVERRIDES: dict[str, Any] = {
+    "retain_tail": True,
+    "short_line_guard": True,
+    "smart_duplicate_ttl": True,
+    "display_mode": "adaptive",
+    "alignment_mode": "line",
+    "phonological_norm": False,
+    "weighted_dakuten": False,
+    "adjacent_pair": False,
+}
+
+
 class SmartSyncStrategy(BaselineStrategy):
     """Preset enabling tail retention, short-line guard, smart duplicate TTL, and adaptive display."""
 
-    _DEFAULT_OVERRIDES = {
-        "retain_tail": True,
-        "short_line_guard": True,
-        "smart_duplicate_ttl": True,
-        "display_mode": "adaptive",
-    }
+    _DEFAULT_OVERRIDES = dict(_ISSUE3_LINE_OVERRIDES)
 
 
 class RtSmartSyncStrategy(RtReadingStrategy):
     """Preset combining UtaTen ``<rt>`` readings with all Issue #3 matcher improvements."""
 
+    _DEFAULT_OVERRIDES = dict(_ISSUE3_LINE_OVERRIDES)
+
+
+class PhonoSyncStrategy(RtReadingStrategy):
+    """Preset enabling Japanese singing phonological normalization on top of ``rt_smart_sync``."""
+
     _DEFAULT_OVERRIDES = {
-        "retain_tail": True,
-        "short_line_guard": True,
-        "smart_duplicate_ttl": True,
-        "display_mode": "adaptive",
+        **_ISSUE3_LINE_OVERRIDES,
+        "phonological_norm": True,
+    }
+
+
+class PhonoWeightedStrategy(RtReadingStrategy):
+    """Preset combining singing phonological normalization with weighted dakuten edit distance."""
+
+    _DEFAULT_OVERRIDES = {
+        **_ISSUE3_LINE_OVERRIDES,
+        "phonological_norm": True,
+        "weighted_dakuten": True,
+        "dakuten_cost": 0.35,
+    }
+
+
+class PairSyncStrategy(RtReadingStrategy):
+    """Preset enabling cross-line adjacent pair candidates on top of ``rt_smart_sync``."""
+
+    _DEFAULT_OVERRIDES = {
+        **_ISSUE3_LINE_OVERRIDES,
+        "adjacent_pair": True,
+    }
+
+
+class PhonoPairSyncStrategy(RtReadingStrategy):
+    """Preset combining phonological norm, weighted dakuten distance, and adjacent line pairs."""
+
+    _DEFAULT_OVERRIDES = {
+        **_ISSUE3_LINE_OVERRIDES,
+        "phonological_norm": True,
+        "weighted_dakuten": True,
+        "dakuten_cost": 0.35,
+        "adjacent_pair": True,
+    }
+
+
+class BeamAlignStrategy(RtReadingStrategy):
+    """Preset using continuous character timeline Smith-Waterman alignment and Top-K beam tracking."""
+
+    _DEFAULT_OVERRIDES = {
+        **_ISSUE3_LINE_OVERRIDES,
+        "alignment_mode": "beam",
+        "phonological_norm": True,
     }
 
 
@@ -325,6 +491,11 @@ STRATEGIES: dict[str, type[ReplayStrategy]] = {
     "rt_reading": RtReadingStrategy,
     "smart_sync": SmartSyncStrategy,
     "rt_smart_sync": RtSmartSyncStrategy,
+    "phono_sync": PhonoSyncStrategy,
+    "phono_weighted": PhonoWeightedStrategy,
+    "pair_sync": PairSyncStrategy,
+    "phono_pair_sync": PhonoPairSyncStrategy,
+    "beam_align": BeamAlignStrategy,
 }
 
 
@@ -999,8 +1170,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=[],
         help=(
             "Strategy spec to evaluate (repeatable), e.g. 'baseline', 'rt_reading', "
-            "'smart_sync', 'rt_smart_sync', or "
-            "'rt_smart_sync:threshold=0.70,retain_tail=true,display_mode=adaptive'. "
+            "'smart_sync', 'rt_smart_sync', 'phono_sync', 'phono_weighted', "
+            "'pair_sync', 'phono_pair_sync', 'beam_align', or "
+            "'beam_align:threshold=0.73,beam_width=4'. "
             "Defaults to 'baseline'."
         ),
     )
