@@ -12,7 +12,10 @@ if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
 from utaten_finder.lyrics.matching import LyricSyncEngine  # noqa: E402
-from utaten_finder.lyrics.parser import parse_utaten_lyrics  # noqa: E402
+from utaten_finder.lyrics.parser import (  # noqa: E402
+    extract_ruby_reading,
+    parse_utaten_lyrics,
+)
 from utaten_finder.lyrics.web_scraper import fetch_utaten_lyrics_html  # noqa: E402
 
 
@@ -174,6 +177,120 @@ class TestUtaTenParser(unittest.TestCase):
         assert match is not None
         self.assertEqual(match["matched_index"], 1)
         self.assertEqual(match["display_index"], 2)
+
+    def test_ateji_and_gikun_rt_readings_prioritized_over_pykakasi(self) -> None:
+        html = """
+        <div class="lyricBody">
+          <div class="hiragana">
+            <span class="ruby"><span class="rb">明日</span><span class="rt">あした</span></span>は<span class="ruby"><span class="rb">本気</span><span class="rt">マジ</span></span>だ<br/>
+            <span class="ruby"><span class="rb">宇宙</span><span class="rt">そら</span></span>の<span class="ruby"><span class="rb">運命</span><span class="rt">さだめ</span></span>と<span class="ruby"><span class="rb">私</span><span class="rt">あたし</span></span><br/>
+            <span class="ruby"><span class="rb">氷菓</span><span class="rt">アイス</span></span>の<span class="ruby"><span class="rb">行方</span><span class="rt">ゆくえ</span></span>は<span class="ruby"><span class="rb">如何</span><span class="rt">どう</span></span>か<br/>
+            <span class="ruby"><span class="rb">明後日</span><span class="rt">あさって</span></span>にしよう<br/>
+          </div>
+        </div>
+        """
+        lines = parse_utaten_lyrics(html)["lines"]
+        self.assertEqual(len(lines), 4)
+
+        self.assertEqual(lines[0]["original"], "明日は本気だ")
+        self.assertEqual(lines[0]["reading"], "あしたはまじだ")
+        self.assertEqual(lines[0]["normalized"], "あしたはまじだ")
+        self.assertEqual(
+            lines[0]["ruby_html"],
+            "<ruby>明日<rt>あした</rt></ruby>は<ruby>本気<rt>マジ</rt></ruby>だ",
+        )
+
+        self.assertEqual(lines[1]["original"], "宇宙の運命と私")
+        self.assertEqual(lines[1]["reading"], "そらのさだめとあたし")
+        self.assertEqual(lines[1]["normalized"], "そらのさだめとあたし")
+
+        self.assertEqual(lines[2]["original"], "氷菓の行方は如何か")
+        self.assertEqual(lines[2]["reading"], "あいすのゆくえはどうか")
+        self.assertEqual(lines[2]["normalized"], "あいすのゆくえはどうか")
+        self.assertIn("<rt>アイス</rt>", lines[2]["ruby_html"])
+
+        self.assertEqual(lines[3]["original"], "明後日にしよう")
+        self.assertEqual(lines[3]["reading"], "あさってにしよう")
+        self.assertEqual(lines[3]["normalized"], "あさってにしよう")
+
+    def test_rt_reading_fallbacks_and_edge_cases(self) -> None:
+        html = """
+        <div class="lyricBody">
+          <div class="hiragana">
+            <span class="ruby"><span class="rb">今日</span><span class="rt">きょう</span></span>の<span>手</span><span>紙</span><br/>
+            <ruby>本気<rp>(</rp><rt>マジ</rt><rp>)</rp>で</ruby><ruby>宇宙<rt>そら</rt></ruby>へ<br/>
+            <span class="ruby"><span class="rb">手</span><span class="rt">   </span></span>紙と<span class="ruby"><span class="rb">運命</span><span class="rt">・・・</span></span><br/>
+            <span class="ruby"><span class="rb">氷菓</span><span class="rt">ｱｲｽ</span></span>とﾊﾟﾋﾟﾌﾟﾍﾟﾎﾟ<br/>
+            <span class="ruby"><span class="rb">愛</span><span class="rt">LOVE</span></span>を歌う<br/>
+          </div>
+        </div>
+        """
+        lines = parse_utaten_lyrics(html)["lines"]
+        self.assertEqual(len(lines), 5)
+
+        # Consecutive non-<rt> tokens are coalesced before pykakasi conversion (手 + 紙 -> てがみ).
+        self.assertEqual(lines[0]["original"], "今日の手紙")
+        self.assertEqual(lines[0]["reading"], "きょうのてがみ")
+        self.assertEqual(lines[0]["normalized"], "きょうのてがみ")
+
+        # Native <ruby> with <rp> and trailing okurigana.
+        self.assertEqual(lines[1]["original"], "本気で宇宙へ")
+        self.assertEqual(lines[1]["reading"], "まじでそらへ")
+        self.assertEqual(lines[1]["normalized"], "まじでそらへ")
+
+        # Empty/whitespace <rt> and emphasis-dot-only <rt> fall back to base text.
+        self.assertEqual(lines[2]["original"], "手紙と運命")
+        self.assertEqual(lines[2]["reading"], "てがみとうんめい")
+        self.assertEqual(lines[2]["normalized"], "てがみとうんめい")
+        self.assertIn("<rt>・・・</rt>", lines[2]["ruby_html"])
+
+        # Half-width katakana in both <rt> and plain text converts cleanly to hiragana.
+        self.assertEqual(lines[3]["reading"], "あいすとぱぴぷぺぽ")
+        self.assertEqual(lines[3]["normalized"], "あいすとぱぴぷぺぽ")
+
+        # English <rt> preserves case in reading and lowercases in normalized.
+        self.assertEqual(lines[4]["original"], "愛を歌う")
+        self.assertEqual(lines[4]["reading"], "LOVEをうたう")
+        self.assertEqual(lines[4]["normalized"], "loveをうたう")
+
+    def test_extract_ruby_reading_matches_parse_utaten_lyrics(self) -> None:
+        html = """
+        <div class="lyricBody">
+          <div class="hiragana">
+            <span class="ruby"><span class="rb">本気</span><span class="rt">マジ</span></span>で<span class="ruby"><span class="rb">氷菓</span><span class="rt">アイス</span></span><br/>
+            <ruby><rb>東京</rb><rp>(</rp><rt>とうきょう</rt><rp>)</rp></ruby>へ<ruby>行<rt>い</rt>く</ruby><br/>
+            <span>Love &amp; Peace &lt;3</span><br/>
+            ひらがなだけ<br/>
+          </div>
+        </div>
+        """
+        lines = parse_utaten_lyrics(html)["lines"]
+        self.assertEqual(len(lines), 4)
+        for line in lines:
+            reading, normalized = extract_ruby_reading(line["ruby_html"])
+            self.assertEqual((reading, normalized), (line["reading"], line["normalized"]))
+
+        self.assertEqual(extract_ruby_reading(""), ("", ""))
+        self.assertEqual(extract_ruby_reading("   "), ("", ""))
+
+    def test_sync_engine_matches_ateji_using_rt_reading(self) -> None:
+        html = """
+        <div class="lyricBody">
+          <div class="hiragana">
+            <span class="ruby"><span class="rb">本気</span><span class="rt">マジ</span></span>で<span class="ruby"><span class="rb">宇宙</span><span class="rt">そら</span></span>を<span class="ruby"><span class="rb">飛</span><span class="rt">と</span></span>ぶ<br/>
+          </div>
+        </div>
+        """
+        parsed = parse_utaten_lyrics(html)
+        engine = LyricSyncEngine(emit_events=False)
+        engine.reset_with_lyrics(parsed["lines"])
+
+        match = engine.process_recognized_text("マジでそらをとぶ")
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match["matched_index"], 0)
+        self.assertAlmostEqual(match["score"], 1.0, places=4)
+        self.assertEqual(match["target_normalized"], "まじでそらをとぶ")
 
 
 class TestFetchUtaTenHtml(unittest.TestCase):

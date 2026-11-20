@@ -20,6 +20,7 @@ if _SRC_DIR not in sys.path:
 
 from utaten_finder.core import config  # noqa: E402
 from utaten_finder.lyrics.matching import LyricSyncEngine  # noqa: E402
+from utaten_finder.lyrics.parser import extract_ruby_reading  # noqa: E402
 from utaten_finder.lyrics.trace import load_trace  # noqa: E402
 
 _BASELINE_PARAM_CASTERS: dict[str, tuple[str, Any]] = {
@@ -198,8 +199,49 @@ class BaselineStrategy(ReplayStrategy):
         return self._engine.apply_manual_jump(line_index)
 
 
+class RtReadingStrategy(BaselineStrategy):
+    """Recompute line ``normalized`` targets using UtaTen ``<rt>`` furigana readings."""
+
+    def reset(
+        self,
+        lyrics: list[dict[str, Any]],
+        session_start: dict[str, Any],
+        clock: VirtualClock,
+    ) -> None:
+        updated_lyrics: list[dict[str, Any]] = []
+        for line in lyrics:
+            line_copy = dict(line)
+            ruby_html = str(line_copy.get("ruby_html") or "")
+            if ruby_html:
+                reading, norm = extract_ruby_reading(ruby_html)
+                if norm:
+                    line_copy["reading"] = reading
+                    line_copy["normalized"] = norm
+            updated_lyrics.append(line_copy)
+
+        updated_session = session_start
+        init_state = session_start.get("initial_state")
+        if isinstance(init_state, dict):
+            try:
+                cur_idx = int(init_state.get("current_index", -1))
+            except (TypeError, ValueError):
+                cur_idx = -1
+            last_norm = str(init_state.get("last_success_normalized") or "")
+            if 0 <= cur_idx < len(lyrics) and last_norm:
+                old_norm = str(lyrics[cur_idx].get("normalized") or "")
+                new_norm = str(updated_lyrics[cur_idx].get("normalized") or "")
+                if last_norm == old_norm and new_norm and new_norm != old_norm:
+                    init_copy = dict(init_state)
+                    init_copy["last_success_normalized"] = new_norm
+                    updated_session = dict(session_start)
+                    updated_session["initial_state"] = init_copy
+
+        super().reset(updated_lyrics, updated_session, clock)
+
+
 STRATEGIES: dict[str, type[ReplayStrategy]] = {
     "baseline": BaselineStrategy,
+    "rt_reading": RtReadingStrategy,
 }
 
 
@@ -850,7 +892,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="strategies",
         default=[],
         help=(
-            "Strategy spec to evaluate (repeatable), e.g. 'baseline' or "
+            "Strategy spec to evaluate (repeatable), e.g. 'baseline', 'rt_reading', or "
             "'baseline:threshold=0.70,recovery=0.55,lookahead=5'. Defaults to 'baseline'."
         ),
     )

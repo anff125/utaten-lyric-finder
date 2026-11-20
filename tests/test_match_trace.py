@@ -28,6 +28,7 @@ from utaten_finder.lyrics.matching import (  # noqa: E402
 from utaten_finder.lyrics.trace import (  # noqa: E402
     TRACE_SCHEMA_VERSION,
     MatchTraceRecorder,
+    _snapshot_lyrics_for_trace,
     load_trace,
     sanitize_trace_slug,
 )
@@ -168,6 +169,27 @@ class TestMatchTraceRecorder(unittest.TestCase):
             bad_path.write_text(json.dumps({"type": "asr_step"}) + "\n", encoding="utf-8")
             with self.assertRaises(ValueError):
                 load_trace(bad_path)
+
+    def test_snapshot_lyrics_preserves_optional_reading(self) -> None:
+        snap = _snapshot_lyrics_for_trace(
+            [
+                {
+                    "index": 0,
+                    "original": "本気",
+                    "normalized": "まじ",
+                    "ruby_html": "<ruby>本気<rt>マジ</rt></ruby>",
+                    "reading": "まじ",
+                },
+                {
+                    "index": 1,
+                    "original": "宇宙",
+                    "normalized": "そら",
+                    "ruby_html": "<ruby>宇宙<rt>そら</rt></ruby>",
+                },
+            ]
+        )
+        self.assertEqual(snap[0]["reading"], "まじ")
+        self.assertNotIn("reading", snap[1])
 
     def test_prune_old_traces_keeps_active_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -616,6 +638,108 @@ class TestEvalMatchingReplay(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertIn("EvalSong", out_buf.getvalue())
             self.assertIn("略過損毀或無法讀取的 Trace 檔案", err_buf.getvalue())
+
+    def test_rt_reading_strategy_matches_ateji_and_remaps_lazy_state(self) -> None:
+        legacy_lyrics = [
+            {
+                "index": 0,
+                "original": "本気で宇宙を飛ぶ",
+                "normalized": "ほんきでうちゅうをとぶ",
+                "ruby_html": "<ruby>本気<rt>マジ</rt></ruby>で<ruby>宇宙<rt>そら</rt></ruby>を<ruby>飛<rt>と</rt></ruby>ぶ",
+                "stanza_break": False,
+            },
+            {
+                "index": 1,
+                "original": "運命の氷菓",
+                "normalized": "うんめいのひょうか",
+                "ruby_html": "<ruby>運命<rt>さだめ</rt></ruby>の<ruby>氷菓<rt>アイス</rt></ruby>",
+                "stanza_break": False,
+            },
+        ]
+
+        trace_fresh = {
+            "path": "synthetic_ateji.jsonl",
+            "session_start": {
+                "type": "session_start",
+                "schema_version": TRACE_SCHEMA_VERSION,
+                "track": {"song_name": "AtejiSong", "artist_name": "Tester"},
+                "asr_config": {"block_seconds": 3.0, "step_seconds": 1.5},
+                "matcher_config": {},
+                "initial_state": {"lazy_opened": False, "current_index": -1},
+                "lyrics": legacy_lyrics,
+            },
+            "events": [
+                {
+                    "type": "asr_step",
+                    "seq": 1,
+                    "elapsed_sec": 2.0,
+                    "asr": {"text": "マジでそらをとぶ"},
+                    "playback": {},
+                    "decision": "no_match",
+                    "matched_index": None,
+                },
+                {
+                    "type": "asr_step",
+                    "seq": 2,
+                    "elapsed_sec": 6.0,
+                    "asr": {"text": "さだめのあいす"},
+                    "playback": {},
+                    "decision": "no_match",
+                    "matched_index": None,
+                },
+            ],
+        }
+
+        base_run = eval_matching.replay_trace(
+            trace_fresh,
+            eval_matching.parse_strategy_spec("baseline"),
+            anchor_mode="eval",
+        )
+        rt_run = eval_matching.replay_trace(
+            trace_fresh,
+            eval_matching.parse_strategy_spec("rt_reading:threshold=0.75"),
+            anchor_mode="eval",
+        )
+        self.assertEqual(base_run["summary"]["total_matches"], 0)
+        self.assertEqual(rt_run["summary"]["total_matches"], 2)
+        self.assertEqual(rt_run["summary"]["unique_lines_matched"], 2)
+
+        trace_lazy = {
+            "path": "synthetic_lazy_ateji.jsonl",
+            "session_start": {
+                "type": "session_start",
+                "schema_version": TRACE_SCHEMA_VERSION,
+                "track": {"song_name": "AtejiLazySong", "artist_name": "Tester"},
+                "asr_config": {"block_seconds": 3.0, "step_seconds": 1.5},
+                "matcher_config": {},
+                "initial_state": {
+                    "lazy_opened": True,
+                    "current_index": 0,
+                    "buffer": "",
+                    "last_success_normalized": "ほんきでうちゅうをとぶ",
+                    "elapsed_since_last_success": 0.5,
+                    "elapsed_since_buffer_start": None,
+                },
+                "lyrics": legacy_lyrics,
+            },
+            "events": [
+                {
+                    "type": "asr_step",
+                    "seq": 1,
+                    "elapsed_sec": 1.0,
+                    "asr": {"text": "マジでそらをとぶ"},
+                    "playback": {},
+                    "decision": "no_match",
+                    "matched_index": None,
+                },
+            ],
+        }
+        lazy_rt = eval_matching.replay_trace(
+            trace_lazy,
+            eval_matching.parse_strategy_spec("rt_reading"),
+            anchor_mode="eval",
+        )
+        self.assertEqual(lazy_rt["timeline"][0]["decision"], "skipped_duplicate_ttl")
 
 
 if __name__ == "__main__":

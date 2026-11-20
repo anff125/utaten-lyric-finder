@@ -123,6 +123,9 @@ Enable **Record match trace (`data/traces/*.jsonl`)** in **⚙️ Settings** whi
 
 # Compare multiple strategies or thresholds on recorded traces
 .\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy baseline:threshold=0.70,recovery=0.55 --diff
+
+# Compare baseline pykakasi normalization vs UtaTen <rt> furigana readings
+.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy rt_reading --diff
 ```
 
 ### Build your own portable release package
@@ -150,7 +153,7 @@ After completion, the portable folder and ZIP file will be generated under `buil
 - **Enhanced Japanese ASR & Sliding-Window Matching**:
   - Supports `kotoba-whisper-v2.0-faster` and `turbo` with polyphase resampling (`scipy.signal.resample_poly`) and sliding-window capture (`asr_worker.py`).
   - Two-phase lyric matching (local lookahead + lost-position recovery) with Japanese hiragana normalization (`matching.py`) and click-to-jump sync.
-- **Browserless UtaTen Scraper & Sanitized `<ruby>` Parser**: Fetches and parses UtaTen lyrics directly in Python (`web_scraper.py`, `parser.py`) and caches matches in `song_cache.py`.
+- **Browserless UtaTen Scraper & Sanitized `<ruby>` Parser**: Fetches and parses UtaTen lyrics directly in Python (`web_scraper.py`, `parser.py`), prioritizing `<rt>` furigana readings (including ateji/gikun) when building normalized sync targets, and caches matches in `song_cache.py`.
 
 ## 📁 Project Structure
 
