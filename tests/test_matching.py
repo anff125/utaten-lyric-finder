@@ -527,6 +527,8 @@ class TestSingingPhonologyAndWeightedDistance(unittest.TestCase):
             collapse_japanese_long_vowels("せいしゅん", include_ei=True),
             "せしゅん",
         )
+        # Standalone を symmetry in o-column long vowel collapsing
+        self.assertEqual(collapse_japanese_long_vowels("をうおを"), "を")
 
     def test_weighted_indel_calibration_and_dakuten_tolerance(self) -> None:
         pairs = [
@@ -881,12 +883,52 @@ class TestContinuousBeamAlignment(unittest.TestCase):
             self.assertEqual(spec.name, preset)
 
         spec_custom = eval_matching.parse_strategy_spec(
-            "beam_align:align_mode=beam,phono=true,beam_width=5,beam_min_sim=0.75"
+            "beam_align:align_mode=beam,phono=true,beam_width=5,beam_min_sim=0.75,"
+            "beam_line_pen=1.5,beam_max_jump_pen=7.0,beam_rec_pen=5.5,"
+            "beam_decay=0.8,beam_back_slack=12,beam_buf_chars=40,beam_stale_sec=5.0"
         )
         self.assertEqual(spec_custom.params["alignment_mode"], "beam")
         self.assertTrue(spec_custom.params["phonological_norm"])
         self.assertEqual(spec_custom.params["beam_width"], 5)
         self.assertEqual(spec_custom.params["beam_min_sim"], 0.75)
+        self.assertEqual(spec_custom.params["beam_jump_penalty_per_line"], 1.5)
+        self.assertEqual(spec_custom.params["beam_max_jump_penalty"], 7.0)
+        self.assertEqual(spec_custom.params["beam_recovery_penalty"], 5.5)
+        self.assertEqual(spec_custom.params["beam_decay"], 0.8)
+        self.assertEqual(spec_custom.params["beam_back_slack"], 12)
+        self.assertEqual(spec_custom.params["beam_max_buffer_chars"], 40)
+        self.assertEqual(spec_custom.params["beam_buffer_stale_seconds"], 5.0)
+
+    def test_beam_partial_next_line_clamp_rewinds_beam_and_advances_sequentially(
+        self,
+    ) -> None:
+        lyrics = [
+            _line(0, "あいうえおかきくけこ"),
+            _line(1, "さしすせそたちつてとなにぬねの"),
+            _line(2, "まみむめもやゆよらりるれろ"),
+        ]
+        clock = _FakeClock(0.0)
+        eng = LyricSyncEngine(clock=clock, emit_events=False)
+        eng.reset_with_lyrics(lyrics)
+
+        # Match L0 + 4 chars of L1 (4/15 = 0.267 < 0.35): must clamp to L0,
+        # retain the 4-char spill, and rewind _beam[0] back to L0 end (pos=10, line=0).
+        clock.now = 2.0
+        m0, t0 = eng.evaluate_recognized_text("あいうえおかきくけこさしすせ")
+        self.assertIsNotNone(m0)
+        assert m0 is not None
+        self.assertEqual(m0["matched_index"], 0)
+        self.assertEqual(t0["retained_tail"], "さしすせ")
+        self.assertEqual(eng._beam[0].pos, len("あいうえおかきくけこ"))
+        self.assertEqual(eng._beam[0].last_line, 0)
+
+        # Next ASR step brings only 2 more chars of L1 ("そた"): combined with retained spill
+        # ("さしすせそた"), beam cleanly advances +1 to L1.
+        clock.now = 4.0
+        m1 = eng.process_recognized_text("そた")
+        self.assertIsNotNone(m1)
+        assert m1 is not None
+        self.assertEqual(m1["matched_index"], 1)
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ def collapse_japanese_long_vowels(text: str, *, include_ei: bool = False) -> str
             continue
         if ch == "え" and prev in _E_COL:
             continue
-        if ch == "お" and prev in _O_COL:
+        if ch in ("お", "を") and prev in _O_COL:
             continue
         out.append(ch)
     return "".join(out)

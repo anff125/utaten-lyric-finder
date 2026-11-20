@@ -1842,6 +1842,12 @@ class LyricSyncEngine:
                     spill = g_e - line_starts[eff_end_line]
                     src_consume = max(qs, qe - spill)
                     win_ge = line_ends[start_line]
+                    self._beam[0] = _BeamHypothesis(
+                        pos=win_ge,
+                        score=nh.score,
+                        last_adv_time=now,
+                        last_line=emit_line,
+                    )
                 else:
                     emit_line = eff_end_line
                     src_consume = qe

@@ -79,6 +79,13 @@ _BASELINE_PARAM_CASTERS: dict[str, tuple[str, Any]] = {
     "beam_dakuten": ("beam_dakuten_score", float),
     "beam_forward": ("beam_forward_bonus", float),
     "beam_jump_pen": ("beam_jump_penalty_per_char", float),
+    "beam_line_pen": ("beam_jump_penalty_per_line", float),
+    "beam_max_jump_pen": ("beam_max_jump_penalty", float),
+    "beam_rec_pen": ("beam_recovery_penalty", float),
+    "beam_decay": ("beam_decay", float),
+    "beam_back_slack": ("beam_back_slack", int),
+    "beam_buf_chars": ("beam_max_buffer_chars", int),
+    "beam_stale_sec": ("beam_buffer_stale_seconds", float),
 }
 
 
