@@ -8,7 +8,7 @@ import jaconv
 import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
-from thefuzz import fuzz
+from rapidfuzz import fuzz
 
 try:
     from pykakasi import kakasi

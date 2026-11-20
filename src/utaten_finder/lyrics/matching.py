@@ -5,7 +5,7 @@ import threading
 import time
 from typing import Any, Callable
 
-from thefuzz import fuzz
+from rapidfuzz import fuzz
 
 from utaten_finder.core import config, events
 from utaten_finder.lyrics.trace import MatchTraceRecorder
@@ -86,7 +86,7 @@ def merge_overlapped_text(existing_text, new_text, min_overlap=2, threshold=0.8)
 
 def score_similarity_detailed(
     na: str, nb: str, min_coverage_ratio: float = 0.4
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """Return detailed similarity breakdown matching calculate_similarity_normalized."""
     if not na or not nb:
         return {
@@ -95,12 +95,29 @@ def score_similarity_detailed(
             "partial_score": 0.0,
             "ratio_score": 0.0,
             "final_score": 0.0,
+            "src_start": 0,
+            "src_end": 0,
+            "dest_start": 0,
+            "dest_end": 0,
         }
 
     coverage = _length_coverage_ratio(na, nb)
 
-    # 1. partial_ratio: 解決 Whisper 只聽到一半的問題
-    raw_partial_score = fuzz.partial_ratio(na, nb) / 100.0
+    # 1. partial_ratio: 解決 Whisper 只聽到一半的問題，並以 alignment 定位已匹配片段
+    alignment = fuzz.partial_ratio_alignment(na, nb)
+    if alignment is not None:
+        raw_partial_score = alignment.score / 100.0
+        src_start = int(alignment.src_start)
+        src_end = int(alignment.src_end)
+        dest_start = int(alignment.dest_start)
+        dest_end = int(alignment.dest_end)
+    else:
+        raw_partial_score = 0.0
+        src_start = 0
+        src_end = 0
+        dest_start = 0
+        dest_end = 0
+
     partial_score = raw_partial_score
     if coverage < min_coverage_ratio:
         partial_score *= coverage / min_coverage_ratio
@@ -115,6 +132,10 @@ def score_similarity_detailed(
         "partial_score": partial_score,
         "ratio_score": ratio_score,
         "final_score": final_score,
+        "src_start": src_start,
+        "src_end": src_end,
+        "dest_start": dest_start,
+        "dest_end": dest_end,
     }
 
 
@@ -140,6 +161,14 @@ class LyricsAgent:
 
     def reset(self):
         self.asr_buffer = ""
+
+    def consume_prefix(self, end_index: int) -> str:
+        """Drop consumed prefix up to ``end_index`` and keep any unconsumed tail."""
+        if end_index <= 0 or end_index >= len(self.asr_buffer):
+            self.asr_buffer = ""
+            return ""
+        self.asr_buffer = self.asr_buffer[end_index:]
+        return self.asr_buffer
 
     def append(self, normalized_text):
         if normalized_text:
@@ -178,6 +207,9 @@ class LyricsAgent:
         return calculate_ratio_similarity_normalized(self.asr_buffer, target_normalized)
 
 
+_VALID_DISPLAY_MODES = frozenset({"adaptive", "next", "current"})
+
+
 class LyricSyncEngine:
     """Thread-safe two-phase lyric line synchronization state machine."""
 
@@ -194,8 +226,18 @@ class LyricSyncEngine:
         duplicate_ttl: float | None = None,
         min_coverage_ratio: float = 0.4,
         max_buffer_ratio: float = 1.8,
+        retain_tail: bool = True,
+        short_line_guard: bool = True,
+        short_line_max_len: int = 4,
+        smart_duplicate_ttl: bool = True,
+        display_mode: str = "adaptive",
+        early_display_progress_threshold: float = 0.75,
         emit_events: bool = True,
     ) -> None:
+        if display_mode not in _VALID_DISPLAY_MODES:
+            raise ValueError(
+                f"display_mode 必須為 {sorted(_VALID_DISPLAY_MODES)} 之一，收到: {display_mode!r}"
+            )
         self._lock = threading.Lock()
         self._lyrics: list[dict[str, Any]] = []
         self._current_index = -1
@@ -206,6 +248,7 @@ class LyricSyncEngine:
             max_buffer_ratio=max_buffer_ratio,
         )
         self._last_success_normalized = ""
+        self._last_success_recognized = ""
         self._last_success_at: float | None = None
         self._buffer_start_at: float | None = None
         self._lookahead_seconds_per_line = lookahead_seconds_per_line
@@ -216,6 +259,14 @@ class LyricSyncEngine:
         self._recovery_lookahead_lines = recovery_lookahead_lines
         self._recovery_threshold = recovery_threshold
         self._duplicate_ttl = duplicate_ttl
+        self._retain_tail = bool(retain_tail)
+        self._short_line_guard = bool(short_line_guard)
+        self._short_line_max_len = int(short_line_max_len)
+        self._smart_duplicate_ttl = bool(smart_duplicate_ttl)
+        self._display_mode = display_mode
+        self._early_display_progress_threshold = float(
+            early_display_progress_threshold
+        )
         self._emit_events = bool(emit_events)
 
         self._playback_song_id: str | None = None
@@ -260,6 +311,12 @@ class LyricSyncEngine:
             "min_coverage_ratio": self._agent.min_coverage_ratio,
             "max_buffer_ratio": self._agent.max_buffer_ratio,
             "duplicate_ttl": self._effective_duplicate_ttl(),
+            "retain_tail": self._retain_tail,
+            "short_line_guard": self._short_line_guard,
+            "short_line_max_len": self._short_line_max_len,
+            "smart_duplicate_ttl": self._smart_duplicate_ttl,
+            "display_mode": self._display_mode,
+            "early_display_progress_threshold": self._early_display_progress_threshold,
         }
 
     def update_playback_progress(
@@ -325,6 +382,7 @@ class LyricSyncEngine:
             "current_index": self._current_index,
             "buffer": self._agent.asr_buffer,
             "last_success_normalized": self._last_success_normalized,
+            "last_success_recognized": self._last_success_recognized,
             "elapsed_since_last_success": elapsed_last,
             "elapsed_since_buffer_start": elapsed_buf,
         }
@@ -335,6 +393,7 @@ class LyricSyncEngine:
         current_index: int = -1,
         buffer: str = "",
         last_success_normalized: str = "",
+        last_success_recognized: str = "",
         elapsed_since_last_success: float | None = None,
         elapsed_since_buffer_start: float | None = None,
     ) -> None:
@@ -349,6 +408,7 @@ class LyricSyncEngine:
             self._current_index = idx
             self._agent.asr_buffer = str(buffer or "")
             self._last_success_normalized = str(last_success_normalized or "")
+            self._last_success_recognized = str(last_success_recognized or "")
             self._last_success_at = (
                 now - float(elapsed_since_last_success)
                 if elapsed_since_last_success is not None
@@ -387,6 +447,7 @@ class LyricSyncEngine:
             self._pending_highlight_index = -1
             self._agent.reset()
             self._last_success_normalized = ""
+            self._last_success_recognized = ""
             self._last_success_at = None
             self._buffer_start_at = None
 
@@ -457,6 +518,7 @@ class LyricSyncEngine:
             self._pending_highlight_index = lyric_index
             self._agent.reset()
             self._last_success_normalized = ""
+            self._last_success_recognized = ""
             self._last_success_at = None
             self._buffer_start_at = None
 
@@ -539,8 +601,110 @@ class LyricSyncEngine:
             "best_score": None,
             "threshold": None,
             "is_recovery": False,
+            "retained_tail": "",
+            "early_display_hold": False,
+            "alignment": None,
             "current_index_after": current_index,
         }
+
+    def _effective_phase1_threshold(
+        self,
+        target_normalized: str,
+        base_threshold: float,
+        buffer_text: str,
+        details: dict[str, Any],
+        *,
+        is_immediate_next: bool,
+    ) -> tuple[float, bool]:
+        if (
+            not self._short_line_guard
+            or len(target_normalized) > self._short_line_max_len
+        ):
+            return base_threshold, True
+
+        if len(target_normalized) <= 2:
+            return max(base_threshold, 0.99), float(details["ratio_score"]) >= 0.50
+
+        effective = max(base_threshold, 0.90)
+        if (
+            not is_immediate_next
+            and (len(buffer_text) - int(details["src_end"]) > 2)
+            and float(details["ratio_score"]) < 0.60
+        ):
+            return effective, False
+        return effective, True
+
+    def _is_duplicate_locked(
+        self,
+        now: float,
+        normalized_recognized: str,
+        start_index: int,
+        duplicate_ttl: float,
+    ) -> bool:
+        if not self._last_success_normalized or self._last_success_at is None:
+            return False
+
+        elapsed = now - self._last_success_at
+        if not self._smart_duplicate_ttl:
+            return (
+                elapsed <= duplicate_ttl
+                and normalized_recognized in self._last_success_normalized
+            )
+
+        next_norm = (
+            self._lyrics[start_index]["normalized"]
+            if start_index < len(self._lyrics)
+            else ""
+        )
+        next_is_repeat = bool(next_norm) and (
+            next_norm == self._last_success_normalized
+            or (
+                len(next_norm) >= 3
+                and (
+                    next_norm in self._last_success_normalized
+                    or self._last_success_normalized in next_norm
+                )
+            )
+            or (fuzz.ratio(next_norm, self._last_success_normalized) / 100.0 >= 0.85)
+        )
+        effective_ttl = (
+            min(duplicate_ttl * 0.4, 1.5) if next_is_repeat else duplicate_ttl
+        )
+        if elapsed > effective_ttl:
+            return False
+
+        if normalized_recognized in self._last_success_normalized:
+            return True
+
+        if self._last_success_recognized and (
+            normalized_recognized == self._last_success_recognized
+            or (
+                len(normalized_recognized) >= 4
+                and normalized_recognized in self._last_success_recognized
+            )
+        ):
+            return True
+
+        if (
+            not next_is_repeat
+            and 5 <= len(normalized_recognized) <= len(self._last_success_normalized)
+        ):
+            sim_last = (
+                fuzz.partial_ratio(
+                    normalized_recognized, self._last_success_normalized
+                )
+                / 100.0
+            )
+            if sim_last >= 0.85:
+                sim_next = (
+                    fuzz.partial_ratio(normalized_recognized, next_norm) / 100.0
+                    if next_norm
+                    else 0.0
+                )
+                if sim_last > sim_next:
+                    return True
+
+        return False
 
     def _evaluate_locked(
         self,
@@ -573,14 +737,13 @@ class LyricSyncEngine:
         if not self._lyrics:
             return _empty_result("ignored_no_lyrics")
 
-        duplicate_ttl = self._effective_duplicate_ttl()
-        if self._last_success_normalized and self._last_success_at is not None:
-            within_ttl = now - self._last_success_at <= duplicate_ttl
-            is_duplicate = normalized_recognized in self._last_success_normalized
-            if within_ttl and is_duplicate:
-                return _empty_result("skipped_duplicate_ttl")
-
         start_index = self._current_index + 1
+        duplicate_ttl = self._effective_duplicate_ttl()
+        if self._is_duplicate_locked(
+            now, normalized_recognized, start_index, duplicate_ttl
+        ):
+            return _empty_result("skipped_duplicate_ttl")
+
         if start_index >= len(self._lyrics):
             return _empty_result("end_of_lyrics")
 
@@ -614,13 +777,28 @@ class LyricSyncEngine:
         )
         best_index: int | None = None
         best_score = 0.0
+        best_details: dict[str, Any] | None = None
+        best_threshold = phase1_threshold
+
+        best_passed_index: int | None = None
+        best_passed_score = 0.0
+        best_passed_details: dict[str, Any] | None = None
+        best_passed_threshold = phase1_threshold
+
         candidates: list[dict[str, Any]] = []
 
         for idx in range(start_index, end_index_phase1 + 1):
             target_normalized = self._lyrics[idx]["normalized"]
+            details = self._agent.score_detailed(target_normalized)
+            score = float(details["final_score"])
+            eff_threshold, allowed = self._effective_phase1_threshold(
+                target_normalized,
+                phase1_threshold,
+                buffer_after_trim,
+                details,
+                is_immediate_next=(idx == start_index),
+            )
             if build_trace:
-                details = self._agent.score_detailed(target_normalized)
-                score = details["final_score"]
                 candidates.append(
                     {
                         "index": idx,
@@ -633,19 +811,35 @@ class LyricSyncEngine:
                         "partial_score": round(details["partial_score"], 4),
                         "ratio_score": round(details["ratio_score"], 4),
                         "score": round(score, 4),
+                        "effective_threshold": round(eff_threshold, 4),
+                        "allowed": allowed,
+                        "src_end": int(details["src_end"]),
+                        "dest_end": int(details["dest_end"]),
                     }
                 )
-            else:
-                score = self._agent.score(target_normalized)
-            if score > best_score:
-                best_score = score
-                best_index = idx
+            if allowed:
+                if score > best_score:
+                    best_score = score
+                    best_index = idx
+                    best_details = details
+                    best_threshold = eff_threshold
+                if score >= eff_threshold and score > best_passed_score:
+                    best_passed_score = score
+                    best_passed_index = idx
+                    best_passed_details = details
+                    best_passed_threshold = eff_threshold
+
+        if best_passed_index is not None:
+            best_index = best_passed_index
+            best_score = best_passed_score
+            best_details = best_passed_details
+            best_threshold = best_passed_threshold
 
         # 階段二：迷失恢復機制 (階段一達到上限後才啟用)
         is_recovery = False
         phase2_range: list[int] | None = None
         if (
-            best_score < phase1_threshold
+            best_passed_index is None
             and phase1_lookahead_lines >= max_lookahead
         ):
             start_index_phase2 = end_index_phase1 + 1
@@ -659,6 +853,17 @@ class LyricSyncEngine:
                 for idx in range(start_index_phase2, end_index_phase2 + 1):
                     target_normalized = self._lyrics[idx]["normalized"]
                     score = self._agent.ratio_score(target_normalized)
+                    req_threshold = (
+                        max(
+                            recovery_threshold,
+                            0.99 if len(target_normalized) <= 2 else 0.90,
+                        )
+                        if (
+                            self._short_line_guard
+                            and len(target_normalized) <= self._short_line_max_len
+                        )
+                        else recovery_threshold
+                    )
                     if build_trace:
                         candidates.append(
                             {
@@ -667,15 +872,18 @@ class LyricSyncEngine:
                                 "target_normalized": target_normalized,
                                 "ratio_score": round(score, 4),
                                 "score": round(score, 4),
+                                "effective_threshold": round(req_threshold, 4),
                             }
                         )
-                    if score > best_score and score >= recovery_threshold:
+                    if score > best_score and score >= req_threshold:
                         best_score = score
                         best_index = idx
+                        best_threshold = req_threshold
+                        best_details = None
                         is_recovery = True
 
         threshold_to_pass = (
-            recovery_threshold if is_recovery else phase1_threshold
+            best_threshold if best_index is not None else phase1_threshold
         )
 
         step_trace: dict[str, Any] = {}
@@ -712,7 +920,38 @@ class LyricSyncEngine:
         target_normalized = self._lyrics[best_index]["normalized"]
         buffer_length = len(buffer_after_trim)
 
-        next_display_index = min(best_index + 1, len(self._lyrics) - 1)
+        if self._retain_tail and not is_recovery and best_details is not None:
+            retained_tail = self._agent.consume_prefix(
+                int(best_details["src_end"])
+            )
+        else:
+            self._agent.reset()
+            retained_tail = ""
+
+        dest_progress = (
+            min(1.0, int(best_details["dest_end"]) / len(target_normalized))
+            if (best_details is not None and target_normalized)
+            else 1.0
+        )
+        ratio_for_display = (
+            float(best_details["ratio_score"])
+            if best_details is not None
+            else best_score
+        )
+        is_early_prefix_match = (
+            not is_recovery
+            and not retained_tail
+            and dest_progress < self._early_display_progress_threshold
+            and ratio_for_display < phase1_threshold
+        )
+        early_display_hold = bool(
+            self._display_mode == "adaptive" and is_early_prefix_match
+        )
+        if self._display_mode == "current" or early_display_hold:
+            next_display_index = best_index
+        else:
+            next_display_index = min(best_index + 1, len(self._lyrics) - 1)
+
         locator_index = int(
             self._lyrics[next_display_index].get(
                 "locator_index", next_display_index
@@ -722,9 +961,9 @@ class LyricSyncEngine:
         self._pending_highlight_index = next_display_index
         self._current_index = best_index
         self._last_success_normalized = target_normalized
+        self._last_success_recognized = normalized_recognized
         self._last_success_at = now
-        self._buffer_start_at = None
-        self._agent.reset()
+        self._buffer_start_at = now if retained_tail else None
 
         if build_trace:
             step_trace["decision"] = (
@@ -732,6 +971,19 @@ class LyricSyncEngine:
             )
             step_trace["matched_index"] = best_index
             step_trace["display_index"] = next_display_index
+            step_trace["retained_tail"] = retained_tail
+            step_trace["early_display_hold"] = early_display_hold
+            step_trace["alignment"] = (
+                {
+                    "src_start": int(best_details["src_start"]),
+                    "src_end": int(best_details["src_end"]),
+                    "dest_start": int(best_details["dest_start"]),
+                    "dest_end": int(best_details["dest_end"]),
+                    "dest_progress": round(dest_progress, 4),
+                }
+                if best_details is not None
+                else None
+            )
             step_trace["current_index_after"] = self._current_index
 
         match_payload = {
@@ -743,6 +995,8 @@ class LyricSyncEngine:
             "target_normalized": target_normalized,
             "buffer_length": buffer_length,
             "is_recovery": is_recovery,
+            "retained_tail": retained_tail,
+            "early_display_hold": early_display_hold,
         }
         return match_payload, step_trace
 
