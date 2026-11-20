@@ -1,5 +1,6 @@
-"""Japanese text normalization and two-phase fuzzy lyric synchronization."""
+"""Japanese text normalization and multi-mode fuzzy lyric synchronization."""
 
+from dataclasses import dataclass
 import re
 import threading
 import time
@@ -8,6 +9,13 @@ from typing import Any, Callable
 from rapidfuzz import fuzz
 
 from utaten_finder.core import config, events
+from utaten_finder.lyrics.phonology import (
+    ContinuousLyricsTimeline,
+    normalize_singing_phonology,
+    score_similarity_weighted_detailed,
+    smith_waterman_local_peaks,
+    weighted_indel_ratio,
+)
 from utaten_finder.lyrics.trace import MatchTraceRecorder
 
 try:
@@ -208,10 +216,19 @@ class LyricsAgent:
 
 
 _VALID_DISPLAY_MODES = frozenset({"adaptive", "next", "current"})
+_VALID_ALIGNMENT_MODES = frozenset({"line", "beam"})
+
+
+@dataclass(frozen=True)
+class _BeamHypothesis:
+    pos: int
+    score: float
+    last_adv_time: float | None
+    last_line: int
 
 
 class LyricSyncEngine:
-    """Thread-safe two-phase lyric line synchronization state machine."""
+    """Thread-safe multi-mode lyric synchronization state machine."""
 
     def __init__(
         self,
@@ -232,14 +249,41 @@ class LyricSyncEngine:
         smart_duplicate_ttl: bool = True,
         display_mode: str = "adaptive",
         early_display_progress_threshold: float = 0.75,
+        alignment_mode: str = "beam",
+        phonological_norm: bool = True,
+        phono_particles: bool = True,
+        phono_long_vowels: bool = True,
+        phono_drop_sokuon: bool = True,
+        weighted_dakuten: bool = False,
+        dakuten_cost: float = 0.35,
+        adjacent_pair: bool = False,
+        pair_threshold: float | None = None,
+        beam_width: int = 4,
+        beam_min_sim: float = 0.73,
+        beam_dakuten_score: float = 1.2,
+        beam_forward_bonus: float = 3.5,
+        beam_jump_penalty_per_char: float = 0.10,
+        beam_jump_penalty_per_line: float = 2.0,
+        beam_max_jump_penalty: float = 8.0,
+        beam_recovery_penalty: float = 6.5,
+        beam_decay: float = 0.78,
+        beam_back_slack: int = 16,
+        beam_max_buffer_chars: int = 32,
+        beam_buffer_stale_seconds: float = 6.5,
         emit_events: bool = True,
     ) -> None:
         if display_mode not in _VALID_DISPLAY_MODES:
             raise ValueError(
                 f"display_mode 必須為 {sorted(_VALID_DISPLAY_MODES)} 之一，收到: {display_mode!r}"
             )
+        if alignment_mode not in _VALID_ALIGNMENT_MODES:
+            raise ValueError(
+                f"alignment_mode 必須為 {sorted(_VALID_ALIGNMENT_MODES)} 之一，收到: {alignment_mode!r}"
+            )
         self._lock = threading.Lock()
         self._lyrics: list[dict[str, Any]] = []
+        self._match_keys: list[str] = []
+        self._timeline = ContinuousLyricsTimeline([])
         self._current_index = -1
         self._pending_scroll_targets: list[int] = []
         self._pending_highlight_index = -1
@@ -248,6 +292,7 @@ class LyricSyncEngine:
             max_buffer_ratio=max_buffer_ratio,
         )
         self._last_success_normalized = ""
+        self._last_success_match_key = ""
         self._last_success_recognized = ""
         self._last_success_at: float | None = None
         self._buffer_start_at: float | None = None
@@ -267,6 +312,33 @@ class LyricSyncEngine:
         self._early_display_progress_threshold = float(
             early_display_progress_threshold
         )
+        self._alignment_mode = alignment_mode
+        self._phonological_norm = bool(phonological_norm)
+        self._phono_particles = bool(phono_particles)
+        self._phono_long_vowels = bool(phono_long_vowels)
+        self._phono_drop_sokuon = bool(phono_drop_sokuon)
+        self._weighted_dakuten = bool(weighted_dakuten)
+        self._dakuten_cost = float(dakuten_cost)
+        self._adjacent_pair = bool(adjacent_pair)
+        self._pair_threshold = (
+            float(pair_threshold) if pair_threshold is not None else None
+        )
+        self._beam_width = max(1, int(beam_width))
+        self._beam_min_sim = float(beam_min_sim)
+        self._beam_dakuten_score = float(beam_dakuten_score)
+        self._beam_forward_bonus = float(beam_forward_bonus)
+        self._beam_jump_penalty_per_char = float(beam_jump_penalty_per_char)
+        self._beam_jump_penalty_per_line = float(beam_jump_penalty_per_line)
+        self._beam_max_jump_penalty = float(beam_max_jump_penalty)
+        self._beam_recovery_penalty = float(beam_recovery_penalty)
+        self._beam_decay = float(beam_decay)
+        self._beam_back_slack = max(0, int(beam_back_slack))
+        self._beam_max_buffer_chars = max(8, int(beam_max_buffer_chars))
+        self._beam_buffer_stale_seconds = float(beam_buffer_stale_seconds)
+        self._beam: list[_BeamHypothesis] = [
+            _BeamHypothesis(pos=0, score=0.0, last_adv_time=None, last_line=-1)
+        ]
+        self._beam_buffer_at: float | None = None
         self._emit_events = bool(emit_events)
 
         self._playback_song_id: str | None = None
@@ -274,6 +346,16 @@ class LyricSyncEngine:
         self._playback_duration_ms: int | None = None
         self._playback_polled_at: float | None = None
         self._playback_is_playing = False
+
+    def _to_match_key(self, normalized: str) -> str:
+        if not normalized or not self._phonological_norm:
+            return normalized
+        return normalize_singing_phonology(
+            normalized,
+            normalize_particles=self._phono_particles,
+            collapse_long_vowels=self._phono_long_vowels,
+            drop_sokuon=self._phono_drop_sokuon,
+        )
 
     def _effective_lookahead_lines(self) -> int:
         if self._fuzzy_lookahead_lines is not None:
@@ -317,6 +399,27 @@ class LyricSyncEngine:
             "smart_duplicate_ttl": self._smart_duplicate_ttl,
             "display_mode": self._display_mode,
             "early_display_progress_threshold": self._early_display_progress_threshold,
+            "alignment_mode": self._alignment_mode,
+            "phonological_norm": self._phonological_norm,
+            "phono_particles": self._phono_particles,
+            "phono_long_vowels": self._phono_long_vowels,
+            "phono_drop_sokuon": self._phono_drop_sokuon,
+            "weighted_dakuten": self._weighted_dakuten,
+            "dakuten_cost": self._dakuten_cost,
+            "adjacent_pair": self._adjacent_pair,
+            "pair_threshold": self._pair_threshold,
+            "beam_width": self._beam_width,
+            "beam_min_sim": self._beam_min_sim,
+            "beam_dakuten_score": self._beam_dakuten_score,
+            "beam_forward_bonus": self._beam_forward_bonus,
+            "beam_jump_penalty_per_char": self._beam_jump_penalty_per_char,
+            "beam_jump_penalty_per_line": self._beam_jump_penalty_per_line,
+            "beam_max_jump_penalty": self._beam_max_jump_penalty,
+            "beam_recovery_penalty": self._beam_recovery_penalty,
+            "beam_decay": self._beam_decay,
+            "beam_back_slack": self._beam_back_slack,
+            "beam_max_buffer_chars": self._beam_max_buffer_chars,
+            "beam_buffer_stale_seconds": self._beam_buffer_stale_seconds,
         }
 
     def update_playback_progress(
@@ -377,7 +480,7 @@ class LyricSyncEngine:
             if self._buffer_start_at is not None
             else None
         )
-        return {
+        snapshot: dict[str, Any] = {
             "lazy_opened": True,
             "current_index": self._current_index,
             "buffer": self._agent.asr_buffer,
@@ -386,6 +489,27 @@ class LyricSyncEngine:
             "elapsed_since_last_success": elapsed_last,
             "elapsed_since_buffer_start": elapsed_buf,
         }
+        if self._alignment_mode == "beam":
+            snapshot["beam_pos"] = int(self._beam[0].pos) if self._beam else 0
+            snapshot["elapsed_since_beam_buffer"] = (
+                round(max(0.0, now - self._beam_buffer_at), 4)
+                if self._beam_buffer_at is not None
+                else None
+            )
+            snapshot["beam"] = [
+                {
+                    "pos": int(h.pos),
+                    "score": round(float(h.score), 6),
+                    "elapsed_since_adv": (
+                        round(max(0.0, now - h.last_adv_time), 4)
+                        if h.last_adv_time is not None
+                        else None
+                    ),
+                    "last_line": int(h.last_line),
+                }
+                for h in self._beam
+            ]
+        return snapshot
 
     def restore_state(
         self,
@@ -396,6 +520,9 @@ class LyricSyncEngine:
         last_success_recognized: str = "",
         elapsed_since_last_success: float | None = None,
         elapsed_since_buffer_start: float | None = None,
+        beam_pos: int | None = None,
+        elapsed_since_beam_buffer: float | None = None,
+        beam: list[dict[str, Any]] | None = None,
     ) -> None:
         """Restore mid-song synchronization state (e.g. from a lazy-opened trace)."""
         with self._lock:
@@ -408,6 +535,11 @@ class LyricSyncEngine:
             self._current_index = idx
             self._agent.asr_buffer = str(buffer or "")
             self._last_success_normalized = str(last_success_normalized or "")
+            self._last_success_match_key = (
+                self._to_match_key(self._last_success_normalized)
+                if self._last_success_normalized
+                else ""
+            )
             self._last_success_recognized = str(last_success_recognized or "")
             self._last_success_at = (
                 now - float(elapsed_since_last_success)
@@ -419,6 +551,48 @@ class LyricSyncEngine:
                 if elapsed_since_buffer_start is not None
                 else None
             )
+            self._beam_buffer_at = (
+                now - float(elapsed_since_beam_buffer)
+                if elapsed_since_beam_buffer is not None
+                else (now if self._agent.asr_buffer else None)
+            )
+            max_pos = len(self._timeline.full_text)
+            if beam and isinstance(beam, list):
+                restored_beam: list[_BeamHypothesis] = []
+                for item in beam:
+                    if not isinstance(item, dict):
+                        continue
+                    pos_val = max(0, min(max_pos, int(item.get("pos", 0))))
+                    adv_el = item.get("elapsed_since_adv")
+                    adv_at = (
+                        now - float(adv_el) if adv_el is not None else None
+                    )
+                    restored_beam.append(
+                        _BeamHypothesis(
+                            pos=pos_val,
+                            score=float(item.get("score", 0.0)),
+                            last_adv_time=adv_at,
+                            last_line=int(item.get("last_line", idx)),
+                        )
+                    )
+                if restored_beam:
+                    self._beam = restored_beam[: self._beam_width]
+                    return
+
+            if beam_pos is not None:
+                pos_val = max(0, min(max_pos, int(beam_pos)))
+            elif 0 <= idx < self._timeline.line_count:
+                pos_val = self._timeline.line_ends[idx]
+            else:
+                pos_val = 0
+            self._beam = [
+                _BeamHypothesis(
+                    pos=pos_val,
+                    score=0.0,
+                    last_adv_time=self._last_success_at,
+                    last_line=idx,
+                )
+            ]
 
     def close_trace_session(
         self, reason: str = "stopped", *, clear_pending: bool = False
@@ -442,14 +616,24 @@ class LyricSyncEngine:
         with self._lock:
             now = self._clock()
             self._lyrics = list(lyrics_lines)
+            self._match_keys = [
+                self._to_match_key(str(line.get("normalized") or ""))
+                for line in self._lyrics
+            ]
+            self._timeline = ContinuousLyricsTimeline(self._match_keys)
             self._current_index = -1
             self._pending_scroll_targets = []
             self._pending_highlight_index = -1
             self._agent.reset()
             self._last_success_normalized = ""
+            self._last_success_match_key = ""
             self._last_success_recognized = ""
             self._last_success_at = None
             self._buffer_start_at = None
+            self._beam = [
+                _BeamHypothesis(pos=0, score=0.0, last_adv_time=None, last_line=-1)
+            ]
+            self._beam_buffer_at = None
 
             new_song_id = (track_meta or {}).get("song_id")
             if not self._lyrics or (
@@ -518,9 +702,24 @@ class LyricSyncEngine:
             self._pending_highlight_index = lyric_index
             self._agent.reset()
             self._last_success_normalized = ""
+            self._last_success_match_key = ""
             self._last_success_recognized = ""
             self._last_success_at = None
             self._buffer_start_at = None
+            jump_pos = (
+                self._timeline.line_ends[lyric_index]
+                if lyric_index < self._timeline.line_count
+                else 0
+            )
+            self._beam = [
+                _BeamHypothesis(
+                    pos=jump_pos,
+                    score=0.0,
+                    last_adv_time=None,
+                    last_line=lyric_index,
+                )
+            ]
+            self._beam_buffer_at = None
 
             current_line_no = lyric_index + 1
             current_line_text = self._lyrics[lyric_index]["original"]
@@ -609,7 +808,7 @@ class LyricSyncEngine:
 
     def _effective_phase1_threshold(
         self,
-        target_normalized: str,
+        target_key: str,
         base_threshold: float,
         buffer_text: str,
         details: dict[str, Any],
@@ -618,11 +817,11 @@ class LyricSyncEngine:
     ) -> tuple[float, bool]:
         if (
             not self._short_line_guard
-            or len(target_normalized) > self._short_line_max_len
+            or len(target_key) > self._short_line_max_len
         ):
             return base_threshold, True
 
-        if len(target_normalized) <= 2:
+        if len(target_key) <= 2:
             return max(base_threshold, 0.99), float(details["ratio_score"]) >= 0.50
 
         effective = max(base_threshold, 0.90)
@@ -637,35 +836,38 @@ class LyricSyncEngine:
     def _is_duplicate_locked(
         self,
         now: float,
-        normalized_recognized: str,
+        match_recognized: str,
         start_index: int,
         duplicate_ttl: float,
     ) -> bool:
-        if not self._last_success_normalized or self._last_success_at is None:
+        if not self._last_success_match_key or self._last_success_at is None:
             return False
 
         elapsed = now - self._last_success_at
         if not self._smart_duplicate_ttl:
             return (
                 elapsed <= duplicate_ttl
-                and normalized_recognized in self._last_success_normalized
+                and match_recognized in self._last_success_match_key
             )
 
-        next_norm = (
-            self._lyrics[start_index]["normalized"]
-            if start_index < len(self._lyrics)
+        next_key = (
+            self._match_keys[start_index]
+            if start_index < len(self._match_keys)
             else ""
         )
-        next_is_repeat = bool(next_norm) and (
-            next_norm == self._last_success_normalized
+        next_is_repeat = bool(next_key) and (
+            next_key == self._last_success_match_key
             or (
-                len(next_norm) >= 3
+                len(next_key) >= 3
                 and (
-                    next_norm in self._last_success_normalized
-                    or self._last_success_normalized in next_norm
+                    next_key in self._last_success_match_key
+                    or self._last_success_match_key in next_key
                 )
             )
-            or (fuzz.ratio(next_norm, self._last_success_normalized) / 100.0 >= 0.85)
+            or (
+                fuzz.ratio(next_key, self._last_success_match_key) / 100.0
+                >= 0.85
+            )
         )
         effective_ttl = (
             min(duplicate_ttl * 0.4, 1.5) if next_is_repeat else duplicate_ttl
@@ -673,32 +875,32 @@ class LyricSyncEngine:
         if elapsed > effective_ttl:
             return False
 
-        if normalized_recognized in self._last_success_normalized:
+        if match_recognized in self._last_success_match_key:
             return True
 
         if self._last_success_recognized and (
-            normalized_recognized == self._last_success_recognized
+            match_recognized == self._last_success_recognized
             or (
-                len(normalized_recognized) >= 4
-                and normalized_recognized in self._last_success_recognized
+                len(match_recognized) >= 4
+                and match_recognized in self._last_success_recognized
             )
         ):
             return True
 
         if (
             not next_is_repeat
-            and 5 <= len(normalized_recognized) <= len(self._last_success_normalized)
+            and 5 <= len(match_recognized) <= len(self._last_success_match_key)
         ):
             sim_last = (
                 fuzz.partial_ratio(
-                    normalized_recognized, self._last_success_normalized
+                    match_recognized, self._last_success_match_key
                 )
                 / 100.0
             )
             if sim_last >= 0.85:
                 sim_next = (
-                    fuzz.partial_ratio(normalized_recognized, next_norm) / 100.0
-                    if next_norm
+                    fuzz.partial_ratio(match_recognized, next_key) / 100.0
+                    if next_key
                     else 0.0
                 )
                 if sim_last > sim_next:
@@ -706,11 +908,221 @@ class LyricSyncEngine:
 
         return False
 
-    def _evaluate_locked(
+    def _score_line_detailed(
+        self,
+        buffer_text: str,
+        target_key: str,
+        *,
+        min_coverage_ratio: float | None = None,
+    ) -> dict[str, Any]:
+        min_cov = (
+            self._agent.min_coverage_ratio
+            if min_coverage_ratio is None
+            else min_coverage_ratio
+        )
+        if self._weighted_dakuten:
+            return score_similarity_weighted_detailed(
+                buffer_text,
+                target_key,
+                min_coverage_ratio=min_cov,
+                dakuten_cost=self._dakuten_cost,
+            )
+        return score_similarity_detailed(buffer_text, target_key, min_cov)
+
+    def _score_line_ratio(self, buffer_text: str, target_key: str) -> float:
+        if self._weighted_dakuten:
+            return weighted_indel_ratio(
+                buffer_text, target_key, dakuten_cost=self._dakuten_cost
+            )
+        return calculate_ratio_similarity_normalized(buffer_text, target_key)
+
+    def _score_adjacent_pairs_locked(
+        self,
+        start_index: int,
+        end_index_phase1: int,
+        buffer_text: str,
+        phase1_threshold: float,
+        build_trace: bool,
+        candidates: list[dict[str, Any]],
+    ) -> tuple[int, float, float, int, float, dict[str, Any]] | None:
+        pair_ranges: list[tuple[int, int, bool]] = []
+        if self._current_index >= 0 and start_index < len(self._lyrics):
+            pair_ranges.append((self._current_index, start_index, True))
+        for idx in range(
+            start_index, min(end_index_phase1, len(self._lyrics) - 2) + 1
+        ):
+            pair_ranges.append((idx, idx + 1, False))
+
+        eff_pair_th = (
+            self._pair_threshold
+            if self._pair_threshold is not None
+            else phase1_threshold
+        )
+        min_cov = min(self._agent.min_coverage_ratio, 0.35)
+        best_win: tuple[int, float, float, int, float, dict[str, Any]] | None = (
+            None
+        )
+        best_pair_score = 0.0
+
+        for i1, i2, is_bridge in pair_ranges:
+            t1 = self._match_keys[i1]
+            t2 = self._match_keys[i2]
+            if len(t1) < 3 or len(t2) < 3:
+                continue
+
+            details = self._score_line_detailed(
+                buffer_text, t1 + t2, min_coverage_ratio=min_cov
+            )
+            ds = int(details["dest_start"])
+            de = int(details["dest_end"])
+            l1, l2 = len(t1), len(t2)
+            cov1 = max(0, min(de, l1) - ds)
+            cov2 = max(0, de - max(ds, l1))
+
+            allowed = (
+                cov1 >= 3
+                and cov2 >= 3
+                and (cov1 / l1 >= 0.20)
+                and (cov2 / l2 >= 0.25)
+            )
+            if allowed and self._short_line_guard and l2 <= self._short_line_max_len:
+                if cov2 < l2:
+                    allowed = False
+
+            score = float(details["final_score"])
+            if build_trace:
+                candidates.append(
+                    {
+                        "index": i2,
+                        "pair": [i1, i2],
+                        "is_bridge": is_bridge,
+                        "phase": 1,
+                        "target_normalized": (
+                            f"{self._lyrics[i1]['normalized']}"
+                            f"+{self._lyrics[i2]['normalized']}"
+                        ),
+                        "coverage": round(details["coverage"], 4),
+                        "raw_partial_score": round(
+                            details["raw_partial_score"], 4
+                        ),
+                        "partial_score": round(details["partial_score"], 4),
+                        "ratio_score": round(details["ratio_score"], 4),
+                        "score": round(score, 4),
+                        "effective_threshold": round(eff_pair_th, 4),
+                        "allowed": allowed,
+                        "src_end": int(details["src_end"]),
+                        "dest_end": de,
+                    }
+                )
+
+            if allowed and score >= eff_pair_th and score > best_pair_score:
+                best_pair_score = score
+                prog2 = min(1.0, cov2 / l2)
+                if is_bridge:
+                    emit_idx = i2
+                    src_end = int(details["src_end"])
+                    dest_prog = prog2
+                elif prog2 < 0.70:
+                    emit_idx = i1
+                    src_end = max(
+                        int(details["src_start"]),
+                        int(details["src_end"]) - cov2,
+                    )
+                    dest_prog = 1.0
+                else:
+                    emit_idx = i2
+                    src_end = int(details["src_end"])
+                    dest_prog = prog2
+                best_win = (
+                    emit_idx,
+                    score,
+                    eff_pair_th,
+                    src_end,
+                    dest_prog,
+                    details,
+                )
+
+        return best_win
+
+    def _commit_match_locked(
         self,
         now: float,
         cleaned_text: str,
-        normalized_recognized: str,
+        match_recognized: str,
+        best_index: int,
+        best_score: float,
+        buffer_length: int,
+        is_recovery: bool,
+        retained_tail: str,
+        dest_progress: float,
+        ratio_for_display: float,
+        phase1_threshold: float,
+        alignment_info: dict[str, Any] | None,
+        build_trace: bool,
+        step_trace: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        target_original = self._lyrics[best_index]["original"]
+        target_normalized = self._lyrics[best_index]["normalized"]
+
+        is_early_prefix_match = (
+            not is_recovery
+            and not retained_tail
+            and dest_progress < self._early_display_progress_threshold
+            and ratio_for_display < phase1_threshold
+        )
+        early_display_hold = bool(
+            self._display_mode == "adaptive" and is_early_prefix_match
+        )
+        if self._display_mode == "current" or early_display_hold:
+            next_display_index = best_index
+        else:
+            next_display_index = min(best_index + 1, len(self._lyrics) - 1)
+
+        locator_index = int(
+            self._lyrics[next_display_index].get(
+                "locator_index", next_display_index
+            )
+        )
+        self._pending_scroll_targets.append(locator_index)
+        self._pending_highlight_index = next_display_index
+        self._current_index = best_index
+        self._last_success_normalized = target_normalized
+        self._last_success_match_key = self._match_keys[best_index]
+        self._last_success_recognized = match_recognized
+        self._last_success_at = now
+        self._buffer_start_at = now if retained_tail else None
+
+        if build_trace:
+            step_trace["decision"] = (
+                "matched_phase2_recovery" if is_recovery else "matched_phase1"
+            )
+            step_trace["matched_index"] = best_index
+            step_trace["display_index"] = next_display_index
+            step_trace["retained_tail"] = retained_tail
+            step_trace["early_display_hold"] = early_display_hold
+            step_trace["alignment"] = alignment_info
+            step_trace["current_index_after"] = self._current_index
+
+        match_payload = {
+            "matched_index": best_index,
+            "display_index": next_display_index,
+            "score": best_score,
+            "recognized_text": cleaned_text,
+            "target_original": target_original,
+            "target_normalized": target_normalized,
+            "buffer_length": buffer_length,
+            "is_recovery": is_recovery,
+            "retained_tail": retained_tail,
+            "early_display_hold": early_display_hold,
+        }
+        return match_payload, step_trace
+
+    def _evaluate_line_locked(
+        self,
+        now: float,
+        cleaned_text: str,
+        canonical_recognized: str,
+        match_recognized: str,
         asr_payload: dict[str, Any],
         build_trace: bool,
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
@@ -721,13 +1133,15 @@ class LyricSyncEngine:
         buffer_before = self._agent.asr_buffer
         elapsed_before = self._elapsed_since_success_locked(now)
 
-        def _empty_result(decision: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        def _empty_result(
+            decision: str,
+        ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
             if not build_trace:
                 return None, {}
             return None, self._make_step_trace(
                 playback,
                 asr_payload,
-                normalized_recognized,
+                canonical_recognized,
                 cur_idx_before,
                 buffer_before,
                 elapsed_before,
@@ -740,7 +1154,7 @@ class LyricSyncEngine:
         start_index = self._current_index + 1
         duplicate_ttl = self._effective_duplicate_ttl()
         if self._is_duplicate_locked(
-            now, normalized_recognized, start_index, duplicate_ttl
+            now, match_recognized, start_index, duplicate_ttl
         ):
             return _empty_result("skipped_duplicate_ttl")
 
@@ -750,9 +1164,9 @@ class LyricSyncEngine:
         if not self._agent.asr_buffer:
             self._buffer_start_at = now
 
-        self._agent.append(normalized_recognized)
+        self._agent.append(match_recognized)
         buffer_after_append = self._agent.asr_buffer
-        target_length = len(self._lyrics[start_index]["normalized"])
+        target_length = len(self._match_keys[start_index])
         trimmed = self._agent.trim_if_needed(target_length)
         buffer_after_trim = self._agent.asr_buffer
 
@@ -788,11 +1202,11 @@ class LyricSyncEngine:
         candidates: list[dict[str, Any]] = []
 
         for idx in range(start_index, end_index_phase1 + 1):
-            target_normalized = self._lyrics[idx]["normalized"]
-            details = self._agent.score_detailed(target_normalized)
+            target_key = self._match_keys[idx]
+            details = self._score_line_detailed(buffer_after_trim, target_key)
             score = float(details["final_score"])
             eff_threshold, allowed = self._effective_phase1_threshold(
-                target_normalized,
+                target_key,
                 phase1_threshold,
                 buffer_after_trim,
                 details,
@@ -803,7 +1217,7 @@ class LyricSyncEngine:
                     {
                         "index": idx,
                         "phase": 1,
-                        "target_normalized": target_normalized,
+                        "target_normalized": self._lyrics[idx]["normalized"],
                         "coverage": round(details["coverage"], 4),
                         "raw_partial_score": round(
                             details["raw_partial_score"], 4
@@ -829,11 +1243,33 @@ class LyricSyncEngine:
                     best_passed_details = details
                     best_passed_threshold = eff_threshold
 
+        pair_src_end_override: int | None = None
+        pair_dest_progress_override: float | None = None
+
         if best_passed_index is not None:
             best_index = best_passed_index
             best_score = best_passed_score
             best_details = best_passed_details
             best_threshold = best_passed_threshold
+        elif self._adjacent_pair:
+            pair_win = self._score_adjacent_pairs_locked(
+                start_index,
+                end_index_phase1,
+                buffer_after_trim,
+                phase1_threshold,
+                build_trace,
+                candidates,
+            )
+            if pair_win is not None:
+                (
+                    best_index,
+                    best_score,
+                    best_threshold,
+                    pair_src_end_override,
+                    pair_dest_progress_override,
+                    best_details,
+                ) = pair_win
+                best_passed_index = best_index
 
         # 階段二：迷失恢復機制 (階段一達到上限後才啟用)
         is_recovery = False
@@ -851,16 +1287,18 @@ class LyricSyncEngine:
             if start_index_phase2 <= end_index_phase2:
                 phase2_range = [start_index_phase2, end_index_phase2]
                 for idx in range(start_index_phase2, end_index_phase2 + 1):
-                    target_normalized = self._lyrics[idx]["normalized"]
-                    score = self._agent.ratio_score(target_normalized)
+                    target_key = self._match_keys[idx]
+                    score = self._score_line_ratio(
+                        buffer_after_trim, target_key
+                    )
                     req_threshold = (
                         max(
                             recovery_threshold,
-                            0.99 if len(target_normalized) <= 2 else 0.90,
+                            0.99 if len(target_key) <= 2 else 0.90,
                         )
                         if (
                             self._short_line_guard
-                            and len(target_normalized) <= self._short_line_max_len
+                            and len(target_key) <= self._short_line_max_len
                         )
                         else recovery_threshold
                     )
@@ -869,7 +1307,9 @@ class LyricSyncEngine:
                             {
                                 "index": idx,
                                 "phase": 2,
-                                "target_normalized": target_normalized,
+                                "target_normalized": self._lyrics[idx][
+                                    "normalized"
+                                ],
                                 "ratio_score": round(score, 4),
                                 "score": round(score, 4),
                                 "effective_threshold": round(req_threshold, 4),
@@ -891,7 +1331,7 @@ class LyricSyncEngine:
             step_trace = self._make_step_trace(
                 playback,
                 asr_payload,
-                normalized_recognized,
+                canonical_recognized,
                 cur_idx_before,
                 buffer_before,
                 elapsed_since_success,
@@ -916,89 +1356,614 @@ class LyricSyncEngine:
                 step_trace["current_index_after"] = self._current_index
             return None, step_trace
 
-        target_original = self._lyrics[best_index]["original"]
-        target_normalized = self._lyrics[best_index]["normalized"]
         buffer_length = len(buffer_after_trim)
-
+        consume_end = (
+            pair_src_end_override
+            if pair_src_end_override is not None
+            else (int(best_details["src_end"]) if best_details is not None else 0)
+        )
         if self._retain_tail and not is_recovery and best_details is not None:
-            retained_tail = self._agent.consume_prefix(
-                int(best_details["src_end"])
-            )
+            retained_tail = self._agent.consume_prefix(consume_end)
         else:
             self._agent.reset()
             retained_tail = ""
 
-        dest_progress = (
-            min(1.0, int(best_details["dest_end"]) / len(target_normalized))
-            if (best_details is not None and target_normalized)
-            else 1.0
-        )
+        target_key = self._match_keys[best_index]
+        if pair_dest_progress_override is not None:
+            dest_progress = pair_dest_progress_override
+        elif best_details is not None and target_key:
+            dest_progress = min(1.0, int(best_details["dest_end"]) / len(target_key))
+        else:
+            dest_progress = 1.0
+
         ratio_for_display = (
             float(best_details["ratio_score"])
             if best_details is not None
             else best_score
         )
-        is_early_prefix_match = (
-            not is_recovery
-            and not retained_tail
-            and dest_progress < self._early_display_progress_threshold
-            and ratio_for_display < phase1_threshold
+        alignment_info = (
+            {
+                "src_start": int(best_details["src_start"]),
+                "src_end": int(best_details["src_end"]),
+                "dest_start": int(best_details["dest_start"]),
+                "dest_end": int(best_details["dest_end"]),
+                "dest_progress": round(dest_progress, 4),
+            }
+            if best_details is not None
+            else None
         )
-        early_display_hold = bool(
-            self._display_mode == "adaptive" and is_early_prefix_match
+        return self._commit_match_locked(
+            now=now,
+            cleaned_text=cleaned_text,
+            match_recognized=match_recognized,
+            best_index=best_index,
+            best_score=best_score,
+            buffer_length=buffer_length,
+            is_recovery=is_recovery,
+            retained_tail=retained_tail,
+            dest_progress=dest_progress,
+            ratio_for_display=ratio_for_display,
+            phase1_threshold=phase1_threshold,
+            alignment_info=alignment_info,
+            build_trace=build_trace,
+            step_trace=step_trace,
         )
-        if self._display_mode == "current" or early_display_hold:
-            next_display_index = best_index
-        else:
-            next_display_index = min(best_index + 1, len(self._lyrics) - 1)
 
-        locator_index = int(
-            self._lyrics[next_display_index].get(
-                "locator_index", next_display_index
+    def _evaluate_beam_locked(
+        self,
+        now: float,
+        cleaned_text: str,
+        canonical_recognized: str,
+        match_recognized: str,
+        asr_payload: dict[str, Any],
+        build_trace: bool,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        playback = (
+            self._snapshot_playback_progress_locked(now) if build_trace else {}
+        )
+        cur_idx_before = self._current_index
+        buffer_before = self._agent.asr_buffer
+        elapsed_before = self._elapsed_since_success_locked(now)
+
+        def _empty_result(
+            decision: str,
+        ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+            if not build_trace:
+                return None, {}
+            return None, self._make_step_trace(
+                playback,
+                asr_payload,
+                canonical_recognized,
+                cur_idx_before,
+                buffer_before,
+                elapsed_before,
+                decision=decision,
             )
-        )
-        self._pending_scroll_targets.append(locator_index)
-        self._pending_highlight_index = next_display_index
-        self._current_index = best_index
-        self._last_success_normalized = target_normalized
-        self._last_success_recognized = normalized_recognized
-        self._last_success_at = now
-        self._buffer_start_at = now if retained_tail else None
 
+        if not self._lyrics:
+            return _empty_result("ignored_no_lyrics")
+
+        start_index = self._current_index + 1
+        duplicate_ttl = self._effective_duplicate_ttl()
+        if self._is_duplicate_locked(
+            now, match_recognized, start_index, duplicate_ttl
+        ):
+            return _empty_result("skipped_duplicate_ttl")
+
+        n_lines = len(self._lyrics)
+        if start_index >= n_lines:
+            return _empty_result("end_of_lyrics")
+
+        if self._buffer_start_at is None:
+            self._buffer_start_at = now
+        if (
+            self._beam_buffer_at is not None
+            and (now - self._beam_buffer_at) > self._beam_buffer_stale_seconds
+        ):
+            self._agent.reset()
+
+        prev_buf_len = len(self._agent.asr_buffer)
+        self._agent.append(match_recognized)
+        buffer_after_append = self._agent.asr_buffer
+        added_tail = len(buffer_after_append) - prev_buf_len
+        trimmed = False
+        if len(buffer_after_append) > self._beam_max_buffer_chars:
+            self._agent.asr_buffer = buffer_after_append[
+                -self._beam_max_buffer_chars :
+            ]
+            trimmed = True
+        buffer_after_trim = self._agent.asr_buffer
+        self._beam_buffer_at = now
+
+        fresh_start_in_buf = max(
+            0, len(buffer_after_trim) - max(len(match_recognized), added_tail)
+        )
+        queries: list[tuple[str, bool, int]] = (
+            [(match_recognized, True, 0)]
+            if buffer_after_trim == match_recognized
+            else [
+                (match_recognized, True, 0),
+                (buffer_after_trim, False, fresh_start_in_buf),
+            ]
+        )
+
+        elapsed_since_success = self._elapsed_since_success_locked(now)
+        max_lookahead = self._effective_lookahead_lines()
+        phase1_threshold = self._effective_next_line_threshold()
+        recovery_lookahead = self._effective_recovery_lookahead_lines()
+        recovery_threshold = self._effective_recovery_threshold()
+
+        phase1_lookahead_lines = max(
+            1,
+            min(
+                max_lookahead,
+                int(elapsed_since_success / self._lookahead_seconds_per_line),
+            ),
+        )
+        end_index_phase1 = min(start_index + phase1_lookahead_lines, n_lines - 1)
+        phase2_range: list[int] | None = None
+        if phase1_lookahead_lines >= max_lookahead:
+            p2_start = end_index_phase1 + 1
+            p2_end = min(self._current_index + recovery_lookahead, n_lines - 1)
+            if p2_start <= p2_end:
+                phase2_range = [p2_start, p2_end]
+
+        timeline = self._timeline
+        full_text = timeline.full_text
+        line_starts = timeline.line_starts
+        line_ends = timeline.line_ends
+        char_to_line = timeline.char_to_line
+        decay = self._beam_decay
+
+        next_hyps: list[tuple[float, _BeamHypothesis, tuple[Any, ...] | None]] = [
+            (h.score * decay, _BeamHypothesis(h.pos, h.score * decay, h.last_adv_time, h.last_line), None)
+            for h in self._beam
+        ]
+        candidates: list[dict[str, Any]] = []
+        seen_cand_keys: set[tuple[int, int, bool]] = set()
+        best_seen_sim: float | None = None
+
+        for h in self._beam:
+            h_line = h.last_line
+            ref_t = (
+                h.last_adv_time
+                if h.last_adv_time is not None
+                else self._buffer_start_at
+            )
+            dt = max(0.0, now - ref_t) if ref_t is not None else 0.0
+            h_p1_la = max(
+                1, min(max_lookahead, int(dt / self._lookahead_seconds_per_line))
+            )
+            if h_line < 0:
+                max_p1_line = min(n_lines - 1, h_p1_la)
+                max_target_line = (
+                    min(n_lines - 1, recovery_lookahead - 1)
+                    if h_p1_la >= max_lookahead
+                    else max_p1_line
+                )
+            else:
+                max_p1_line = min(n_lines - 1, h_line + 1 + h_p1_la)
+                max_target_line = (
+                    min(n_lines - 1, h_line + recovery_lookahead)
+                    if h_p1_la >= max_lookahead
+                    else max_p1_line
+                )
+
+            win_start = max(0, h.pos - self._beam_back_slack)
+            win_end = line_ends[max_target_line] if n_lines > 0 else 0
+            if win_end <= win_start:
+                continue
+            window = full_text[win_start:win_end]
+
+            first_target_line = max(0, h_line + 1)
+            min_len_in_win = min(
+                (
+                    timeline.line_length(li)
+                    for li in range(first_target_line, max_target_line + 1)
+                    if timeline.line_length(li) > 0
+                ),
+                default=self._short_line_max_len + 1,
+            )
+            min_raw_score = (
+                4.0
+                if (
+                    not self._short_line_guard
+                    or min_len_in_win <= self._short_line_max_len
+                )
+                else 6.0
+            )
+
+            best_echo_raw = 0.0
+            adv_cands: list[tuple[Any, ...]] = []
+
+            for q_text, is_fresh_q, fresh_start in queries:
+                if len(q_text) < 2:
+                    continue
+                peaks = smith_waterman_local_peaks(
+                    q_text,
+                    window,
+                    dakuten_score=self._beam_dakuten_score,
+                    min_raw_score=min_raw_score,
+                    top_k=5,
+                )
+                for peak in peaks:
+                    g_s = win_start + peak.ref_start
+                    g_e = win_start + peak.ref_end
+                    if g_e <= g_s:
+                        continue
+                    matched_r_len = g_e - g_s
+                    matched_q_len = peak.q_end - peak.q_start
+                    end_line = char_to_line[g_e - 1]
+                    start_line = char_to_line[g_s]
+                    line_len = timeline.line_length(end_line)
+
+                    if not is_fresh_q:
+                        fresh_used = peak.q_end - max(peak.q_start, fresh_start)
+                        if fresh_used < min(2, len(match_recognized)) or (
+                            len(q_text) - peak.q_end
+                            > max(3, len(match_recognized) // 2)
+                        ):
+                            continue
+
+                    if g_e <= h.pos:
+                        if peak.local_sim >= self._beam_min_sim:
+                            best_echo_raw = max(best_echo_raw, peak.raw_score)
+                        continue
+
+                    in_recovery = end_line > max_p1_line
+                    eff_req_sim = (
+                        max(recovery_threshold, 0.80)
+                        if in_recovery
+                        else self._beam_min_sim
+                    )
+                    is_exact_short = (
+                        line_len <= self._short_line_max_len
+                        and g_s == line_starts[end_line]
+                        and g_e == line_ends[end_line]
+                        and peak.local_sim >= 0.95
+                    )
+
+                    allowed = True
+                    if self._short_line_guard:
+                        if matched_r_len < 4 and not is_exact_short:
+                            allowed = False
+                        elif line_len <= self._short_line_max_len:
+                            eff_req_sim = max(
+                                eff_req_sim,
+                                0.99 if line_len <= 2 else 0.90,
+                            )
+                            if line_len <= 2 and len(q_text) > line_len + 2:
+                                allowed = False
+                            elif (
+                                end_line > first_target_line
+                                and (len(q_text) - peak.q_end > 2)
+                            ):
+                                allowed = False
+                        elif matched_r_len <= 5:
+                            eff_req_sim = max(eff_req_sim, 0.85)
+                        if (
+                            matched_q_len < 6
+                            and len(q_text) >= 14
+                            and (len(q_text) - peak.q_end > 3)
+                            and peak.local_sim < 0.90
+                        ):
+                            allowed = False
+                    elif matched_r_len < 2:
+                        allowed = False
+
+                    if in_recovery and matched_r_len < (
+                        6 if self._short_line_guard else 4
+                    ):
+                        allowed = False
+
+                    if build_trace:
+                        cand_key = (end_line, 2 if in_recovery else 1, is_fresh_q)
+                        if cand_key not in seen_cand_keys:
+                            seen_cand_keys.add(cand_key)
+                            candidates.append(
+                                {
+                                    "index": end_line,
+                                    "start_index": start_line,
+                                    "phase": 2 if in_recovery else 1,
+                                    "target_normalized": self._lyrics[end_line][
+                                        "normalized"
+                                    ],
+                                    "coverage": round(
+                                        timeline.line_progress(end_line, g_e), 4
+                                    ),
+                                    "raw_score": round(peak.raw_score, 4),
+                                    "score": round(peak.local_sim, 4),
+                                    "effective_threshold": round(
+                                        eff_req_sim, 4
+                                    ),
+                                    "allowed": allowed,
+                                    "span": [g_s, g_e],
+                                    "q_span": [peak.q_start, peak.q_end],
+                                }
+                            )
+
+                    if allowed:
+                        if best_seen_sim is None or peak.local_sim > best_seen_sim:
+                            best_seen_sim = peak.local_sim
+                        if peak.local_sim >= eff_req_sim:
+                            adv_cands.append(
+                                (
+                                    peak.raw_score,
+                                    peak.local_sim,
+                                    peak.q_start,
+                                    peak.q_end,
+                                    g_s,
+                                    g_e,
+                                    start_line,
+                                    end_line,
+                                    q_text,
+                                    is_fresh_q,
+                                    in_recovery,
+                                    eff_req_sim,
+                                    is_exact_short,
+                                )
+                            )
+
+            if best_echo_raw > 0.0:
+                conf_sc = h.score * decay + best_echo_raw * 0.45
+                next_hyps.append(
+                    (
+                        conf_sc,
+                        _BeamHypothesis(
+                            h.pos, conf_sc, h.last_adv_time, h.last_line
+                        ),
+                        None,
+                    )
+                )
+
+            for (
+                raw_sc,
+                local_sim,
+                qs,
+                qe,
+                g_s,
+                g_e,
+                start_line,
+                end_line,
+                q_text,
+                is_fresh_q,
+                in_recovery,
+                eff_req_sim,
+                is_exact_short,
+            ) in adv_cands:
+                gap = g_s - h.pos
+                line_skip = max(0, start_line - (h_line + 1))
+                if in_recovery:
+                    trans = -self._beam_recovery_penalty
+                elif -self._beam_back_slack <= gap <= 8 and line_skip == 0:
+                    trans = self._beam_forward_bonus
+                elif gap > 8 or line_skip > 0:
+                    trans = -min(
+                        self._beam_max_jump_penalty,
+                        self._beam_jump_penalty_per_char * max(0, gap - 6)
+                        + self._beam_jump_penalty_per_line * line_skip,
+                    )
+                else:
+                    trans = -1.5
+
+                step_gain = raw_sc * local_sim + trans
+                min_gain = 3.0 if is_exact_short else 5.0
+                if step_gain < min_gain:
+                    continue
+                new_sc = h.score * decay + step_gain
+                nh = _BeamHypothesis(
+                    pos=g_e, score=new_sc, last_adv_time=now, last_line=end_line
+                )
+                next_hyps.append(
+                    (
+                        new_sc,
+                        nh,
+                        (
+                            nh,
+                            local_sim,
+                            raw_sc,
+                            g_s,
+                            g_e,
+                            start_line,
+                            end_line,
+                            q_text,
+                            qs,
+                            qe,
+                            is_fresh_q,
+                            in_recovery,
+                            eff_req_sim,
+                        ),
+                    )
+                )
+
+        next_hyps.sort(key=lambda item: item[0], reverse=True)
+        pruned: list[_BeamHypothesis] = []
+        best_ev: tuple[Any, ...] | None = None
+        for _, hyp, ev_info in next_hyps:
+            if any(abs(hyp.pos - kept.pos) <= 5 for kept in pruned):
+                continue
+            if not pruned:
+                best_ev = ev_info
+            pruned.append(hyp)
+            if len(pruned) >= self._beam_width:
+                break
+        if pruned:
+            self._beam = pruned
+
+        matched_emit = False
+        emit_line = self._current_index
+        win_sim = best_seen_sim
+        win_thresh = self._beam_min_sim
+        win_recovery = False
+        win_gs = 0
+        win_ge = 0
+        win_qs = 0
+        win_qe = 0
+        win_q_text = ""
+        src_consume = 0
+
+        if best_ev is not None:
+            (
+                nh,
+                local_sim,
+                _raw_sc,
+                g_s,
+                g_e,
+                start_line,
+                end_line,
+                q_text,
+                qs,
+                qe,
+                _is_fresh_q,
+                in_recovery,
+                eff_req_sim,
+            ) = best_ev
+            eff_end_line = end_line
+            entered_chars = g_e - line_starts[eff_end_line]
+            end_line_len = timeline.line_length(eff_end_line)
+            if eff_end_line > start_line and entered_chars < min(3, end_line_len):
+                eff_end_line -= 1
+                g_e = line_ends[eff_end_line]
+                self._beam[0] = _BeamHypothesis(
+                    pos=g_e,
+                    score=nh.score,
+                    last_adv_time=now,
+                    last_line=eff_end_line,
+                )
+
+            if eff_end_line > self._current_index:
+                end_prog = timeline.line_progress(eff_end_line, g_e)
+                if (
+                    start_line > self._current_index
+                    and start_line < eff_end_line
+                    and end_prog < 0.35
+                ):
+                    emit_line = start_line
+                    spill = g_e - line_starts[eff_end_line]
+                    src_consume = max(qs, qe - spill)
+                    win_ge = line_ends[start_line]
+                    self._beam[0] = _BeamHypothesis(
+                        pos=win_ge,
+                        score=nh.score,
+                        last_adv_time=now,
+                        last_line=emit_line,
+                    )
+                else:
+                    emit_line = eff_end_line
+                    src_consume = qe
+                    win_ge = g_e
+
+                if emit_line > self._current_index:
+                    matched_emit = True
+                    win_sim = local_sim
+                    win_thresh = eff_req_sim
+                    win_recovery = bool(in_recovery)
+                    win_gs = g_s
+                    win_qs = qs
+                    win_qe = src_consume
+                    win_q_text = q_text
+
+        step_trace: dict[str, Any] = {}
         if build_trace:
-            step_trace["decision"] = (
-                "matched_phase2_recovery" if is_recovery else "matched_phase1"
+            step_trace = self._make_step_trace(
+                playback,
+                asr_payload,
+                canonical_recognized,
+                cur_idx_before,
+                buffer_before,
+                elapsed_since_success,
             )
-            step_trace["matched_index"] = best_index
-            step_trace["display_index"] = next_display_index
-            step_trace["retained_tail"] = retained_tail
-            step_trace["early_display_hold"] = early_display_hold
-            step_trace["alignment"] = (
-                {
-                    "src_start": int(best_details["src_start"]),
-                    "src_end": int(best_details["src_end"]),
-                    "dest_start": int(best_details["dest_start"]),
-                    "dest_end": int(best_details["dest_end"]),
-                    "dest_progress": round(dest_progress, 4),
-                }
-                if best_details is not None
-                else None
+            step_trace["buffer_after_append"] = buffer_after_append
+            step_trace["trimmed"] = bool(trimmed)
+            step_trace["buffer_after_trim"] = buffer_after_trim
+            step_trace["trim_target_length"] = len(self._match_keys[start_index])
+            step_trace["phase1_lookahead_lines"] = phase1_lookahead_lines
+            step_trace["phase1_range"] = [start_index, end_index_phase1]
+            step_trace["phase2_range"] = phase2_range
+            step_trace["candidates"] = candidates
+            step_trace["threshold"] = round(win_thresh, 4)
+            step_trace["best_score"] = (
+                round(win_sim, 4) if win_sim is not None else None
             )
-            step_trace["current_index_after"] = self._current_index
+            step_trace["is_recovery"] = win_recovery
 
-        match_payload = {
-            "matched_index": best_index,
-            "display_index": next_display_index,
-            "score": best_score,
-            "recognized_text": cleaned_text,
-            "target_original": target_original,
-            "target_normalized": target_normalized,
-            "buffer_length": buffer_length,
-            "is_recovery": is_recovery,
-            "retained_tail": retained_tail,
-            "early_display_hold": early_display_hold,
+        if not matched_emit or win_sim is None:
+            if build_trace:
+                step_trace["decision"] = "no_match"
+                step_trace["current_index_after"] = self._current_index
+            return None, step_trace
+
+        buffer_length = len(buffer_after_trim)
+        if self._retain_tail and not win_recovery:
+            self._agent.asr_buffer = win_q_text[src_consume:]
+            retained_tail = self._agent.asr_buffer
+        else:
+            self._agent.reset()
+            retained_tail = ""
+        if not retained_tail:
+            self._beam_buffer_at = None
+
+        dest_progress = timeline.line_progress(emit_line, win_ge)
+        line_len = timeline.line_length(emit_line)
+        matched_in_line = max(
+            0, min(win_ge, line_ends[emit_line]) - max(win_gs, line_starts[emit_line])
+        )
+        ratio_for_display = (
+            (2.0 * matched_in_line) / (matched_in_line + line_len)
+            if line_len > 0
+            else win_sim
+        )
+        alignment_info = {
+            "src_start": int(win_qs),
+            "src_end": int(win_qe),
+            "dest_start": int(max(0, win_gs - line_starts[emit_line])),
+            "dest_end": int(max(0, min(win_ge, line_ends[emit_line]) - line_starts[emit_line])),
+            "dest_progress": round(dest_progress, 4),
+            "global_span": [int(win_gs), int(win_ge)],
         }
-        return match_payload, step_trace
+        return self._commit_match_locked(
+            now=now,
+            cleaned_text=cleaned_text,
+            match_recognized=match_recognized,
+            best_index=emit_line,
+            best_score=win_sim,
+            buffer_length=buffer_length,
+            is_recovery=win_recovery,
+            retained_tail=retained_tail,
+            dest_progress=dest_progress,
+            ratio_for_display=ratio_for_display,
+            phase1_threshold=phase1_threshold,
+            alignment_info=alignment_info,
+            build_trace=build_trace,
+            step_trace=step_trace,
+        )
+
+    def _evaluate_locked(
+        self,
+        now: float,
+        cleaned_text: str,
+        canonical_recognized: str,
+        match_recognized: str,
+        asr_payload: dict[str, Any],
+        build_trace: bool,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        if self._alignment_mode == "beam":
+            return self._evaluate_beam_locked(
+                now,
+                cleaned_text,
+                canonical_recognized,
+                match_recognized,
+                asr_payload,
+                build_trace,
+            )
+        return self._evaluate_line_locked(
+            now,
+            cleaned_text,
+            canonical_recognized,
+            match_recognized,
+            asr_payload,
+            build_trace,
+        )
 
     def evaluate_recognized_text(
         self,
@@ -1014,9 +1979,14 @@ class LyricSyncEngine:
             if asr_meta is not None
             else {"text": cleaned_text}
         )
-        normalized_recognized = (
+        canonical_recognized = (
             normalize_match_text(normalize_to_hiragana(cleaned_text))
             if cleaned_text
+            else ""
+        )
+        match_recognized = (
+            self._to_match_key(canonical_recognized)
+            if canonical_recognized
             else ""
         )
 
@@ -1036,7 +2006,11 @@ class LyricSyncEngine:
                 else None
             )
 
-            if not cleaned_text or not normalized_recognized:
+            if (
+                not cleaned_text
+                or not canonical_recognized
+                or not match_recognized
+            ):
                 empty_decision = (
                     "asr_empty_or_filtered"
                     if (not cleaned_text and asr_meta is not None)
@@ -1064,7 +2038,8 @@ class LyricSyncEngine:
             match_payload, step_trace = self._evaluate_locked(
                 now,
                 cleaned_text,
-                normalized_recognized,
+                canonical_recognized,
+                match_recognized,
                 asr_payload,
                 build_trace,
             )

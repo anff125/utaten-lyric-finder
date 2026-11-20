@@ -302,6 +302,7 @@ set "TEMP_PY=%~dp0temp_update.py"
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/__init__.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/matching.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/parser.py',
+>> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/phonology.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/song_cache.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/trace.py',
 >> "%TEMP_PY%" echo     'src/utaten_finder/lyrics/web_scraper.py',

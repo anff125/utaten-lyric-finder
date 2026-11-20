@@ -124,8 +124,8 @@ Enable **Record match trace (`data/traces/*.jsonl`)** in **⚙️ Settings** whi
 # Compare multiple strategies or thresholds on recorded traces
 .\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy baseline:threshold=0.70,recovery=0.55 --diff
 
-# Compare baseline pykakasi normalization, <rt> furigana readings, and RapidFuzz smart sync (tail retention + short-line/repeat guards + adaptive display)
-.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy rt_reading --strategy rt_smart_sync --strategy rt_smart_sync:display_mode=next --diff
+# Compare baseline pykakasi normalization, <rt> furigana readings, Issue #3 smart sync, and Issue #4 phonological/pair/beam strategies
+.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy rt_reading --strategy rt_smart_sync --strategy phono_sync --strategy phono_weighted --strategy pair_sync --strategy phono_pair_sync --strategy beam_align --diff
 ```
 
 ### Build your own portable release package
@@ -152,7 +152,7 @@ After completion, the portable folder and ZIP file will be generated under `buil
 - **Automatic CUDA DLL Resolution & CPU Fallback**: Preloads pip-installed NVIDIA `cublas64_12.dll` / `cudnn` libraries (`cuda_loader.py`) with startup warm-up verification, and seamlessly falls back to CPU (`int8`) mode if GPU initialization or inference fails.
 - **Enhanced Japanese ASR & Sliding-Window Matching**:
   - Supports `kotoba-whisper-v2.0-faster` and `turbo` with polyphase resampling (`scipy.signal.resample_poly`) and sliding-window capture (`asr_worker.py`).
-  - Two-phase RapidFuzz lyric matching (local lookahead + lost-position recovery) with `partial_ratio_alignment` unconsumed tail retention, short-line protection, consecutive repeated-line handling, adaptive highlight timing, Japanese hiragana normalization (`matching.py`), and click-to-jump sync.
+  - Continuous character timeline Top-K Beam alignment with weighted Smith-Waterman local alignment (`matching.py`, `phonology.py`), Japanese singing phonological normalization (particles, yotsugana, long vowels, sokuon, and voiced/unvoiced tolerance), unconsumed tail retention, short-line protection, consecutive repeated-line handling, adaptive highlight timing, and click-to-jump sync (with optional RapidFuzz line-by-line & adjacent-pair mode).
 - **Browserless UtaTen Scraper & Sanitized `<ruby>` Parser**: Fetches and parses UtaTen lyrics directly in Python (`web_scraper.py`, `parser.py`), prioritizing `<rt>` furigana readings (including ateji/gikun) when building normalized sync targets, and caches matches in `song_cache.py`.
 
 ## 📁 Project Structure
@@ -174,7 +174,7 @@ utaten-lyric-finder/
     ├── core/                           # config.py, events.py (EventBus + logging capture), orchestrator.py
     ├── media/                          # spotify_api.py (API + OAuth server), system_media.py (SMTC)
     ├── audio/                          # cuda_loader.py, process_loopback.py, asr_worker.py (ASR + VU meter)
-    ├── lyrics/                         # web_scraper.py, parser.py, matching.py, song_cache.py, trace.py
+    ├── lyrics/                         # web_scraper.py, parser.py, phonology.py, matching.py, song_cache.py, trace.py
     └── ui/                             # webview_app.py (PyWebView controller & JsApi bridge)
 ```
 

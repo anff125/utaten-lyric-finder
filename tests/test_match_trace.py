@@ -534,7 +534,7 @@ class TestEvalMatchingReplay(unittest.TestCase):
                         "--strategy",
                         "baseline",
                         "--strategy",
-                        "baseline:threshold=0.95",
+                        "baseline:threshold=0.98",
                         "--anchor-mode",
                         "eval",
                         "--timeline",
@@ -554,7 +554,7 @@ class TestEvalMatchingReplay(unittest.TestCase):
 
             md_text = md_out.read_text(encoding="utf-8")
             self.assertIn("`baseline`", md_text)
-            self.assertIn("`baseline:threshold=0.95`", md_text)
+            self.assertIn("`baseline:threshold=0.98`", md_text)
 
             json_data = json.loads(json_out.read_text(encoding="utf-8"))
             self.assertEqual(len(json_data["overall"]), 2)
