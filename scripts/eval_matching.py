@@ -93,6 +93,14 @@ _BASELINE_PARAM_CASTERS: dict[str, tuple[str, Any]] = {
     "min_logprob": ("asr_min_avg_logprob", float),
     "max_no_speech": ("asr_max_no_speech_prob", float),
     "max_comp_ratio": ("asr_max_compression_ratio", float),
+    "pos_prior": ("position_prior_enabled", _parse_bool),
+    "pos_tol": ("position_prior_tolerance", float),
+    "pos_weight": ("position_prior_weight", float),
+    "pos_floor": ("position_prior_floor", float),
+    "seek_detect": ("seek_detection_enabled", _parse_bool),
+    "seek_rewind_ms": ("seek_rewind_threshold_ms", int),
+    "seek_forward_ms": ("seek_forward_threshold_ms", int),
+    "seek_radius": ("seek_window_ratio_radius", float),
 }
 
 
@@ -138,6 +146,9 @@ class ReplayStrategy:
 
     def apply_manual_jump(self, line_index: int) -> dict[str, Any] | None:
         raise NotImplementedError
+
+    def update_playback_progress(self, playback: dict[str, Any]) -> None:
+        return None
 
 
 class BaselineStrategy(ReplayStrategy):
@@ -351,6 +362,38 @@ class BaselineStrategy(ReplayStrategy):
                     "asr_max_compression_ratio", matcher_cfg, 1.35
                 )
             ),
+            "position_prior_enabled": bool(
+                self._resolve_param("position_prior_enabled", matcher_cfg, False)
+            ),
+            "position_prior_tolerance": float(
+                self._resolve_param(
+                    "position_prior_tolerance", matcher_cfg, 0.15
+                )
+            ),
+            "position_prior_weight": float(
+                self._resolve_param("position_prior_weight", matcher_cfg, 0.45)
+            ),
+            "position_prior_floor": float(
+                self._resolve_param("position_prior_floor", matcher_cfg, 0.60)
+            ),
+            "seek_detection_enabled": bool(
+                self._resolve_param("seek_detection_enabled", matcher_cfg, False)
+            ),
+            "seek_rewind_threshold_ms": int(
+                self._resolve_param(
+                    "seek_rewind_threshold_ms", matcher_cfg, 3500
+                )
+            ),
+            "seek_forward_threshold_ms": int(
+                self._resolve_param(
+                    "seek_forward_threshold_ms", matcher_cfg, 12000
+                )
+            ),
+            "seek_window_ratio_radius": float(
+                self._resolve_param(
+                    "seek_window_ratio_radius", matcher_cfg, 0.35
+                )
+            ),
             "emit_events": False,
         }
         self._asr_filter_active = bool(engine_kwargs["asr_segment_filter"])
@@ -422,6 +465,22 @@ class BaselineStrategy(ReplayStrategy):
     def apply_manual_jump(self, line_index: int) -> dict[str, Any] | None:
         assert self._engine is not None
         return self._engine.apply_manual_jump(line_index)
+
+    def update_playback_progress(self, playback: dict[str, Any]) -> None:
+        assert self._engine is not None
+        if not playback:
+            return
+        sp_ms = playback.get("spotify_progress_ms")
+        est_ms = playback.get("estimated_progress_ms")
+        dur_ms = playback.get("duration_ms")
+        if sp_ms is None and est_ms is None and dur_ms is None:
+            return
+        self._engine.update_playback_progress(
+            sp_ms,
+            dur_ms,
+            is_playing=bool(playback.get("is_playing", True)),
+            estimated_progress_ms=est_ms,
+        )
 
 
 class RtReadingStrategy(BaselineStrategy):
@@ -548,6 +607,16 @@ class BeamAsrOptStrategy(BeamAlignStrategy):
     }
 
 
+class BeamPosPriorStrategy(BeamAsrOptStrategy):
+    """Preset combining beam_asr_opt with Spotify soft position prior and seek/rewind detection."""
+
+    _DEFAULT_OVERRIDES = {
+        **BeamAsrOptStrategy._DEFAULT_OVERRIDES,
+        "position_prior_enabled": True,
+        "seek_detection_enabled": True,
+    }
+
+
 STRATEGIES: dict[str, type[ReplayStrategy]] = {
     "baseline": BaselineStrategy,
     "rt_reading": RtReadingStrategy,
@@ -559,6 +628,7 @@ STRATEGIES: dict[str, type[ReplayStrategy]] = {
     "phono_pair_sync": PhonoPairSyncStrategy,
     "beam_align": BeamAlignStrategy,
     "beam_asr_opt": BeamAsrOptStrategy,
+    "beam_pos_prior": BeamPosPriorStrategy,
 }
 
 
@@ -692,6 +762,8 @@ def replay_trace(
     parity_matches = 0
     tails_retained = 0
     early_display_holds = 0
+    seek_reanchors = 0
+    rewind_advances = 0
 
     anchor_evals: list[dict[str, Any]] = []
     timeline_rows: list[dict[str, Any]] = []
@@ -718,6 +790,7 @@ def replay_trace(
                 if infer_val > step_budget_ms:
                     infer_over_budget_count += 1
 
+            strategy.update_playback_progress(event.get("playback") or {})
             match_payload, step_trace = strategy.step(raw_text, asr_info)
             decision = str(step_trace.get("decision") or "")
             matched_idx = step_trace.get("matched_index")
@@ -745,6 +818,8 @@ def replay_trace(
                     tails_retained += 1
                 if step_trace.get("early_display_hold"):
                     early_display_holds += 1
+                if step_trace.get("seek_reanchored"):
+                    seek_reanchors += 1
 
                 if prev_matched_index is not None:
                     delta = matched_idx - prev_matched_index
@@ -753,6 +828,8 @@ def replay_trace(
                     elif delta >= 2:
                         jump_advances += 1
                         max_jump = max(max_jump, delta)
+                    elif delta < 0:
+                        rewind_advances += 1
                 prev_matched_index = matched_idx
 
             timeline_rows.append(
@@ -772,6 +849,10 @@ def replay_trace(
                     "display_index": display_idx,
                     "best_score": step_trace.get("best_score"),
                     "threshold": step_trace.get("threshold"),
+                    "seek_detected": step_trace.get("seek_detected"),
+                    "seek_reanchored": bool(
+                        step_trace.get("seek_reanchored", False)
+                    ),
                     "pred_display_index": pred_display_index,
                     "recorded_decision": event.get("decision"),
                     "recorded_matched_index": event.get("matched_index"),
@@ -779,6 +860,7 @@ def replay_trace(
             )
 
         elif ev_type == "manual_jump":
+            strategy.update_playback_progress(event.get("playback") or {})
             to_index = int(event.get("to_index", -1))
             error = (
                 pred_display_index - to_index
@@ -877,6 +959,8 @@ def replay_trace(
         "parity_matches": parity_matches,
         "tails_retained": tails_retained,
         "early_display_holds": early_display_holds,
+        "seek_reanchors": seek_reanchors,
+        "rewind_advances": rewind_advances,
         "_parity_steps": asr_steps if parity_applicable else 0,
         "_parity_matches": parity_matches if parity_applicable else 0,
         "_score_sum": sum(match_scores),
@@ -963,6 +1047,8 @@ def aggregate_summaries(
         "early_display_holds": sum(
             s.get("early_display_holds", 0) for s in summaries
         ),
+        "seek_reanchors": sum(s.get("seek_reanchors", 0) for s in summaries),
+        "rewind_advances": sum(s.get("rewind_advances", 0) for s in summaries),
     }
 
 
@@ -1154,8 +1240,19 @@ def format_timeline(run: dict[str, Any]) -> str:
             )
             dec_str = f"{decision} (best={best})"
 
+        seek_parts: list[str] = []
+        seek_det = item.get("seek_detected")
+        if isinstance(seek_det, dict):
+            seek_parts.append(
+                f"{seek_det.get('type', '?')} "
+                f"{format_ms(seek_det.get('from_ms'))}->{format_ms(seek_det.get('to_ms'))}"
+            )
+        if item.get("seek_reanchored"):
+            seek_parts.append("reanchored")
+        seek_tag = f" [SEEK:{','.join(seek_parts)}]" if seek_parts else ""
+
         lines.append(
-            f"  #{item['seq']:<3} {t_str} [SP {sp_str}] "
+            f"  #{item['seq']:<3} {t_str} [SP {sp_str}]{seek_tag} "
             f"ASR='{item['raw_text']}' | buf='{item['buffer_after_trim']}' | "
             f"{meta_str} | top=[{cand_str}] | {dec_str}"
         )
@@ -1234,8 +1331,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Strategy spec to evaluate (repeatable), e.g. 'baseline', 'rt_reading', "
             "'smart_sync', 'rt_smart_sync', 'phono_sync', 'phono_weighted', "
-            "'pair_sync', 'phono_pair_sync', 'beam_align', 'beam_asr_opt', or "
-            "'beam_asr_opt:min_logprob=-0.75,beam_width=4'. "
+            "'pair_sync', 'phono_pair_sync', 'beam_align', 'beam_asr_opt', "
+            "'beam_pos_prior', or 'beam_pos_prior:pos_weight=0.45,seek_rewind_ms=3500'. "
             "Defaults to 'baseline'."
         ),
     )

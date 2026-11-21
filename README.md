@@ -124,8 +124,8 @@ Enable **Record match trace (`data/traces/*.jsonl`)** in **⚙️ Settings** whi
 # Compare multiple strategies or thresholds on recorded traces
 .\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy baseline:threshold=0.70,recovery=0.55 --diff
 
-# Compare baseline pykakasi normalization, <rt> furigana readings, Issue #3 smart sync, Issue #4 phonological/pair/beam strategies, and Issue #5 ASR confidence filtering
-.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy rt_reading --strategy rt_smart_sync --strategy phono_sync --strategy phono_weighted --strategy pair_sync --strategy phono_pair_sync --strategy beam_align --strategy beam_asr_opt --diff
+# Compare baseline pykakasi normalization, <rt> furigana readings, Issue #3 smart sync, Issue #4 phonological/pair/beam strategies, Issue #5 ASR confidence filtering, and Issue #6 Spotify position prior / seek detection
+.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy rt_reading --strategy rt_smart_sync --strategy phono_sync --strategy phono_weighted --strategy pair_sync --strategy phono_pair_sync --strategy beam_align --strategy beam_asr_opt --strategy beam_pos_prior --diff
 ```
 
 ### Build your own portable release package
@@ -153,6 +153,7 @@ After completion, the portable folder and ZIP file will be generated under `buil
 - **Enhanced Japanese ASR & Sliding-Window Matching**:
   - Supports `kotoba-whisper-v2.0-faster` and `turbo` with polyphase resampling (`scipy.signal.resample_poly`), sliding-window capture (`asr_worker.py`), rolling upcoming-lyric `initial_prompt` hints (`condition_on_previous_text=False`), and segment confidence/interlude hallucination filtering (`avg_logprob`, `no_speech_prob`, `compression_ratio`, repetitive-loop & context-aware filler guards).
   - Continuous character timeline Top-K Beam alignment with weighted Smith-Waterman local alignment (`matching.py`, `phonology.py`), Japanese singing phonological normalization (particles, yotsugana, long vowels, sokuon, and voiced/unvoiced tolerance), unconsumed tail retention, short-line protection, consecutive repeated-line handling, adaptive highlight timing, and click-to-jump sync (with optional RapidFuzz line-by-line & adjacent-pair mode).
+  - When Spotify playback progress (`progress_ms` / `duration_ms`) is available, applies a soft position prior along the character timeline to disambiguate repeated choruses (with generous intro/interlude drift tolerance) and automatically detects manual seeks (rewind / fast-forward) to re-anchor the search window without affecting System Media mode.
 - **Browserless UtaTen Scraper & Sanitized `<ruby>` Parser**: Fetches and parses UtaTen lyrics directly in Python (`web_scraper.py`, `parser.py`), prioritizing `<rt>` furigana readings (including ateji/gikun) when building normalized sync targets, and caches matches in `song_cache.py`.
 
 ## 📁 Project Structure

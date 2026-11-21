@@ -268,10 +268,38 @@ class ContinuousLyricsTimeline:
             line_ends.append(cursor)
 
         self.full_text: str = "".join(parts)
+        self.total_chars: int = len(self.full_text)
         self.line_starts: list[int] = line_starts
         self.line_ends: list[int] = line_ends
         self.char_to_line: list[int] = char_to_line
         self.line_count: int = len(match_keys)
+
+    def char_ratio(self, pos: int | float) -> float:
+        """Return normalized cumulative character ratio [0..1] for global position ``pos``."""
+        if self.total_chars <= 0:
+            return 0.0
+        return min(1.0, max(0.0, float(pos) / self.total_chars))
+
+    def line_center_ratio(self, line_idx: int) -> float:
+        """Return normalized cumulative character midpoint ratio [0..1] for ``line_idx``."""
+        if 0 <= line_idx < self.line_count:
+            if self.total_chars > 0:
+                mid = 0.5 * (self.line_starts[line_idx] + self.line_ends[line_idx])
+                return min(1.0, max(0.0, mid / self.total_chars))
+            return (line_idx + 0.5) / self.line_count
+        return 0.0
+
+    def line_for_ratio(self, ratio: float) -> int:
+        """Map normalized playback ratio [0..1] to the nearest lyric line index."""
+        if self.line_count <= 0:
+            return 0
+        r = min(1.0, max(0.0, float(ratio)))
+        if self.total_chars > 0 and self.char_to_line:
+            char_idx = min(
+                self.total_chars - 1, max(0, int(round(r * self.total_chars)))
+            )
+            return int(self.char_to_line[char_idx])
+        return min(self.line_count - 1, max(0, int(round(r * (self.line_count - 1)))))
 
     def line_length(self, line_idx: int) -> int:
         """Return character length of ``line_idx`` in the continuous timeline."""

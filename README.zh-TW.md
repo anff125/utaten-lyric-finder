@@ -126,8 +126,8 @@ pip install -r requirements.txt
 # 針對錄製好的 Trace 並列比較不同參數或策略，並列出決策分歧點
 .\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy baseline:threshold=0.70,recovery=0.55 --diff
 
-# 比較舊版 pykakasi、UtaTen <rt> 振假名、Issue #3 智慧同步、Issue #4 歌唱音韻／Beam 對齊，以及 Issue #5 ASR 信心與幻覺過濾策略
-.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy rt_reading --strategy rt_smart_sync --strategy phono_sync --strategy phono_weighted --strategy pair_sync --strategy phono_pair_sync --strategy beam_align --strategy beam_asr_opt --diff
+# 比較舊版 pykakasi、UtaTen <rt> 振假名、Issue #3 智慧同步、Issue #4 歌唱音韻／Beam 對齊、Issue #5 ASR 信心過濾，以及 Issue #6 Spotify 位置先驗與倒轉偵測策略
+.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy rt_reading --strategy rt_smart_sync --strategy phono_sync --strategy phono_weighted --strategy pair_sync --strategy phono_pair_sync --strategy beam_align --strategy beam_asr_opt --strategy beam_pos_prior --diff
 ```
 
 ### 自行建立 Release 可攜包
@@ -155,6 +155,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_portable.ps1 -SkipEnvBu
 - **高精準度日文語音辨識與滑動視窗匹配**：
   - 支援 `kotoba-whisper-v2.0-faster` 與 `turbo` 等模型，使用多相濾波重採樣 (`scipy.signal.resample_poly`)、滑動視窗收音 (`asr_worker.py`)、接下來數行歌詞上下文提示 (`initial_prompt` 搭配 `condition_on_previous_text=False`)，以及 segment 信心度與間奏幻覺過濾（`avg_logprob`、`no_speech_prob`、`compression_ratio`、重複迴圈與詞庫感知語氣詞防護）。
   - 內建連續字元時間軸 Top-K Beam 追蹤與清濁音加權 Smith-Waterman 局部對齊 (`matching.py`、`phonology.py`)，整合日文歌唱音韻正規化（助詞、四假名、長音、促音）、未消耗尾端保留、短句誤觸防護、連續重複句智慧去重、自適應高亮時機與點擊歌詞任意行手動跳轉定位（亦支援 RapidFuzz 單行／相鄰跨行拼接模式）。
+  - 當 Spotify 播放進度 (`progress_ms` / `duration_ms`) 可用時，會將進度百分比映射至歌詞字元時間軸作為軟性位置先驗（降低副歌重複段誤跳並保留前奏／間奏寬容區間），並在偵測到手動倒轉／快轉時自動重新錨定搜尋視窗（不影響 System Media 模式）。
 - **無瀏覽器 UtaTen 爬蟲與 `<ruby>` 解析器**：直接由 Python 後端抓取並清洗 UtaTen HTML (`web_scraper.py`、`parser.py`)，優先採用 `<rt>` 振假名讀音（支援義訓／当て字）產生正規化比對目標，並透過本地快取 (`song_cache.py`) 秒開已聽過的歌曲。
 
 ## 📁 專案架構 (Project Structure)

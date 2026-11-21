@@ -478,6 +478,14 @@ class LyricSyncEngine:
         asr_min_avg_logprob: float = -0.80,
         asr_max_no_speech_prob: float = 0.60,
         asr_max_compression_ratio: float = 1.35,
+        position_prior_enabled: bool = True,
+        position_prior_tolerance: float = 0.15,
+        position_prior_weight: float = 0.45,
+        position_prior_floor: float = 0.60,
+        seek_detection_enabled: bool = True,
+        seek_rewind_threshold_ms: int = 3500,
+        seek_forward_threshold_ms: int = 12000,
+        seek_window_ratio_radius: float = 0.35,
         emit_events: bool = True,
     ) -> None:
         if display_mode not in _VALID_DISPLAY_MODES:
@@ -551,15 +559,32 @@ class LyricSyncEngine:
         self._asr_min_avg_logprob = float(asr_min_avg_logprob)
         self._asr_max_no_speech_prob = float(asr_max_no_speech_prob)
         self._asr_max_compression_ratio = float(asr_max_compression_ratio)
+        self._position_prior_enabled = bool(position_prior_enabled)
+        self._position_prior_tolerance = max(0.0, float(position_prior_tolerance))
+        self._position_prior_weight = max(0.0, float(position_prior_weight))
+        self._position_prior_floor = max(0.0, min(1.0, float(position_prior_floor)))
+        self._seek_detection_enabled = bool(seek_detection_enabled)
+        self._seek_rewind_threshold_ms = max(500, int(seek_rewind_threshold_ms))
+        self._seek_forward_threshold_ms = max(1000, int(seek_forward_threshold_ms))
+        self._seek_window_ratio_radius = max(
+            0.05, min(1.0, float(seek_window_ratio_radius))
+        )
         self._lyrics_corpus = ""
         self._track_slug = ""
+        self._track_song_id = ""
         self._emit_events = bool(emit_events)
 
         self._playback_song_id: str | None = None
         self._playback_progress_ms: int | None = None
+        self._playback_estimated_ms_at_poll: int | None = None
         self._playback_duration_ms: int | None = None
         self._playback_polled_at: float | None = None
         self._playback_is_playing = False
+        self._repeated_line_flags: list[bool] = []
+        self._seek_reanchor_active = False
+        self._seek_type = ""
+        self._seek_ref_index = -1
+        self._pending_seek_event: dict[str, Any] | None = None
 
     def _to_match_key(self, normalized: str) -> str:
         if not normalized or not self._phonological_norm:
@@ -638,7 +663,212 @@ class LyricSyncEngine:
             "asr_min_avg_logprob": self._asr_min_avg_logprob,
             "asr_max_no_speech_prob": self._asr_max_no_speech_prob,
             "asr_max_compression_ratio": self._asr_max_compression_ratio,
+            "position_prior_enabled": self._position_prior_enabled,
+            "position_prior_tolerance": self._position_prior_tolerance,
+            "position_prior_weight": self._position_prior_weight,
+            "position_prior_floor": self._position_prior_floor,
+            "seek_detection_enabled": self._seek_detection_enabled,
+            "seek_rewind_threshold_ms": self._seek_rewind_threshold_ms,
+            "seek_forward_threshold_ms": self._seek_forward_threshold_ms,
+            "seek_window_ratio_radius": self._seek_window_ratio_radius,
         }
+
+    def _clear_seek_state_locked(self) -> None:
+        self._seek_reanchor_active = False
+        self._seek_type = ""
+        self._seek_ref_index = -1
+        self._pending_seek_event = None
+
+    @staticmethod
+    def _build_repeated_line_flags(match_keys: list[str]) -> list[bool]:
+        """Flag lyric lines whose text repeats or strongly overlaps another line."""
+        n = len(match_keys)
+        flags = [False] * n
+        for i in range(n):
+            ki = match_keys[i]
+            if len(ki) < 3:
+                continue
+            for j in range(i + 1, n):
+                kj = match_keys[j]
+                if len(kj) < 3:
+                    continue
+                is_dup = ki == kj
+                if not is_dup and len(ki) >= 4 and len(kj) >= 4:
+                    is_dup = (
+                        ki in kj
+                        or kj in ki
+                        or (fuzz.ratio(ki, kj) / 100.0) >= 0.78
+                    )
+                if not is_dup and min(len(ki), len(kj)) >= 6:
+                    is_dup = (fuzz.partial_ratio(ki, kj) / 100.0) >= 0.88
+                if is_dup:
+                    flags[i] = True
+                    flags[j] = True
+        return flags
+
+    def _is_repeated_candidate_locked(
+        self, line_idx: int, matched_span_text: str = ""
+    ) -> bool:
+        if (
+            0 <= line_idx < len(self._repeated_line_flags)
+            and self._repeated_line_flags[line_idx]
+        ):
+            return True
+        return (
+            len(matched_span_text) >= 4
+            and self._timeline.full_text.count(matched_span_text) > 1
+        )
+
+    @staticmethod
+    def _current_playback_ratio_locked(playback: dict[str, Any]) -> float | None:
+        est_ms = playback.get("estimated_progress_ms")
+        if est_ms is None:
+            est_ms = playback.get("spotify_progress_ms")
+        dur_ms = playback.get("duration_ms")
+        if est_ms is None or dur_ms is None:
+            return None
+        try:
+            est_val = float(est_ms)
+            dur_val = float(dur_ms)
+        except (TypeError, ValueError):
+            return None
+        if dur_val <= 0.0:
+            return None
+        return min(1.0, max(0.0, est_val / dur_val))
+
+    def _compute_position_prior_locked(
+        self,
+        line_idx: int,
+        playback_ratio: float | None,
+        *,
+        cand_ratio: float | None = None,
+        is_repeated: bool = False,
+        is_immediate_next: bool = False,
+        in_recovery: bool = False,
+        seek_active: bool = False,
+    ) -> float:
+        """Compute multiplicative soft position prior in [floor, 1.0] from playback ratio."""
+        if not self._position_prior_enabled or playback_ratio is None:
+            return 1.0
+        if not is_repeated and not seek_active:
+            return 1.0
+
+        c_ratio = (
+            cand_ratio
+            if cand_ratio is not None
+            else self._timeline.line_center_ratio(line_idx)
+        )
+        drift = abs(c_ratio - playback_ratio)
+        eff_tol = (
+            max(self._position_prior_tolerance, 0.22)
+            if (is_immediate_next and not seek_active)
+            else self._position_prior_tolerance
+        )
+        tie_slope = 0.08 if seek_active else 0.0
+        if drift <= eff_tol:
+            return max(self._position_prior_floor, 1.0 - tie_slope * drift)
+
+        excess = drift - eff_tol
+        base_weight = (
+            self._position_prior_weight
+            if is_repeated
+            else (self._position_prior_weight * 0.35)
+        )
+        if is_repeated and (in_recovery or seek_active or not is_immediate_next):
+            base_weight = max(base_weight, self._position_prior_weight * 1.2)
+        return max(
+            self._position_prior_floor,
+            1.0 - (tie_slope * eff_tol) - base_weight * excess,
+        )
+
+    def _compute_seek_window_locked(
+        self, playback_ratio: float | None, seek_type: str, ref_index: int
+    ) -> tuple[int, int]:
+        n_lines = len(self._lyrics)
+        if n_lines <= 0:
+            return (0, 0)
+        if playback_ratio is None:
+            return (0, n_lines - 1)
+
+        est_line = self._timeline.line_for_ratio(playback_ratio)
+        low_r = max(0.0, playback_ratio - self._seek_window_ratio_radius)
+        high_r = min(1.0, playback_ratio + self._seek_window_ratio_radius)
+        start_line = min(
+            self._timeline.line_for_ratio(low_r), max(0, est_line - 12)
+        )
+        end_line = max(
+            self._timeline.line_for_ratio(high_r), min(n_lines - 1, est_line + 12)
+        )
+        if seek_type == "rewind":
+            if playback_ratio <= 0.25:
+                start_line = 0
+            if ref_index >= 0:
+                start_line = min(start_line, ref_index)
+        elif seek_type == "fast_forward" and ref_index >= 0:
+            start_line = max(start_line, min(n_lines - 1, ref_index + 1))
+            end_line = max(end_line, start_line)
+
+        start_line = max(0, min(n_lines - 1, start_line))
+        end_line = max(start_line, min(n_lines - 1, end_line))
+        return (start_line, end_line)
+
+    def _apply_playback_seek_locked(
+        self,
+        now: float,
+        seek_type: str,
+        *,
+        from_ms: int,
+        to_ms: int,
+        duration_ms: int,
+    ) -> dict[str, Any]:
+        ratio = (
+            min(1.0, max(0.0, float(to_ms) / float(duration_ms)))
+            if duration_ms > 0
+            else 0.0
+        )
+        from_index = (
+            self._current_index
+            if not self._seek_reanchor_active
+            else self._seek_ref_index
+        )
+        seek_start, seek_end = self._compute_seek_window_locked(
+            ratio, seek_type, from_index
+        )
+        self._agent.reset()
+        self._last_success_normalized = ""
+        self._last_success_match_key = ""
+        self._last_success_recognized = ""
+        self._last_success_at = None
+        self._buffer_start_at = None
+        self._beam_buffer_at = None
+
+        self._seek_reanchor_active = True
+        self._seek_type = seek_type
+        self._seek_ref_index = from_index
+        self._current_index = seek_start - 1
+        start_pos = (
+            self._timeline.line_starts[seek_start]
+            if 0 <= seek_start < self._timeline.line_count
+            else 0
+        )
+        self._beam = [
+            _BeamHypothesis(
+                pos=start_pos,
+                score=0.0,
+                last_adv_time=now,
+                last_line=self._current_index,
+            )
+        ]
+        seek_info: dict[str, Any] = {
+            "type": seek_type,
+            "from_ms": int(from_ms),
+            "to_ms": int(to_ms),
+            "from_index": int(from_index),
+            "estimated_line": self._timeline.line_for_ratio(ratio),
+            "window": [seek_start, seek_end],
+        }
+        self._pending_seek_event = seek_info
+        return dict(seek_info)
 
     def update_playback_progress(
         self,
@@ -647,30 +877,127 @@ class LyricSyncEngine:
         *,
         song_id: str | None = None,
         is_playing: bool = True,
-    ) -> None:
-        """Store latest playback progress snapshot (e.g., from Spotify Web API)."""
+        estimated_progress_ms: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Store latest playback progress snapshot and detect manual seek/rewind."""
         with self._lock:
+            now = self._clock()
+            new_sp = int(progress_ms) if progress_ms is not None else None
+            new_dur = int(duration_ms) if duration_ms is not None else None
+            new_est = (
+                int(estimated_progress_ms)
+                if estimated_progress_ms is not None
+                else new_sp
+            )
+            seek_event: dict[str, Any] | None = None
+
+            same_duration = (
+                new_dur is not None
+                and self._playback_duration_ms is not None
+                and new_dur > 0
+                and new_dur == self._playback_duration_ms
+            )
+            same_song = not (
+                song_id and self._track_song_id and song_id != self._track_song_id
+            ) and not (
+                song_id
+                and self._playback_song_id
+                and song_id != self._playback_song_id
+            )
+            if (
+                self._seek_detection_enabled
+                and self._lyrics
+                and same_duration
+                and same_song
+            ):
+                prev_sp = self._playback_progress_ms
+                prev_base = (
+                    self._playback_estimated_ms_at_poll
+                    if self._playback_estimated_ms_at_poll is not None
+                    else prev_sp
+                )
+                dt_ms = (
+                    max(0.0, now - self._playback_polled_at) * 1000.0
+                    if (
+                        self._playback_polled_at is not None
+                        and self._playback_is_playing
+                    )
+                    else 0.0
+                )
+                expected_est = (prev_base + dt_ms) if prev_base is not None else None
+
+                seek_type = ""
+                if (
+                    (
+                        new_sp is not None
+                        and prev_sp is not None
+                        and (prev_sp - new_sp) >= self._seek_rewind_threshold_ms
+                    )
+                    or (
+                        new_est is not None
+                        and prev_base is not None
+                        and (prev_base - new_est) >= self._seek_rewind_threshold_ms
+                    )
+                    or (
+                        new_est is not None
+                        and expected_est is not None
+                        and prev_base is not None
+                        and new_est < (prev_base - 1500)
+                        and (expected_est - new_est)
+                        >= max(self._seek_rewind_threshold_ms, 5000)
+                    )
+                ):
+                    seek_type = "rewind"
+                elif (
+                    new_est is not None
+                    and expected_est is not None
+                    and (new_est - expected_est) >= self._seek_forward_threshold_ms
+                ):
+                    seek_type = "fast_forward"
+
+                if seek_type:
+                    from_ms = int(
+                        prev_base
+                        if prev_base is not None
+                        else (prev_sp if prev_sp is not None else 0)
+                    )
+                    to_ms = int(
+                        new_est
+                        if new_est is not None
+                        else (new_sp if new_sp is not None else 0)
+                    )
+                    seek_event = self._apply_playback_seek_locked(
+                        now,
+                        seek_type,
+                        from_ms=from_ms,
+                        to_ms=to_ms,
+                        duration_ms=int(new_dur),
+                    )
+
             self._playback_song_id = song_id
-            self._playback_progress_ms = (
-                int(progress_ms) if progress_ms is not None else None
-            )
-            self._playback_duration_ms = (
-                int(duration_ms) if duration_ms is not None else None
-            )
-            self._playback_polled_at = self._clock()
+            self._playback_progress_ms = new_sp
+            self._playback_estimated_ms_at_poll = new_est
+            self._playback_duration_ms = new_dur
+            self._playback_polled_at = now
             self._playback_is_playing = bool(is_playing)
+            return seek_event
 
     def _snapshot_playback_progress_locked(self, now: float) -> dict[str, Any]:
         spotify_ms = self._playback_progress_ms
         duration_ms = self._playback_duration_ms
-        estimated_ms = spotify_ms
+        base_ms = (
+            self._playback_estimated_ms_at_poll
+            if self._playback_estimated_ms_at_poll is not None
+            else spotify_ms
+        )
+        estimated_ms = base_ms
         if (
-            spotify_ms is not None
+            base_ms is not None
             and self._playback_is_playing
             and self._playback_polled_at is not None
         ):
             elapsed_ms = max(0.0, now - self._playback_polled_at) * 1000.0
-            estimated_ms = int(spotify_ms + elapsed_ms)
+            estimated_ms = int(base_ms + elapsed_ms)
             if duration_ms is not None and duration_ms >= 0:
                 estimated_ms = min(duration_ms, estimated_ms)
         return {
@@ -745,6 +1072,7 @@ class LyricSyncEngine:
         """Restore mid-song synchronization state (e.g. from a lazy-opened trace)."""
         with self._lock:
             now = self._clock()
+            self._clear_seek_state_locked()
             idx = int(current_index)
             if idx < -1:
                 idx = -1
@@ -839,6 +1167,10 @@ class LyricSyncEngine:
                 for line in self._lyrics
             ]
             self._timeline = ContinuousLyricsTimeline(self._match_keys)
+            self._repeated_line_flags = self._build_repeated_line_flags(
+                self._match_keys
+            )
+            self._clear_seek_state_locked()
             self._current_index = -1
             self._pending_scroll_targets = []
             self._pending_highlight_index = -1
@@ -888,6 +1220,7 @@ class LyricSyncEngine:
                 self._track_slug = ""
 
             new_song_id = (track_meta or {}).get("song_id")
+            self._track_song_id = str(new_song_id or "") if self._lyrics else ""
             if not self._lyrics or (
                 new_song_id
                 and self._playback_song_id
@@ -895,6 +1228,7 @@ class LyricSyncEngine:
             ):
                 self._playback_song_id = new_song_id if self._lyrics else None
                 self._playback_progress_ms = None
+                self._playback_estimated_ms_at_poll = None
                 self._playback_duration_ms = None
                 self._playback_polled_at = None
                 self._playback_is_playing = False
@@ -961,6 +1295,11 @@ class LyricSyncEngine:
             return ""
 
         start_idx = max(0, self._current_index + 1)
+        if self._seek_reanchor_active:
+            playback = self._snapshot_playback_progress_locked(self._clock())
+            ratio = self._current_playback_ratio_locked(playback)
+            if ratio is not None:
+                start_idx = max(0, self._timeline.line_for_ratio(ratio) - 1)
         if start_idx >= len(self._lyrics):
             return ""
 
@@ -1018,6 +1357,7 @@ class LyricSyncEngine:
             playback = self._snapshot_playback_progress_locked(now)
 
             self._current_index = lyric_index
+            self._clear_seek_state_locked()
             self._pending_scroll_targets = []
             self._pending_highlight_index = lyric_index
             self._agent.reset()
@@ -1123,6 +1463,8 @@ class LyricSyncEngine:
             "retained_tail": "",
             "early_display_hold": False,
             "alignment": None,
+            "seek_detected": None,
+            "seek_reanchored": False,
             "current_index_after": current_index,
         }
 
@@ -1264,9 +1606,12 @@ class LyricSyncEngine:
         phase1_threshold: float,
         build_trace: bool,
         candidates: list[dict[str, Any]],
+        *,
+        playback_ratio: float | None = None,
+        seek_active: bool = False,
     ) -> tuple[int, float, float, int, float, dict[str, Any]] | None:
         pair_ranges: list[tuple[int, int, bool]] = []
-        if self._current_index >= 0 and start_index < len(self._lyrics):
+        if not seek_active and self._current_index >= 0 and start_index < len(self._lyrics):
             pair_ranges.append((self._current_index, start_index, True))
         for idx in range(
             start_index, min(end_index_phase1, len(self._lyrics) - 2) + 1
@@ -1309,7 +1654,27 @@ class LyricSyncEngine:
                 if cov2 < l2:
                     allowed = False
 
-            score = float(details["final_score"])
+            raw_score = float(details["final_score"])
+            is_repeated = self._is_repeated_candidate_locked(
+                i1
+            ) or self._is_repeated_candidate_locked(i2)
+            cand_ratio = (
+                self._timeline.char_ratio(
+                    0.5 * (self._timeline.line_starts[i1] + self._timeline.line_ends[i2])
+                )
+                if self._timeline.total_chars > 0
+                else None
+            )
+            prior_factor = self._compute_position_prior_locked(
+                i2,
+                playback_ratio,
+                cand_ratio=cand_ratio,
+                is_repeated=is_repeated,
+                is_immediate_next=(i1 == start_index or i2 == start_index),
+                in_recovery=False,
+                seek_active=seek_active,
+            )
+            score = raw_score * prior_factor
             if build_trace:
                 candidates.append(
                     {
@@ -1327,6 +1692,8 @@ class LyricSyncEngine:
                         ),
                         "partial_score": round(details["partial_score"], 4),
                         "ratio_score": round(details["ratio_score"], 4),
+                        "raw_sim": round(raw_score, 4),
+                        "position_prior": round(prior_factor, 4),
                         "score": round(score, 4),
                         "effective_threshold": round(eff_pair_th, 4),
                         "allowed": allowed,
@@ -1383,6 +1750,10 @@ class LyricSyncEngine:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         target_original = self._lyrics[best_index]["original"]
         target_normalized = self._lyrics[best_index]["normalized"]
+        seek_reanchored = bool(self._seek_reanchor_active)
+        self._seek_reanchor_active = False
+        self._seek_type = ""
+        self._seek_ref_index = -1
 
         is_early_prefix_match = (
             not is_recovery
@@ -1421,6 +1792,7 @@ class LyricSyncEngine:
             step_trace["retained_tail"] = retained_tail
             step_trace["early_display_hold"] = early_display_hold
             step_trace["alignment"] = alignment_info
+            step_trace["seek_reanchored"] = seek_reanchored
             step_trace["current_index_after"] = self._current_index
 
         match_payload = {
@@ -1434,8 +1806,55 @@ class LyricSyncEngine:
             "is_recovery": is_recovery,
             "retained_tail": retained_tail,
             "early_display_hold": early_display_hold,
+            "seek_reanchored": seek_reanchored,
         }
         return match_payload, step_trace
+
+    def _prepare_eval_context_locked(
+        self, now: float, build_trace: bool
+    ) -> tuple[dict[str, Any], float | None, dict[str, Any] | None]:
+        need_playback = bool(
+            build_trace
+            or self._position_prior_enabled
+            or self._seek_detection_enabled
+            or self._seek_reanchor_active
+        )
+        playback = (
+            self._snapshot_playback_progress_locked(now) if need_playback else {}
+        )
+        playback_ratio = (
+            self._current_playback_ratio_locked(playback)
+            if (self._position_prior_enabled or self._seek_reanchor_active)
+            else None
+        )
+        seek_event = self._pending_seek_event
+        self._pending_seek_event = None
+        return playback, playback_ratio, seek_event
+
+    def _refresh_seek_window_locked(
+        self, now: float, playback_ratio: float | None, *, reset_beam: bool
+    ) -> tuple[int, int] | None:
+        if not self._seek_reanchor_active or not self._lyrics:
+            return None
+        seek_start, seek_end = self._compute_seek_window_locked(
+            playback_ratio, self._seek_type, self._seek_ref_index
+        )
+        self._current_index = seek_start - 1
+        if reset_beam:
+            start_pos = (
+                self._timeline.line_starts[seek_start]
+                if 0 <= seek_start < self._timeline.line_count
+                else 0
+            )
+            self._beam = [
+                _BeamHypothesis(
+                    pos=start_pos,
+                    score=0.0,
+                    last_adv_time=now,
+                    last_line=self._current_index,
+                )
+            ]
+        return (seek_start, seek_end)
 
     def _evaluate_line_locked(
         self,
@@ -1446,8 +1865,8 @@ class LyricSyncEngine:
         asr_payload: dict[str, Any],
         build_trace: bool,
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-        playback = (
-            self._snapshot_playback_progress_locked(now) if build_trace else {}
+        playback, playback_ratio, seek_event = self._prepare_eval_context_locked(
+            now, build_trace
         )
         cur_idx_before = self._current_index
         buffer_before = self._agent.asr_buffer
@@ -1458,7 +1877,7 @@ class LyricSyncEngine:
         ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
             if not build_trace:
                 return None, {}
-            return None, self._make_step_trace(
+            tr = self._make_step_trace(
                 playback,
                 asr_payload,
                 canonical_recognized,
@@ -1467,13 +1886,22 @@ class LyricSyncEngine:
                 elapsed_before,
                 decision=decision,
             )
+            if seek_event is not None:
+                tr["seek_detected"] = seek_event
+            return None, tr
 
         if not self._lyrics:
             return _empty_result("ignored_no_lyrics")
 
-        start_index = self._current_index + 1
+        seek_bounds = self._refresh_seek_window_locked(
+            now, playback_ratio, reset_beam=False
+        )
+        seek_active = seek_bounds is not None
+        start_index = (
+            seek_bounds[0] if seek_bounds is not None else (self._current_index + 1)
+        )
         duplicate_ttl = self._effective_duplicate_ttl()
-        if self._is_duplicate_locked(
+        if not seek_active and self._is_duplicate_locked(
             now, match_recognized, start_index, duplicate_ttl
         ):
             return _empty_result("skipped_duplicate_ttl")
@@ -1486,7 +1914,16 @@ class LyricSyncEngine:
 
         self._agent.append(match_recognized)
         buffer_after_append = self._agent.asr_buffer
-        target_length = len(self._match_keys[start_index])
+        if seek_active and seek_bounds is not None:
+            target_length = max(
+                [
+                    len(self._match_keys[i])
+                    for i in range(seek_bounds[0], seek_bounds[1] + 1)
+                ]
+                or [len(self._match_keys[start_index])]
+            )
+        else:
+            target_length = len(self._match_keys[start_index])
         trimmed = self._agent.trim_if_needed(target_length)
         buffer_after_trim = self._agent.asr_buffer
 
@@ -1496,19 +1933,22 @@ class LyricSyncEngine:
         recovery_lookahead = self._effective_recovery_lookahead_lines()
         recovery_threshold = self._effective_recovery_threshold()
 
-        phase1_lookahead_lines = max(
-            1,
-            min(
-                max_lookahead,
-                int(elapsed_since_success / self._lookahead_seconds_per_line),
-            ),
-        )
-
-        # 階段一：常規推進 (時間越久，搜尋範圍越大)
-        end_index_phase1 = min(
-            start_index + phase1_lookahead_lines,
-            len(self._lyrics) - 1,
-        )
+        if seek_active and seek_bounds is not None:
+            phase1_lookahead_lines = max(1, seek_bounds[1] - seek_bounds[0] + 1)
+            end_index_phase1 = seek_bounds[1]
+        else:
+            phase1_lookahead_lines = max(
+                1,
+                min(
+                    max_lookahead,
+                    int(elapsed_since_success / self._lookahead_seconds_per_line),
+                ),
+            )
+            # 階段一：常規推進 (時間越久，搜尋範圍越大)
+            end_index_phase1 = min(
+                start_index + phase1_lookahead_lines,
+                len(self._lyrics) - 1,
+            )
         best_index: int | None = None
         best_score = 0.0
         best_details: dict[str, Any] | None = None
@@ -1524,13 +1964,23 @@ class LyricSyncEngine:
         for idx in range(start_index, end_index_phase1 + 1):
             target_key = self._match_keys[idx]
             details = self._score_line_detailed(buffer_after_trim, target_key)
-            score = float(details["final_score"])
+            raw_score = float(details["final_score"])
+            is_repeated = self._is_repeated_candidate_locked(idx, target_key)
+            prior_factor = self._compute_position_prior_locked(
+                idx,
+                playback_ratio,
+                is_repeated=is_repeated,
+                is_immediate_next=(idx == start_index),
+                in_recovery=False,
+                seek_active=seek_active,
+            )
+            score = raw_score * prior_factor
             eff_threshold, allowed = self._effective_phase1_threshold(
                 target_key,
                 phase1_threshold,
                 buffer_after_trim,
                 details,
-                is_immediate_next=(idx == start_index),
+                is_immediate_next=(not seek_active and idx == start_index),
             )
             if build_trace:
                 candidates.append(
@@ -1544,6 +1994,8 @@ class LyricSyncEngine:
                         ),
                         "partial_score": round(details["partial_score"], 4),
                         "ratio_score": round(details["ratio_score"], 4),
+                        "raw_sim": round(raw_score, 4),
+                        "position_prior": round(prior_factor, 4),
                         "score": round(score, 4),
                         "effective_threshold": round(eff_threshold, 4),
                         "allowed": allowed,
@@ -1579,6 +2031,8 @@ class LyricSyncEngine:
                 phase1_threshold,
                 build_trace,
                 candidates,
+                playback_ratio=playback_ratio,
+                seek_active=seek_active,
             )
             if pair_win is not None:
                 (
@@ -1595,7 +2049,8 @@ class LyricSyncEngine:
         is_recovery = False
         phase2_range: list[int] | None = None
         if (
-            best_passed_index is None
+            not seek_active
+            and best_passed_index is None
             and phase1_lookahead_lines >= max_lookahead
         ):
             start_index_phase2 = end_index_phase1 + 1
@@ -1608,9 +2063,21 @@ class LyricSyncEngine:
                 phase2_range = [start_index_phase2, end_index_phase2]
                 for idx in range(start_index_phase2, end_index_phase2 + 1):
                     target_key = self._match_keys[idx]
-                    score = self._score_line_ratio(
+                    raw_score = self._score_line_ratio(
                         buffer_after_trim, target_key
                     )
+                    is_repeated = self._is_repeated_candidate_locked(
+                        idx, target_key
+                    )
+                    prior_factor = self._compute_position_prior_locked(
+                        idx,
+                        playback_ratio,
+                        is_repeated=is_repeated,
+                        is_immediate_next=False,
+                        in_recovery=True,
+                        seek_active=False,
+                    )
+                    score = raw_score * prior_factor
                     req_threshold = (
                         max(
                             recovery_threshold,
@@ -1630,7 +2097,9 @@ class LyricSyncEngine:
                                 "target_normalized": self._lyrics[idx][
                                     "normalized"
                                 ],
-                                "ratio_score": round(score, 4),
+                                "ratio_score": round(raw_score, 4),
+                                "raw_sim": round(raw_score, 4),
+                                "position_prior": round(prior_factor, 4),
                                 "score": round(score, 4),
                                 "effective_threshold": round(req_threshold, 4),
                             }
@@ -1669,6 +2138,8 @@ class LyricSyncEngine:
                 round(best_score, 4) if best_index is not None else None
             )
             step_trace["is_recovery"] = is_recovery
+            if seek_event is not None:
+                step_trace["seek_detected"] = seek_event
 
         if best_index is None or best_score < threshold_to_pass:
             if build_trace:
@@ -1738,8 +2209,8 @@ class LyricSyncEngine:
         asr_payload: dict[str, Any],
         build_trace: bool,
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-        playback = (
-            self._snapshot_playback_progress_locked(now) if build_trace else {}
+        playback, playback_ratio, seek_event = self._prepare_eval_context_locked(
+            now, build_trace
         )
         cur_idx_before = self._current_index
         buffer_before = self._agent.asr_buffer
@@ -1750,7 +2221,7 @@ class LyricSyncEngine:
         ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
             if not build_trace:
                 return None, {}
-            return None, self._make_step_trace(
+            tr = self._make_step_trace(
                 playback,
                 asr_payload,
                 canonical_recognized,
@@ -1759,13 +2230,22 @@ class LyricSyncEngine:
                 elapsed_before,
                 decision=decision,
             )
+            if seek_event is not None:
+                tr["seek_detected"] = seek_event
+            return None, tr
 
         if not self._lyrics:
             return _empty_result("ignored_no_lyrics")
 
-        start_index = self._current_index + 1
+        seek_bounds = self._refresh_seek_window_locked(
+            now, playback_ratio, reset_beam=True
+        )
+        seek_active = seek_bounds is not None
+        start_index = (
+            seek_bounds[0] if seek_bounds is not None else (self._current_index + 1)
+        )
         duplicate_ttl = self._effective_duplicate_ttl()
-        if self._is_duplicate_locked(
+        if not seek_active and self._is_duplicate_locked(
             now, match_recognized, start_index, duplicate_ttl
         ):
             return _empty_result("skipped_duplicate_ttl")
@@ -1813,20 +2293,29 @@ class LyricSyncEngine:
         recovery_lookahead = self._effective_recovery_lookahead_lines()
         recovery_threshold = self._effective_recovery_threshold()
 
-        phase1_lookahead_lines = max(
-            1,
-            min(
-                max_lookahead,
-                int(elapsed_since_success / self._lookahead_seconds_per_line),
-            ),
-        )
-        end_index_phase1 = min(start_index + phase1_lookahead_lines, n_lines - 1)
-        phase2_range: list[int] | None = None
-        if phase1_lookahead_lines >= max_lookahead:
-            p2_start = end_index_phase1 + 1
-            p2_end = min(self._current_index + recovery_lookahead, n_lines - 1)
-            if p2_start <= p2_end:
-                phase2_range = [p2_start, p2_end]
+        if seek_active and seek_bounds is not None:
+            phase1_lookahead_lines = max(1, seek_bounds[1] - seek_bounds[0] + 1)
+            end_index_phase1 = seek_bounds[1]
+            phase2_range: list[int] | None = None
+        else:
+            phase1_lookahead_lines = max(
+                1,
+                min(
+                    max_lookahead,
+                    int(elapsed_since_success / self._lookahead_seconds_per_line),
+                ),
+            )
+            end_index_phase1 = min(
+                start_index + phase1_lookahead_lines, n_lines - 1
+            )
+            phase2_range = None
+            if phase1_lookahead_lines >= max_lookahead:
+                p2_start = end_index_phase1 + 1
+                p2_end = min(
+                    self._current_index + recovery_lookahead, n_lines - 1
+                )
+                if p2_start <= p2_end:
+                    phase2_range = [p2_start, p2_end]
 
         timeline = self._timeline
         full_text = timeline.full_text
@@ -1845,37 +2334,46 @@ class LyricSyncEngine:
 
         for h in self._beam:
             h_line = h.last_line
-            ref_t = (
-                h.last_adv_time
-                if h.last_adv_time is not None
-                else self._buffer_start_at
-            )
-            dt = max(0.0, now - ref_t) if ref_t is not None else 0.0
-            h_p1_la = max(
-                1, min(max_lookahead, int(dt / self._lookahead_seconds_per_line))
-            )
-            if h_line < 0:
-                max_p1_line = min(n_lines - 1, h_p1_la)
-                max_target_line = (
-                    min(n_lines - 1, recovery_lookahead - 1)
-                    if h_p1_la >= max_lookahead
-                    else max_p1_line
-                )
+            if seek_active and seek_bounds is not None:
+                first_target_line = seek_bounds[0]
+                max_p1_line = seek_bounds[1]
+                max_target_line = seek_bounds[1]
+                win_start = line_starts[seek_bounds[0]] if n_lines > 0 else 0
+                win_end = line_ends[seek_bounds[1]] if n_lines > 0 else 0
             else:
-                max_p1_line = min(n_lines - 1, h_line + 1 + h_p1_la)
-                max_target_line = (
-                    min(n_lines - 1, h_line + recovery_lookahead)
-                    if h_p1_la >= max_lookahead
-                    else max_p1_line
+                ref_t = (
+                    h.last_adv_time
+                    if h.last_adv_time is not None
+                    else self._buffer_start_at
                 )
+                dt = max(0.0, now - ref_t) if ref_t is not None else 0.0
+                h_p1_la = max(
+                    1,
+                    min(max_lookahead, int(dt / self._lookahead_seconds_per_line)),
+                )
+                if h_line < 0:
+                    max_p1_line = min(n_lines - 1, h_p1_la)
+                    max_target_line = (
+                        min(n_lines - 1, recovery_lookahead - 1)
+                        if h_p1_la >= max_lookahead
+                        else max_p1_line
+                    )
+                else:
+                    max_p1_line = min(n_lines - 1, h_line + 1 + h_p1_la)
+                    max_target_line = (
+                        min(n_lines - 1, h_line + recovery_lookahead)
+                        if h_p1_la >= max_lookahead
+                        else max_p1_line
+                    )
 
-            win_start = max(0, h.pos - self._beam_back_slack)
-            win_end = line_ends[max_target_line] if n_lines > 0 else 0
+                win_start = max(0, h.pos - self._beam_back_slack)
+                win_end = line_ends[max_target_line] if n_lines > 0 else 0
+                first_target_line = max(0, h_line + 1)
+
             if win_end <= win_start:
                 continue
             window = full_text[win_start:win_end]
 
-            first_target_line = max(0, h_line + 1)
             min_len_in_win = min(
                 (
                     timeline.line_length(li)
@@ -1892,6 +2390,9 @@ class LyricSyncEngine:
                 )
                 else 6.0
             )
+            peaks_top_k = (
+                12 if (seek_active or max_target_line > max_p1_line) else 6
+            )
 
             best_echo_raw = 0.0
             adv_cands: list[tuple[Any, ...]] = []
@@ -1904,7 +2405,7 @@ class LyricSyncEngine:
                     window,
                     dakuten_score=self._beam_dakuten_score,
                     min_raw_score=min_raw_score,
-                    top_k=5,
+                    top_k=peaks_top_k,
                 )
                 for peak in peaks:
                     g_s = win_start + peak.ref_start
@@ -1955,12 +2456,20 @@ class LyricSyncEngine:
                             if line_len <= 2 and len(q_text) > line_len + 2:
                                 allowed = False
                             elif (
-                                end_line > first_target_line
+                                not seek_active
+                                and end_line > first_target_line
                                 and (len(q_text) - peak.q_end > 2)
                             ):
                                 allowed = False
                         elif matched_r_len <= 5:
                             eff_req_sim = max(eff_req_sim, 0.85)
+                            if (
+                                not seek_active
+                                and start_line > first_target_line
+                                and (len(q_text) - peak.q_end > 2)
+                                and (matched_r_len / max(1, line_len) < 0.35)
+                            ):
+                                allowed = False
                         if (
                             matched_q_len < 6
                             and len(q_text) >= 14
@@ -1975,6 +2484,20 @@ class LyricSyncEngine:
                         6 if self._short_line_guard else 4
                     ):
                         allowed = False
+
+                    is_repeated = self._is_repeated_candidate_locked(
+                        end_line, full_text[g_s:g_e]
+                    )
+                    prior_factor = self._compute_position_prior_locked(
+                        end_line,
+                        playback_ratio,
+                        cand_ratio=timeline.char_ratio(0.5 * (g_s + g_e)),
+                        is_repeated=is_repeated,
+                        is_immediate_next=(end_line <= first_target_line),
+                        in_recovery=in_recovery,
+                        seek_active=seek_active,
+                    )
+                    weighted_sim = peak.local_sim * prior_factor
 
                     if build_trace:
                         cand_key = (end_line, 2 if in_recovery else 1, is_fresh_q)
@@ -1992,7 +2515,9 @@ class LyricSyncEngine:
                                         timeline.line_progress(end_line, g_e), 4
                                     ),
                                     "raw_score": round(peak.raw_score, 4),
-                                    "score": round(peak.local_sim, 4),
+                                    "raw_sim": round(peak.local_sim, 4),
+                                    "position_prior": round(prior_factor, 4),
+                                    "score": round(weighted_sim, 4),
                                     "effective_threshold": round(
                                         eff_req_sim, 4
                                     ),
@@ -2003,13 +2528,14 @@ class LyricSyncEngine:
                             )
 
                     if allowed:
-                        if best_seen_sim is None or peak.local_sim > best_seen_sim:
-                            best_seen_sim = peak.local_sim
-                        if peak.local_sim >= eff_req_sim:
+                        if best_seen_sim is None or weighted_sim > best_seen_sim:
+                            best_seen_sim = weighted_sim
+                        if weighted_sim >= eff_req_sim:
                             adv_cands.append(
                                 (
                                     peak.raw_score,
-                                    peak.local_sim,
+                                    weighted_sim,
+                                    prior_factor,
                                     peak.q_start,
                                     peak.q_end,
                                     g_s,
@@ -2039,6 +2565,7 @@ class LyricSyncEngine:
             for (
                 raw_sc,
                 local_sim,
+                prior_factor,
                 qs,
                 qe,
                 g_s,
@@ -2051,20 +2578,28 @@ class LyricSyncEngine:
                 eff_req_sim,
                 is_exact_short,
             ) in adv_cands:
-                gap = g_s - h.pos
-                line_skip = max(0, start_line - (h_line + 1))
-                if in_recovery:
-                    trans = -self._beam_recovery_penalty
-                elif -self._beam_back_slack <= gap <= 8 and line_skip == 0:
-                    trans = self._beam_forward_bonus
-                elif gap > 8 or line_skip > 0:
-                    trans = -min(
-                        self._beam_max_jump_penalty,
-                        self._beam_jump_penalty_per_char * max(0, gap - 6)
-                        + self._beam_jump_penalty_per_line * line_skip,
+                if seek_active:
+                    trans = (
+                        self._beam_forward_bonus * prior_factor
+                        - self._beam_max_jump_penalty * (1.0 - prior_factor)
                     )
                 else:
-                    trans = -1.5
+                    gap = g_s - h.pos
+                    line_skip = max(0, start_line - (h_line + 1))
+                    if in_recovery:
+                        trans = -self._beam_recovery_penalty
+                    elif -self._beam_back_slack <= gap <= 8 and line_skip == 0:
+                        trans = self._beam_forward_bonus
+                    elif gap > 8 or line_skip > 0:
+                        trans = -min(
+                            self._beam_max_jump_penalty,
+                            self._beam_jump_penalty_per_char * max(0, gap - 6)
+                            + self._beam_jump_penalty_per_line * line_skip,
+                        )
+                    else:
+                        trans = -1.5
+                    if prior_factor < 1.0:
+                        trans -= self._beam_max_jump_penalty * (1.0 - prior_factor)
 
                 step_gain = raw_sc * local_sim + trans
                 min_gain = 3.0 if is_exact_short else 5.0
@@ -2206,6 +2741,8 @@ class LyricSyncEngine:
                 round(win_sim, 4) if win_sim is not None else None
             )
             step_trace["is_recovery"] = win_recovery
+            if seek_event is not None:
+                step_trace["seek_detected"] = seek_event
 
         if not matched_emit or win_sim is None:
             if build_trace:
@@ -2373,6 +2910,8 @@ class LyricSyncEngine:
                     if (not cleaned_text and asr_meta is not None)
                     else "ignored_empty"
                 )
+                seek_event = self._pending_seek_event
+                self._pending_seek_event = None
                 if build_trace:
                     step_trace = self._make_step_trace(
                         self._snapshot_playback_progress_locked(now),
@@ -2383,6 +2922,8 @@ class LyricSyncEngine:
                         self._elapsed_since_success_locked(now),
                         decision=empty_decision,
                     )
+                    if seek_event is not None:
+                        step_trace["seek_detected"] = seek_event
                 if should_record and asr_meta is not None:
                     assert self._trace_recorder is not None
                     self._trace_recorder.record_asr_step(
