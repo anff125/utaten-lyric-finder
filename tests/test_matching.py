@@ -27,6 +27,7 @@ from utaten_finder.lyrics.matching import (  # noqa: E402
     score_similarity_detailed,
 )
 from utaten_finder.lyrics.phonology import (  # noqa: E402
+    ContinuousLyricsTimeline,
     collapse_japanese_long_vowels,
     normalize_singing_phonology,
     score_similarity_weighted_detailed,
@@ -1198,6 +1199,701 @@ class TestAsrSegmentFilterAndInitialPrompt(unittest.TestCase):
         self.assertEqual(run_strict["timeline"][0]["decision"], "asr_empty_or_filtered")
         self.assertEqual(run_strict["timeline"][1]["decision"], "asr_empty_or_filtered")
         self.assertEqual(run_strict["summary"]["total_matches"], 0)
+
+
+class TestSpotifyPositionPriorAndSeekDetection(unittest.TestCase):
+    @staticmethod
+    def _build_multi_chorus_lyrics() -> list[dict]:
+        texts = [
+            "つめたいよるのしずくがまどをたたいた",       # 0: Verse 1
+            "あおいライトがゆれてとけいをみた",         # 1
+            "しずかなまちでひとりあるきだした",         # 2
+            "しろいページにゆめをかいていた",           # 3
+            "とおいかねのねいろがきこえてくる",         # 4
+            "きみとすごしたあのひのことをおもう",       # 5
+            "ひかりのかけらをてのひらにあつめて",       # 6: Chorus 1
+            "きえないおもいをそらにとばした",           # 7
+            "はるかなみらいへこえをひびかせて",         # 8
+            "みしらぬえきでとまったでんしゃ",           # 9: Verse 2
+            "かばんのなかにはふるいしゃしん",           # 10
+            "ゆめのつづきはまだおわらない",             # 11
+            "ごごのかふぇでほんをひらいて",             # 12
+            "あめあがりのみちにみずたまり",             # 13
+            "ゆうぐれのこうえんでたちどまる",           # 14
+            "よるがふけてほしがみえてきた",             # 15: Bridge
+            "ながいよるをこえてあさがくるまで",         # 16
+            "なみだをふいてつよくまえをむいて",         # 17
+            "ひかりのかけらをてのひらにあつめてよ",     # 18: Final Chorus (extra particle よ)
+            "きえないおもいをそらにとばしたよ",         # 19
+            "いつかまたあえるそのひまで",               # 20: Outro
+        ]
+        return [_line(i, t) for i, t in enumerate(texts)]
+
+    @staticmethod
+    def _build_long_multi_chorus_lyrics() -> list[dict]:
+        texts = [
+            "あさやけのほどうをあるきだした",           # 0: Verse 1
+            "しろいいきがそらにきえてゆく",             # 1
+            "とおいでんしゃのおとがきこえた",           # 2
+            "きみのなまえをなんどもよんだ",             # 3: Chorus 1
+            "わすられないひびをおいかけて",             # 4
+            "かぜがやさしくほおをなでた",               # 5
+            "ごごのカフェでほんをひらいて",             # 6: Verse 2
+            "とおいむかしのことをおもいだす",           # 7
+            "あめあがりのみちにみずたまり",             # 8
+            "ゆうぐれのこうえんでたちどまる",           # 9
+            "きみのなまえをなんどもよんだ",             # 10: Chorus 2
+            "わすられないひびをおいかけて",             # 11
+            "かぜがやさしくほおをなでた",               # 12
+            "よるがふけてほしがみえてきた",             # 13: Bridge
+            "もういちどだけあいたいとねがう",           # 14
+            "とまったとけいがうごきだす",               # 15
+            "ちいさなてがみをポケットにいれて",         # 16
+            "あしたのひかりをしんじてあるく",           # 17
+            "さよならのかわりにえがおをみせて",         # 18
+            "とおいほしぞらにてをのばした",             # 19
+            "ながれるくもをじっとみつめてた",           # 20
+            "きみのなまえをなんどもよんだ",             # 21: Final Chorus
+            "わすられないひびをおいかけて",             # 22
+            "かぜがやさしくほおをなでた",               # 23
+            "いつかまたあえるそのひまで",               # 24: Outro
+        ]
+        return [_line(i, t) for i, t in enumerate(texts)]
+
+    def test_timeline_character_ratio_helpers(self) -> None:
+        empty = ContinuousLyricsTimeline([])
+        self.assertEqual(empty.total_chars, 0)
+        self.assertEqual(empty.char_ratio(0), 0.0)
+        self.assertEqual(empty.line_center_ratio(0), 0.0)
+        self.assertEqual(empty.line_for_ratio(0.5), 0)
+
+        tl = ContinuousLyricsTimeline(["aaaa", "bbbbbbbb", "cccc"])
+        self.assertEqual(tl.total_chars, 16)
+        self.assertAlmostEqual(tl.char_ratio(0), 0.0)
+        self.assertAlmostEqual(tl.char_ratio(-5), 0.0)
+        self.assertAlmostEqual(tl.char_ratio(8), 0.5)
+        self.assertAlmostEqual(tl.char_ratio(99), 1.0)
+        self.assertAlmostEqual(tl.line_center_ratio(0), 2.0 / 16.0)
+        self.assertAlmostEqual(tl.line_center_ratio(1), 8.0 / 16.0)
+        self.assertAlmostEqual(tl.line_center_ratio(2), 14.0 / 16.0)
+        self.assertEqual(tl.line_center_ratio(-1), 0.0)
+        self.assertEqual(tl.line_center_ratio(99), 0.0)
+        self.assertEqual(tl.line_for_ratio(0.0), 0)
+        self.assertEqual(tl.line_for_ratio(0.5), 1)
+        self.assertEqual(tl.line_for_ratio(0.95), 2)
+        self.assertEqual(tl.line_for_ratio(1.5), 2)
+
+        # _current_playback_ratio_locked rejects bools, NaN, inf, and non-positive durations
+        ratio_fn = LyricSyncEngine._current_playback_ratio_locked
+        self.assertIsNone(ratio_fn({"spotify_progress_ms": True, "duration_ms": 1000}))
+        self.assertIsNone(ratio_fn({"spotify_progress_ms": 500, "duration_ms": True}))
+        self.assertIsNone(ratio_fn({"spotify_progress_ms": float("nan"), "duration_ms": 1000}))
+        self.assertIsNone(ratio_fn({"spotify_progress_ms": 500, "duration_ms": float("inf")}))
+        self.assertIsNone(ratio_fn({"spotify_progress_ms": 500, "duration_ms": 0}))
+        self.assertIsNone(ratio_fn({"spotify_progress_ms": 500, "duration_ms": -100}))
+        self.assertAlmostEqual(
+            ratio_fn({"estimated_progress_ms": 60000, "duration_ms": 240000}),
+            0.25,
+        )
+
+    def test_soft_position_prior_prevents_false_chorus_jump_in_beam_and_line_modes(
+        self,
+    ) -> None:
+        lyrics = self._build_multi_chorus_lyrics()
+        # Spoken/sung Chorus 1 line with slight trailing particle noise ('よ') that would
+        # score slightly higher on Final Chorus (L18) without a position prior.
+        chorus_asr_with_noise = "ひかりのかけらをてのひらにあつめてよ"
+
+        for align_mode in ("beam", "line"):
+            # 1. Early/mid playback (~31% into 240s track): position_prior keeps match at Chorus 1 (L6)
+            #    while position_prior_enabled=False falsely jumps to Final Chorus (L18).
+            for prior_enabled, expected_idx in ((False, 18), (True, 6)):
+                clock = _FakeClock(0.0)
+                eng = LyricSyncEngine(
+                    clock=clock,
+                    emit_events=False,
+                    alignment_mode=align_mode,
+                    phonological_norm=True,
+                    fuzzy_lookahead_lines=4,
+                    recovery_lookahead_lines=20,
+                    position_prior_enabled=prior_enabled,
+                    position_prior_tolerance=0.15,
+                    position_prior_weight=0.45,
+                    position_prior_floor=0.60,
+                    seek_detection_enabled=True,
+                )
+                eng.reset_with_lyrics(lyrics, track_meta={"song_id": "sp:chorus"})
+                clock.now = 5.0
+                self.assertIsNone(
+                    eng.update_playback_progress(
+                        15000, 240000, song_id="sp:chorus", is_playing=True
+                    )
+                )
+                m0, _ = eng.evaluate_recognized_text("つめたいよるのしずくがまどをたたいた")
+                self.assertIsNotNone(m0)
+                assert m0 is not None
+                self.assertEqual(m0["matched_index"], 0)
+
+                # Advance 60s monotonically (no seek jump) -> Phase 2 opens across L6..L18
+                clock.now = 65.0
+                self.assertIsNone(
+                    eng.update_playback_progress(
+                        75000, 240000, song_id="sp:chorus", is_playing=True
+                    )
+                )
+                match_payload, step_trace = eng.evaluate_recognized_text(
+                    chorus_asr_with_noise
+                )
+                self.assertIsNotNone(match_payload)
+                assert match_payload is not None
+                self.assertEqual(
+                    match_payload["matched_index"],
+                    expected_idx,
+                    f"mode={align_mode}, prior={prior_enabled}",
+                )
+                if prior_enabled:
+                    by_idx = {
+                        c["index"]: c for c in step_trace.get("candidates", [])
+                    }
+                    self.assertIn(6, by_idx)
+                    self.assertIn(18, by_idx)
+                    self.assertGreater(
+                        by_idx[6]["position_prior"], by_idx[18]["position_prior"]
+                    )
+
+            # 2. Late playback (~87.5% into 240s track) near Bridge -> matches Final Chorus (L18)
+            clock_late = _FakeClock(0.0)
+            eng_late = LyricSyncEngine(
+                clock=clock_late,
+                emit_events=False,
+                alignment_mode=align_mode,
+                phonological_norm=True,
+                fuzzy_lookahead_lines=4,
+                recovery_lookahead_lines=8,
+                position_prior_enabled=True,
+            )
+            eng_late.reset_with_lyrics(lyrics, track_meta={"song_id": "sp:chorus"})
+            eng_late.apply_manual_jump(16)
+            clock_late.now = 2.0
+            eng_late.update_playback_progress(
+                210000, 240000, song_id="sp:chorus", is_playing=True
+            )
+            clock_late.now = 4.0
+            late_match, late_trace = eng_late.evaluate_recognized_text(
+                chorus_asr_with_noise
+            )
+            self.assertIsNotNone(late_match)
+            assert late_match is not None
+            self.assertEqual(late_match["matched_index"], 18)
+            by_idx_late = {c["index"]: c for c in late_trace.get("candidates", [])}
+            if 18 in by_idx_late:
+                self.assertAlmostEqual(by_idx_late[18]["position_prior"], 1.0)
+
+            # 3. System Media mode (progress_ms=None, duration_ms=None): position prior stays neutral 1.0
+            clock_sm = _FakeClock(0.0)
+            eng_sm = LyricSyncEngine(
+                clock=clock_sm,
+                emit_events=False,
+                alignment_mode=align_mode,
+                phonological_norm=True,
+                fuzzy_lookahead_lines=4,
+                recovery_lookahead_lines=20,
+                position_prior_enabled=True,
+            )
+            eng_sm.reset_with_lyrics(lyrics, track_meta={"song_id": "smtc:chorus"})
+            clock_sm.now = 5.0
+            eng_sm.update_playback_progress(None, None, song_id="smtc:chorus")
+            m0_sm, _ = eng_sm.evaluate_recognized_text("つめたいよるのしずくがまどをたたいた")
+            self.assertIsNotNone(m0_sm)
+            clock_sm.now = 65.0
+            eng_sm.update_playback_progress(None, None, song_id="smtc:chorus")
+            sm_match, sm_trace = eng_sm.evaluate_recognized_text(chorus_asr_with_noise)
+            self.assertIsNotNone(sm_match)
+            assert sm_match is not None
+            self.assertEqual(sm_match["matched_index"], 18)
+            for cand in sm_trace.get("candidates", []):
+                self.assertAlmostEqual(cand["position_prior"], 1.0)
+
+    def test_spotify_rewind_and_fast_forward_seek_detection_reanchors_engine(
+        self,
+    ) -> None:
+        lyrics = self._build_long_multi_chorus_lyrics()
+
+        for align_mode in ("beam", "line"):
+            clock = _FakeClock(0.0)
+            eng = LyricSyncEngine(
+                clock=clock,
+                emit_events=False,
+                alignment_mode=align_mode,
+                phonological_norm=True,
+                position_prior_enabled=True,
+                seek_detection_enabled=True,
+                seek_rewind_threshold_ms=3500,
+                seek_forward_threshold_ms=12000,
+                seek_window_ratio_radius=0.35,
+            )
+            eng.reset_with_lyrics(lyrics, track_meta={"song_id": "sp:seek1"})
+
+            # Advance late into the song (Bridge L19, progress 185s / 240s)
+            eng.apply_manual_jump(19)
+            clock.now = 10.0
+            self.assertIsNone(
+                eng.update_playback_progress(
+                    185000, 240000, song_id="sp:seek1", is_playing=True
+                )
+            )
+            clock.now = 12.0
+            m_late, _ = eng.evaluate_recognized_text("ながれるくもをじっとみつめてた")
+            self.assertIsNotNone(m_late)
+            assert m_late is not None
+            self.assertEqual(m_late["matched_index"], 20)
+
+            # 1. Rewind back to Chorus 1 region (40s / 240s -> ratio 0.167, near L3/L4)
+            clock.now = 15.0
+            rewind_ev = eng.update_playback_progress(
+                40000, 240000, song_id="sp:seek1", is_playing=True
+            )
+            self.assertIsNotNone(rewind_ev)
+            assert rewind_ev is not None
+            self.assertEqual(rewind_ev["type"], "rewind")
+            self.assertEqual(rewind_ev["from_ms"], 185000)
+            self.assertEqual(rewind_ev["to_ms"], 40000)
+
+            prompt_after_rewind = eng.get_upcoming_prompt()
+            self.assertTrue(prompt_after_rewind)
+            self.assertNotIn("いつかまたあえる", prompt_after_rewind)
+
+            clock.now = 17.0
+            rewound_match, rewound_trace = eng.evaluate_recognized_text(
+                "きみのなまえをなんどもよんだ"
+            )
+            self.assertIsNotNone(rewound_match)
+            assert rewound_match is not None
+            self.assertLess(rewound_match["matched_index"], 10)
+            self.assertEqual(rewound_match["matched_index"], 3)
+            self.assertTrue(rewound_match["seek_reanchored"])
+            self.assertTrue(rewound_trace["seek_reanchored"])
+            self.assertEqual(rewound_trace["seek_detected"]["type"], "rewind")
+
+            # 2. Large fast-forward beyond normal lookahead (42s -> 205s / 240s, skipping 15+ lines)
+            clock.now = 19.0
+            ff_ev = eng.update_playback_progress(
+                205000, 240000, song_id="sp:seek1", is_playing=True
+            )
+            self.assertIsNotNone(ff_ev)
+            assert ff_ev is not None
+            self.assertEqual(ff_ev["type"], "fast_forward")
+
+            clock.now = 21.0
+            ff_match, ff_trace = eng.evaluate_recognized_text(
+                "きみのなまえをなんどもよんだ"
+            )
+            self.assertIsNotNone(ff_match)
+            assert ff_match is not None
+            self.assertEqual(ff_match["matched_index"], 21)
+            self.assertTrue(ff_match["seek_reanchored"])
+            self.assertEqual(ff_trace["seek_detected"]["type"], "fast_forward")
+
+            # 3. Rewind recovery even after reaching the final line (end_of_lyrics)
+            eng.apply_manual_jump(len(lyrics) - 1)
+            clock.now = 25.0
+            _, eol_trace = eng.evaluate_recognized_text("てすとてすと")
+            self.assertEqual(eol_trace["decision"], "end_of_lyrics")
+
+            clock.now = 27.0
+            eol_rewind = eng.update_playback_progress(
+                38000, 240000, song_id="sp:seek1", is_playing=True
+            )
+            self.assertIsNotNone(eol_rewind)
+            assert eol_rewind is not None
+            self.assertEqual(eol_rewind["type"], "rewind")
+
+            clock.now = 29.0
+            recovered_after_eol, _ = eng.evaluate_recognized_text(
+                "きみのなまえをなんどもよんだ"
+            )
+            self.assertIsNotNone(recovered_after_eol)
+            assert recovered_after_eol is not None
+            self.assertEqual(recovered_after_eol["matched_index"], 3)
+            self.assertTrue(recovered_after_eol["seek_reanchored"])
+
+            # 4. Track change guards: different duration_ms OR different song_id must NOT trigger rewind
+            clock.now = 32.0
+            self.assertIsNone(
+                eng.update_playback_progress(
+                    2000, 195000, song_id="sp:seek1", is_playing=True
+                )
+            )
+            clock.now = 34.0
+            self.assertIsNone(
+                eng.update_playback_progress(
+                    2000, 240000, song_id="sp:seek1", is_playing=True
+                )
+            )
+            clock.now = 36.0
+            eng.update_playback_progress(
+                180000, 240000, song_id="sp:seek1", is_playing=True
+            )
+            clock.now = 38.0
+            self.assertIsNone(
+                eng.update_playback_progress(
+                    1500, 240000, song_id="sp:other_song", is_playing=True
+                )
+            )
+
+        # 5. Pause -> seek while paused & pause -> >=12s resume without seek
+        p_clock = _FakeClock(0.0)
+        p_eng = LyricSyncEngine(
+            clock=p_clock,
+            emit_events=False,
+            alignment_mode="beam",
+            phonological_norm=True,
+        )
+        p_eng.reset_with_lyrics(lyrics, track_meta={"song_id": "sp:pause"})
+        p_clock.now = 5.0
+        p_eng.update_playback_progress(150000, 240000, song_id="sp:pause", is_playing=True)
+        # Pausing with track metadata preserves progress history
+        p_clock.now = 8.0
+        self.assertIsNone(
+            p_eng.update_playback_progress(153000, 240000, song_id="sp:pause", is_playing=False)
+        )
+        # Waiting 15s while paused and resuming with same progress must NOT false-trigger fast_forward
+        p_clock.now = 23.0
+        self.assertIsNone(
+            p_eng.update_playback_progress(153000, 240000, song_id="sp:pause", is_playing=True)
+        )
+        # Re-pause, then wait 15s and resume 14s ahead (< wall_dt_ms=15s) -> still NOT fast_forward
+        p_clock.now = 25.0
+        p_eng.update_playback_progress(155000, 240000, song_id="sp:pause", is_playing=False)
+        p_clock.now = 40.0
+        self.assertIsNone(
+            p_eng.update_playback_progress(169000, 240000, song_id="sp:pause", is_playing=True)
+        )
+        # Pause then drag backwards by 90s while paused -> detects rewind immediately!
+        p_clock.now = 42.0
+        p_eng.update_playback_progress(171000, 240000, song_id="sp:pause", is_playing=False)
+        p_clock.now = 44.0
+        pause_drag_ev = p_eng.update_playback_progress(
+            40000, 240000, song_id="sp:pause", is_playing=False
+        )
+        self.assertIsNotNone(pause_drag_ev)
+        assert pause_drag_ev is not None
+        self.assertEqual(pause_drag_ev["type"], "rewind")
+
+        # 6. Short rewind (5s back between 5s Spotify polls) triggers consistently on live & replay
+        sr_clock = _FakeClock(0.0)
+        sr_eng = LyricSyncEngine(
+            clock=sr_clock,
+            emit_events=False,
+            alignment_mode="beam",
+            phonological_norm=True,
+        )
+        sr_eng.reset_with_lyrics(lyrics, track_meta={"song_id": "sp:short_rw"})
+        sr_clock.now = 5.0
+        self.assertIsNone(
+            sr_eng.update_playback_progress(100000, 240000, song_id="sp:short_rw", is_playing=True)
+        )
+        sr_clock.now = 10.0
+        sr_ev = sr_eng.update_playback_progress(
+            99500, 240000, song_id="sp:short_rw", is_playing=True
+        )
+        self.assertIsNotNone(sr_ev)
+        assert sr_ev is not None
+        self.assertEqual(sr_ev["type"], "rewind")
+
+        # 7. Lazy-opened trace during active seek preserves seek_reanchor_active state
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_enabled = False
+            lz_clock = _FakeClock(0.0)
+            lz_rec = MatchTraceRecorder(
+                traces_dir=Path(tmpdir),
+                is_enabled_fn=lambda: trace_enabled,
+                clock=lz_clock,
+            )
+            lz_eng = LyricSyncEngine(
+                trace_recorder=lz_rec,
+                clock=lz_clock,
+                emit_events=False,
+                alignment_mode="beam",
+                phonological_norm=True,
+            )
+            try:
+                lz_eng.reset_with_lyrics(lyrics, track_meta={"song_id": "sp:lazy_seek"})
+                lz_eng.apply_manual_jump(19)
+                lz_clock.now = 10.0
+                lz_eng.update_playback_progress(
+                    185000, 240000, song_id="sp:lazy_seek", is_playing=True
+                )
+                lz_clock.now = 14.0
+                lz_ev = lz_eng.update_playback_progress(
+                    40000, 240000, song_id="sp:lazy_seek", is_playing=True
+                )
+                self.assertIsNotNone(lz_ev)
+                # Enable trace recording while seek re-anchor is still active before matching
+                trace_enabled = True
+                lz_clock.now = 16.0
+                m_lz, _ = lz_eng.evaluate_recognized_text("きみのなまえをなんどもよんだ")
+                self.assertIsNotNone(m_lz)
+                assert m_lz is not None
+                self.assertEqual(m_lz["matched_index"], 3)
+                self.assertTrue(m_lz["seek_reanchored"])
+                lz_path = lz_rec.current_trace_path
+            finally:
+                lz_eng.close_trace_session("done", clear_pending=True)
+
+            assert lz_path is not None
+            lz_trace = load_trace(lz_path)
+            init_state = lz_trace["session_start"]["initial_state"]
+            self.assertTrue(init_state.get("seek_reanchor_active"))
+            self.assertEqual(init_state.get("seek_type"), "rewind")
+            lz_replay = eval_matching.replay_trace(
+                lz_trace, eval_matching.parse_strategy_spec("baseline"), anchor_mode="eval"
+            )
+            self.assertEqual(lz_replay["summary"]["live_parity_rate"], 1.0)
+            self.assertEqual(lz_replay["timeline"][0]["matched_index"], 3)
+            self.assertTrue(lz_replay["timeline"][0]["seek_reanchored"])
+
+    def test_eval_matching_beam_pos_prior_reduces_chorus_jumps_and_handles_rewind_trace(
+        self,
+    ) -> None:
+        spec = eval_matching.parse_strategy_spec("beam_pos_prior")
+        self.assertEqual(spec.name, "beam_pos_prior")
+        preset_defaults = eval_matching.STRATEGIES["beam_pos_prior"]._DEFAULT_OVERRIDES
+        self.assertTrue(preset_defaults["position_prior_enabled"])
+        self.assertTrue(preset_defaults["seek_detection_enabled"])
+
+        custom = eval_matching.parse_strategy_spec(
+            "baseline:align_mode=beam,pos_prior=true,pos_tol=0.12,pos_weight=0.5,"
+            "pos_floor=0.55,seek_detect=true,seek_rewind_ms=4000,seek_forward_ms=10000,"
+            "seek_radius=0.3"
+        )
+        self.assertEqual(custom.params["alignment_mode"], "beam")
+        self.assertTrue(custom.params["position_prior_enabled"])
+        self.assertAlmostEqual(custom.params["position_prior_tolerance"], 0.12)
+        self.assertAlmostEqual(custom.params["position_prior_weight"], 0.5)
+        self.assertAlmostEqual(custom.params["position_prior_floor"], 0.55)
+        self.assertTrue(custom.params["seek_detection_enabled"])
+        self.assertEqual(custom.params["seek_rewind_threshold_ms"], 4000)
+        self.assertEqual(custom.params["seek_forward_threshold_ms"], 10000)
+        self.assertAlmostEqual(custom.params["seek_window_ratio_radius"], 0.3)
+
+        lyrics = self._build_multi_chorus_lyrics()
+        trace_data = {
+            "path": "synthetic_pos_prior_seek.jsonl",
+            "session_start": {
+                "type": "session_start",
+                "schema_version": 1,
+                "track": {
+                    "song_name": "ChorusSeekTest",
+                    "artist_name": "Tester",
+                    "song_id": "sp:trace_seek",
+                },
+                "asr_config": {"block_seconds": 4.0, "step_seconds": 2.0},
+                "matcher_config": {
+                    "alignment_mode": "beam",
+                    "fuzzy_lookahead_lines": 4,
+                    "recovery_lookahead_lines": 20,
+                    "position_prior_enabled": True,
+                    "seek_detection_enabled": True,
+                },
+                "initial_state": {"lazy_opened": False, "current_index": -1},
+                "lyrics": lyrics,
+            },
+            "events": [
+                {
+                    "type": "asr_step",
+                    "seq": 1,
+                    "elapsed_sec": 5.0,
+                    "asr": {"text": "つめたいよるのしずくがまどをたたいた"},
+                    "playback": {
+                        "spotify_progress_ms": 15000,
+                        "estimated_progress_ms": 15000,
+                        "duration_ms": 240000,
+                        "is_playing": True,
+                    },
+                    "decision": "matched_phase1",
+                    "matched_index": 0,
+                },
+                {
+                    "type": "asr_step",
+                    "seq": 2,
+                    "elapsed_sec": 65.0,
+                    # Ambiguous Chorus 1 ASR with trailing particle + monotonic playback (Phase 2 opens)
+                    "asr": {"text": "ひかりのかけらをてのひらにあつめてよ"},
+                    "playback": {
+                        "spotify_progress_ms": 75000,
+                        "estimated_progress_ms": 75000,
+                        "duration_ms": 240000,
+                        "is_playing": True,
+                    },
+                    "decision": "matched_phase1",
+                    "matched_index": 6,
+                },
+                {
+                    "type": "asr_step",
+                    "seq": 3,
+                    "elapsed_sec": 69.0,
+                    "asr": {"text": "きえないおもいをそらにとばした"},
+                    "playback": {
+                        "spotify_progress_ms": 79000,
+                        "estimated_progress_ms": 79000,
+                        "duration_ms": 240000,
+                        "is_playing": True,
+                    },
+                    "decision": "matched_phase1",
+                    "matched_index": 7,
+                },
+                {
+                    "type": "asr_step",
+                    "seq": 4,
+                    "elapsed_sec": 73.0,
+                    "asr": {"text": "はるかなみらいへこえをひびかせて"},
+                    "playback": {
+                        "spotify_progress_ms": 83000,
+                        "estimated_progress_ms": 83000,
+                        "duration_ms": 240000,
+                        "is_playing": True,
+                    },
+                    "decision": "matched_phase1",
+                    "matched_index": 8,
+                },
+                {
+                    "type": "asr_step",
+                    "seq": 5,
+                    "elapsed_sec": 77.0,
+                    # Rewind back to Verse 1 (~15s) after singing Chorus 1
+                    "asr": {"text": "つめたいよるのしずくがまどをたたいた"},
+                    "playback": {
+                        "spotify_progress_ms": 15000,
+                        "estimated_progress_ms": 15000,
+                        "duration_ms": 240000,
+                        "is_playing": True,
+                    },
+                    "decision": "matched_phase1",
+                    "matched_index": 0,
+                },
+            ],
+        }
+
+        opt_spec = eval_matching.parse_strategy_spec("beam_asr_opt:recovery_lookahead=20")
+        pos_spec = eval_matching.parse_strategy_spec("beam_pos_prior:recovery_lookahead=20")
+        run_opt = eval_matching.replay_trace(trace_data, opt_spec, anchor_mode="eval")
+        run_pos = eval_matching.replay_trace(trace_data, pos_spec, anchor_mode="eval")
+
+        # Without pos prior, seq 2 falsely jumps to Final Chorus (L18) and loses the rest of Chorus 1 + rewind;
+        # with pos prior, seq 2 stays on L6, follows sequentially L6->L7->L8, and rewind re-anchors back to L0.
+        self.assertEqual(run_opt["timeline"][1]["matched_index"], 18)
+        self.assertGreater(run_opt["summary"]["max_jump"], run_pos["summary"]["max_jump"])
+        self.assertGreater(run_pos["summary"]["line_coverage"], run_opt["summary"]["line_coverage"])
+        self.assertGreater(run_pos["summary"]["sequential_rate"], run_opt["summary"]["sequential_rate"])
+
+        self.assertEqual(run_pos["timeline"][1]["matched_index"], 6)
+        self.assertEqual(run_pos["timeline"][2]["matched_index"], 7)
+        self.assertEqual(run_pos["timeline"][3]["matched_index"], 8)
+        self.assertEqual(run_pos["timeline"][4]["matched_index"], 0)
+        self.assertGreaterEqual(run_pos["summary"]["seek_reanchors"], 1)
+        self.assertGreaterEqual(run_pos["summary"]["rewind_advances"], 1)
+
+        tl_text = eval_matching.format_timeline(run_pos)
+        self.assertIn("[SEEK:rewind", tl_text)
+
+        # Explicit empty playback dict clears engine playback state in BaselineStrategy replay
+        strat = eval_matching.BaselineStrategy(eval_matching.parse_strategy_spec("beam_pos_prior"))
+        vclock = eval_matching.VirtualClock(0.0)
+        strat.reset(lyrics, trace_data["session_start"], vclock)
+        strat.update_playback_progress(
+            {
+                "spotify_progress_ms": 80000,
+                "estimated_progress_ms": 80000,
+                "duration_ms": 240000,
+                "is_playing": True,
+            }
+        )
+        self.assertEqual(strat._engine.get_playback_progress()["spotify_progress_ms"], 80000)
+        strat.update_playback_progress(
+            {
+                "spotify_progress_ms": None,
+                "estimated_progress_ms": None,
+                "duration_ms": None,
+                "is_playing": False,
+            }
+        )
+        cleared = strat._engine.get_playback_progress()
+        self.assertIsNone(cleared["spotify_progress_ms"])
+        self.assertIsNone(cleared["duration_ms"])
+        self.assertFalse(cleared["is_playing"])
+
+        # Comment 4653186528 regression: poll-to-ASR offsets must cancel out and preserve est_ms
+        # Scenario: poll 1 at t=5s (sp=100_000), ASR step 1 at t=9s (est=104_000),
+        # rewind 5.5s at t=10s (sp=99_500), ASR step 2 at t=11s (est=100_500).
+        offset_trace = {
+            "path": "synthetic_poll_offset_short_rewind.jsonl",
+            "session_start": {
+                "type": "session_start",
+                "schema_version": 1,
+                "track": {
+                    "song_name": "OffsetRewindTest",
+                    "artist_name": "Tester",
+                    "song_id": "sp:offset_rw",
+                },
+                "asr_config": {"block_seconds": 4.0, "step_seconds": 2.0},
+                "matcher_config": {
+                    "alignment_mode": "beam",
+                    "position_prior_enabled": True,
+                    "seek_detection_enabled": True,
+                },
+                "initial_state": {"lazy_opened": True, "current_index": 12},
+                "lyrics": lyrics,
+            },
+            "events": [
+                {
+                    "type": "asr_step",
+                    "seq": 1,
+                    "elapsed_sec": 9.0,
+                    "asr": {"text": "あめあがりのみちにみずたまり"},
+                    "playback": {
+                        "spotify_progress_ms": 100000,
+                        "estimated_progress_ms": 104000,
+                        "duration_ms": 240000,
+                        "is_playing": True,
+                    },
+                    "decision": "matched_phase1",
+                    "matched_index": 13,
+                },
+                {
+                    "type": "asr_step",
+                    "seq": 2,
+                    "elapsed_sec": 11.0,
+                    "asr": {"text": "きえないおもいをそらにとばした"},
+                    "playback": {
+                        "spotify_progress_ms": 99500,
+                        "estimated_progress_ms": 100500,
+                        "duration_ms": 240000,
+                        "is_playing": True,
+                    },
+                    "decision": "matched_phase1",
+                    "matched_index": 7,
+                },
+            ],
+        }
+        offset_run = eval_matching.replay_trace(
+            offset_trace, eval_matching.parse_strategy_spec("beam_pos_prior"), anchor_mode="eval"
+        )
+        self.assertEqual(offset_run["summary"]["seek_reanchors"], 1)
+        self.assertEqual(offset_run["summary"]["rewind_advances"], 1)
+        self.assertEqual(offset_run["timeline"][1]["matched_index"], 7)
+        self.assertIsNotNone(offset_run["timeline"][1]["seek_detected"])
+        self.assertEqual(offset_run["timeline"][1]["seek_detected"]["type"], "rewind")
+
+        # Verify BaselineStrategy preserves engine estimated_progress_ms without sp-lag
+        strat2 = eval_matching.BaselineStrategy(eval_matching.parse_strategy_spec("beam_pos_prior"))
+        vclock2 = eval_matching.VirtualClock(9.0)
+        strat2.reset(lyrics, offset_trace["session_start"], vclock2)
+        strat2.update_playback_progress(offset_trace["events"][0]["playback"])
+        self.assertEqual(strat2._engine.get_playback_progress()["estimated_progress_ms"], 104000)
+        vclock2.now = 11.0
+        strat2.update_playback_progress(offset_trace["events"][1]["playback"])
+        self.assertEqual(strat2._engine.get_playback_progress()["estimated_progress_ms"], 100500)
 
 
 if __name__ == "__main__":
