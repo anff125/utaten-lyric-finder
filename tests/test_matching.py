@@ -988,6 +988,18 @@ class TestAsrSegmentFilterAndInitialPrompt(unittest.TestCase):
         self.assertEqual(kept_res["text"], "ごめんme")
         self.assertEqual(kept_res["filtered_segments"], [])
 
+        # Repetitive kana/ASCII choruses present in lyrics_corpus (even across kana scripts) are preserved.
+        chorus_corpus = "らららら\noh la la la tonight"
+        chorus_res = filter_asr_segments(
+            [
+                {"text": "ララララ", "avg_logprob": -0.25, "no_speech_prob": 0.04, "compression_ratio": 1.15},
+                {"text": "la la la", "avg_logprob": -0.25, "no_speech_prob": 0.04, "compression_ratio": 1.10},
+            ],
+            lyrics_corpus=chorus_corpus,
+        )
+        self.assertEqual(chorus_res["text"], "ララララla la la")
+        self.assertEqual(chorus_res["filtered_segments"], [])
+
     def test_upcoming_prompt_and_asr_context_follow_progress(self) -> None:
         eng = LyricSyncEngine(emit_events=False)
         self.assertEqual(eng.get_upcoming_prompt(), "")
@@ -1098,6 +1110,94 @@ class TestAsrSegmentFilterAndInitialPrompt(unittest.TestCase):
         self.assertEqual(run_opt["timeline"][0]["decision"], "asr_empty_or_filtered")
         self.assertEqual(run_opt["timeline"][0]["buffer_after_trim"], "")
         self.assertEqual(run_opt["timeline"][1]["matched_index"], 0)
+
+    def test_post_pr11_trace_refilters_and_reconstructs_for_ab_eval(
+        self,
+    ) -> None:
+        lyrics = [
+            _line(0, "雲を抜け風下へ私だけ"),
+            _line(1, "だから僕は音楽を辞めた"),
+        ]
+        # Verify session_start asr_config records decode/preprocess settings.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rec = MatchTraceRecorder(
+                traces_dir=Path(tmpdir), is_enabled_fn=lambda: True
+            )
+            eng = LyricSyncEngine(trace_recorder=rec, emit_events=False)
+            eng.reset_with_lyrics(lyrics, track_meta={"song_name": "CfgTest"})
+            tpath = rec.current_trace_path
+            eng.close_trace_session("done")
+            assert tpath is not None
+            loaded_cfg = load_trace(tpath)["session_start"]["asr_config"]
+            self.assertIn("beam_size", loaded_cfg)
+            self.assertIn("condition_on_previous_text", loaded_cfg)
+            self.assertIn("initial_prompt_enabled", loaded_cfg)
+            self.assertIn("vocal_bandpass_enabled", loaded_cfg)
+
+        post_pr11_trace = {
+            "path": "synthetic_post_pr11.jsonl",
+            "session_start": {
+                "type": "session_start",
+                "schema_version": 1,
+                "track": {"song_name": "PostPR11", "artist_name": "Tester"},
+                "asr_config": {"block_seconds": 4.0, "step_seconds": 2.0},
+                "matcher_config": {"alignment_mode": "beam", "phonological_norm": True},
+                "initial_state": {"lazy_opened": False, "current_index": -1},
+                "lyrics": lyrics,
+            },
+            "events": [
+                {
+                    "type": "asr_step",
+                    "seq": 1,
+                    "elapsed_sec": 2.0,
+                    "asr": {
+                        "text": "",
+                        "raw_text_before_filter": "ごめん",
+                        "segment_filtered": True,
+                        "segments": [
+                            {"text": "ごめん", "avg_logprob": -0.45, "no_speech_prob": 0.08, "compression_ratio": 0.53}
+                        ],
+                    },
+                    "playback": {},
+                    "decision": "asr_empty_or_filtered",
+                    "matched_index": None,
+                },
+                {
+                    "type": "asr_step",
+                    "seq": 2,
+                    "elapsed_sec": 4.0,
+                    "asr": {
+                        "text": "雲を抜け風下へ私だけ",
+                        "raw_text_before_filter": "雲を抜け風下へ私だけ",
+                        "segment_filtered": True,
+                        "segments": [
+                            {"text": "雲を抜け風下へ私だけ", "avg_logprob": -0.65, "no_speech_prob": 0.04, "compression_ratio": 0.80}
+                        ],
+                    },
+                    "playback": {},
+                    "decision": "matched_phase1",
+                    "matched_index": 0,
+                },
+            ],
+        }
+
+        run_base = eval_matching.replay_trace(
+            post_pr11_trace, eval_matching.parse_strategy_spec("baseline"), anchor_mode="eval"
+        )
+        run_unfiltered = eval_matching.replay_trace(
+            post_pr11_trace, eval_matching.parse_strategy_spec("beam_align"), anchor_mode="eval"
+        )
+        run_strict = eval_matching.replay_trace(
+            post_pr11_trace,
+            eval_matching.parse_strategy_spec("beam_asr_opt:min_logprob=-0.50"),
+            anchor_mode="eval",
+        )
+
+        self.assertEqual(run_base["summary"]["live_parity_rate"], 1.0)
+        self.assertEqual(run_unfiltered["timeline"][0]["buffer_after_trim"], "ごめん")
+        self.assertEqual(run_strict["timeline"][0]["decision"], "asr_empty_or_filtered")
+        self.assertEqual(run_strict["timeline"][1]["decision"], "asr_empty_or_filtered")
+        self.assertEqual(run_strict["summary"]["total_matches"], 0)
 
 
 if __name__ == "__main__":

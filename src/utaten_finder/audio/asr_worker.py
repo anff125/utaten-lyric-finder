@@ -12,16 +12,17 @@ from typing import Any, Callable, cast
 import wave
 
 from utaten_finder.audio.cuda_loader import prepare_windows_cuda_dll_paths
-from utaten_finder.audio.process_loopback import (
-    apply_vocal_bandpass,
-    downmix_to_mono,
-)
 from utaten_finder.core import config, events
 from utaten_finder.lyrics.matching import filter_asr_segments
 from utaten_finder.lyrics.trace import sanitize_trace_slug
 
 with config.startup_progress_stage(0.20, 0.30, "載入音訊重採樣模組 (SciPy)..."):
     from scipy.signal import resample_poly
+
+    from utaten_finder.audio.process_loopback import (
+        apply_vocal_bandpass,
+        downmix_to_mono,
+    )
 
 # 在導入 faster_whisper / ctranslate2 前先設定好 DLL 路徑
 prepare_windows_cuda_dll_paths(report_progress=True)
@@ -642,24 +643,32 @@ def _asr_worker_loop(
     step_frames = int(step_seconds * sample_rate)
     recognition_count = 0
     chunk_counter = 0
+    silent_wav_steps = 0
     level_emitter = AudioLevelEmitter()
 
     def _record_captured_step(step_samples: Any) -> None:
+        nonlocal silent_wav_steps
+        wav_enabled = bool(getattr(config, "ASR_RECORD_WAV_ENABLED", False))
         if (
             not _asr_listening_active
             or _asr_stop_event.is_set()
             or not config.ASR_ENABLED
+            or not wav_enabled
         ):
-            return
-        if not getattr(config, "ASR_RECORD_WAV_ENABLED", False):
+            silent_wav_steps = 0
             if _wav_recorder.is_recording:
-                _wav_recorder.close("disabled")
+                reason = "asr_disabled" if not config.ASR_ENABLED else "disabled"
+                _wav_recorder.close(reason)
             return
+
         arr = np.asarray(step_samples, dtype=np.float32)
-        if not _wav_recorder.is_recording and (
-            arr.size == 0 or float(np.max(np.abs(arr))) < 1e-4
-        ):
-            return
+        if arr.size == 0 or float(np.max(np.abs(arr))) < 1e-4:
+            silent_wav_steps += 1
+            if not _wav_recorder.is_recording or silent_wav_steps > 1:
+                return
+        else:
+            silent_wav_steps = 0
+
         ctx = _get_current_asr_context()
         slug = str(ctx.get("track_slug") or "")
         _wav_recorder.write_step(arr, track_slug=slug, enabled=True)
@@ -672,6 +681,8 @@ def _asr_worker_loop(
             return
 
         if not config.ASR_ENABLED:
+            if _wav_recorder.is_recording:
+                close_asr_wav_recording("asr_disabled")
             if not _asr_disabled_logged:
                 print("ℹ️ ASR 自動捲動已關閉，暫停語音辨識。")
                 _asr_disabled_logged = True

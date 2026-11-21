@@ -19,7 +19,10 @@ if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
 from utaten_finder.core import config  # noqa: E402
-from utaten_finder.lyrics.matching import LyricSyncEngine  # noqa: E402
+from utaten_finder.lyrics.matching import (  # noqa: E402
+    UNCONDITIONAL_HALLUCINATIONS,
+    LyricSyncEngine,
+)
 from utaten_finder.lyrics.parser import extract_ruby_reading  # noqa: E402
 from utaten_finder.lyrics.trace import load_trace  # noqa: E402
 
@@ -145,6 +148,8 @@ class BaselineStrategy(ReplayStrategy):
     def __init__(self, spec: StrategySpec) -> None:
         super().__init__(spec)
         self._engine: LyricSyncEngine | None = None
+        self._asr_filter_active = False
+        self._reconstruct_unfiltered = False
 
     def _resolve_param(
         self, key: str, matcher_cfg: dict[str, Any], legacy_default: Any
@@ -348,6 +353,11 @@ class BaselineStrategy(ReplayStrategy):
             ),
             "emit_events": False,
         }
+        self._asr_filter_active = bool(engine_kwargs["asr_segment_filter"])
+        self._reconstruct_unfiltered = not self._asr_filter_active and (
+            self.spec.name != "baseline"
+            or "asr_segment_filter" in self.spec.params
+        )
         self._engine = LyricSyncEngine(**engine_kwargs)
         self._engine.reset_with_lyrics(lyrics)
 
@@ -387,8 +397,26 @@ class BaselineStrategy(ReplayStrategy):
         asr_meta: dict[str, Any],
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         assert self._engine is not None
+        meta_for_step = dict(asr_meta)
+        text_for_step = recognized_text
+        if (
+            self._asr_filter_active
+            and isinstance(meta_for_step.get("segments"), list)
+            and meta_for_step["segments"]
+        ):
+            meta_for_step["segment_filtered"] = False
+        elif (
+            self._reconstruct_unfiltered
+            and meta_for_step.get("segment_filtered")
+            and "raw_text_before_filter" in meta_for_step
+        ):
+            reconstructed = str(meta_for_step.get("raw_text_before_filter") or "")
+            for phrase in UNCONDITIONAL_HALLUCINATIONS:
+                reconstructed = reconstructed.replace(phrase, "")
+            text_for_step = reconstructed.strip()
+            meta_for_step["text"] = text_for_step
         return self._engine.evaluate_recognized_text(
-            recognized_text, asr_meta=asr_meta
+            text_for_step, asr_meta=meta_for_step
         )
 
     def apply_manual_jump(self, line_index: int) -> dict[str, Any] | None:

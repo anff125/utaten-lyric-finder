@@ -118,11 +118,10 @@ def _is_token_in_lyrics_corpus(token: str, corpus_lower: str) -> bool:
         return False
     if len(token) <= 1:
         return f"\n{token}\n" in f"\n{corpus_lower}\n"
-    if token.isascii() and token.isalpha():
-        return (
-            re.search(rf"(?<![a-z]){re.escape(token)}(?![a-z])", corpus_lower)
-            is not None
-        )
+    if token.isascii() and any(ch.isalpha() for ch in token):
+        if re.search(rf"(?<![a-z]){re.escape(token)}(?![a-z])", corpus_lower):
+            return True
+        return len(token) >= 6 and token in corpus_lower
     return token in corpus_lower
 
 
@@ -189,39 +188,46 @@ def filter_asr_segments(
         ):
             drop_reason = "high_compression_ratio"
         else:
+            punct_stripped = _PUNCT_STRIP_KEEP_LONG_RE.sub(
+                "", cleaned_stripped
+            ).lower()
             norm_seg = normalize_match_text(cleaned_stripped)
-            if has_repetitive_token_loop(cleaned_stripped) and not _is_token_in_lyrics_corpus(
-                norm_seg, corpus_lower
+            hira_seg = normalize_match_text(
+                normalize_to_hiragana(cleaned_stripped)
+            )
+            cand_keys = [
+                key
+                for key in (
+                    cleaned_stripped.lower(),
+                    punct_stripped,
+                    norm_seg,
+                    hira_seg,
+                )
+                if key
+            ]
+            present_in_lyrics = any(
+                _is_token_in_lyrics_corpus(key, corpus_lower)
+                for key in cand_keys
+            )
+            if (
+                has_repetitive_token_loop(cleaned_stripped)
+                and not present_in_lyrics
             ):
                 drop_reason = "repetitive_loop"
                 _record_removed_phrase(cleaned_stripped)
-            elif filter_interlude_fillers:
-                punct_stripped = _PUNCT_STRIP_KEEP_LONG_RE.sub(
-                    "", cleaned_stripped
-                ).lower()
-                hira_seg = normalize_match_text(
-                    normalize_to_hiragana(cleaned_stripped)
-                )
-                cand_keys = [
-                    key for key in (punct_stripped, norm_seg, hira_seg) if key
-                ]
-                present_in_lyrics = any(
-                    _is_token_in_lyrics_corpus(key, corpus_lower)
+            elif filter_interlude_fillers and not present_in_lyrics:
+                is_filler = any(
+                    key in INTERLUDE_FILLER_HALLUCINATIONS
                     for key in cand_keys
                 )
-                if not present_in_lyrics:
-                    is_filler = any(
-                        key in INTERLUDE_FILLER_HALLUCINATIONS
-                        for key in cand_keys
-                    )
-                    is_low_conf_single = (
-                        len(norm_seg) == 1
-                        and avg_logprob is not None
-                        and avg_logprob < -0.45
-                    )
-                    if is_filler or is_low_conf_single:
-                        drop_reason = "interlude_filler"
-                        _record_removed_phrase(cleaned_stripped)
+                is_low_conf_single = (
+                    len(norm_seg) == 1
+                    and avg_logprob is not None
+                    and avg_logprob < -0.45
+                )
+                if is_filler or is_low_conf_single:
+                    drop_reason = "interlude_filler"
+                    _record_removed_phrase(cleaned_stripped)
 
         if drop_reason:
             filtered_segments.append(
@@ -901,6 +907,11 @@ class LyricSyncEngine:
                         "block_seconds": config.ASR_BLOCK_SECONDS,
                         "step_seconds": config.ASR_BLOCK_SECONDS / 2,
                         "language": config.ASR_LANGUAGE,
+                        "beam_size": config.ASR_BEAM_SIZE,
+                        "best_of": config.ASR_BEST_OF,
+                        "condition_on_previous_text": config.ASR_CONDITION_ON_PREVIOUS_TEXT,
+                        "initial_prompt_enabled": config.ASR_INITIAL_PROMPT_ENABLED,
+                        "vocal_bandpass_enabled": config.ASR_VOCAL_BANDPASS_ENABLED,
                     }
                     self._trace_recorder.start_session(
                         track_meta or {},

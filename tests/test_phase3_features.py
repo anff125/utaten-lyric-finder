@@ -379,13 +379,16 @@ class TestAudioPreprocessingAndWavRecorder(unittest.TestCase):
     ) -> None:
         orig_file = config.RUNTIME_SETTINGS_FILE
         orig_wav = config.ASR_RECORD_WAV_ENABLED
+        orig_asr = config.ASR_ENABLED
         self.addCleanup(setattr, config, "RUNTIME_SETTINGS_FILE", orig_file)
         self.addCleanup(setattr, config, "ASR_RECORD_WAV_ENABLED", orig_wav)
+        self.addCleanup(setattr, config, "ASR_ENABLED", orig_asr)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             settings_path = Path(tmpdir) / "runtime_settings.json"
             config.RUNTIME_SETTINGS_FILE = settings_path
             config.set_asr_record_wav_enabled(False, persist=False)
+            config.set_asr_enabled(True, persist=False)
 
             controller = AppController()
             self.addCleanup(controller.shutdown)
@@ -406,6 +409,14 @@ class TestAudioPreprocessingAndWavRecorder(unittest.TestCase):
             self.assertTrue(res_off["ok"])
             self.assertFalse(config.ASR_RECORD_WAV_ENABLED)
             mock_close.assert_called_once_with("disabled")
+
+            with patch.object(
+                asr_worker, "close_asr_wav_recording"
+            ) as mock_close_asr:
+                res_asr_off = controller.save_settings({"asr_enabled": False})
+            self.assertTrue(res_asr_off["ok"])
+            self.assertFalse(config.ASR_ENABLED)
+            mock_close_asr.assert_called_once_with("asr_disabled")
 
 
 if __name__ == "__main__":

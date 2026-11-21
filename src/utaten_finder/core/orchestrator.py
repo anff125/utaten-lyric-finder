@@ -523,12 +523,12 @@ def main(
                 time.sleep(MAIN_LOOP_SLEEP_SECONDS)
     finally:
         engine.close_trace_session("worker_stopped", clear_pending=True)
-        if close_asr_wav_fn is not None:
-            close_asr_wav_fn("worker_stopped")
-        if set_asr_context_provider_fn is not None:
-            set_asr_context_provider_fn(None)
         if asr_listening_started and set_asr_listening_fn is not None:
             set_asr_listening_fn(False)
+        if set_asr_context_provider_fn is not None:
+            set_asr_context_provider_fn(None)
+        if close_asr_wav_fn is not None:
+            close_asr_wav_fn("worker_stopped")
 
 
 if __name__ == "__main__":

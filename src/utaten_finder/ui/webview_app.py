@@ -233,6 +233,12 @@ class AppController:
                 with self._state_lock:
                     self._audio_source_label = source_name
 
+    @staticmethod
+    def _close_active_wav_recording(reason: str) -> None:
+        asr_mod = sys.modules.get("utaten_finder.audio.asr_worker")
+        if asr_mod is not None and hasattr(asr_mod, "close_asr_wav_recording"):
+            asr_mod.close_asr_wav_recording(reason)
+
     def _is_worker_running(self) -> bool:
         return bool(self._worker_thread is not None and self._worker_thread.is_alive())
 
@@ -309,7 +315,10 @@ class AppController:
                 )
 
             if "asr_enabled" in data:
-                config.set_asr_enabled(bool(data["asr_enabled"]))
+                asr_enabled = bool(data["asr_enabled"])
+                config.set_asr_enabled(asr_enabled)
+                if not asr_enabled:
+                    self._close_active_wav_recording("asr_disabled")
 
             if "asr_model_size" in data and str(data["asr_model_size"]).strip():
                 config.set_asr_model_size(str(data["asr_model_size"]))
@@ -333,11 +342,7 @@ class AppController:
                 wav_enabled = bool(data["asr_record_wav_enabled"])
                 config.set_asr_record_wav_enabled(wav_enabled)
                 if not wav_enabled:
-                    asr_mod = sys.modules.get("utaten_finder.audio.asr_worker")
-                    if asr_mod is not None and hasattr(
-                        asr_mod, "close_asr_wav_recording"
-                    ):
-                        asr_mod.close_asr_wav_recording("disabled")
+                    self._close_active_wav_recording("disabled")
 
             return {"ok": True}
         except Exception as exc:
