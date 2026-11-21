@@ -69,7 +69,7 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push and pull reque
 
 ### Check 3: Runtime Smoke Test
 ```powershell
-.\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'src'); import webview; from utaten_finder.core import config, events, orchestrator; from utaten_finder.media import spotify_api, system_media; from utaten_finder.lyrics import web_scraper, parser, matching, song_cache, trace; from utaten_finder.audio import process_loopback, cuda_loader, asr_worker; from utaten_finder.ui import webview_app; print('[SUCCESS] runtime smoke imports loaded')"
+.\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'src'); import webview; from utaten_finder.core import config, events, orchestrator; from utaten_finder.media import spotify_api, system_media; from utaten_finder.lyrics import web_scraper, parser, matching, phonology, song_cache, trace; from utaten_finder.audio import process_loopback, cuda_loader, asr_worker; from utaten_finder.ui import webview_app; print('[SUCCESS] runtime smoke imports loaded')"
 ```
 - Ensure module-level imports do not crash when optional hardware or audio devices are absent.
 
