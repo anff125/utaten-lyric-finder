@@ -689,6 +689,8 @@ class LyricSyncEngine:
             if len(ki) < 3:
                 continue
             for j in range(i + 1, n):
+                if flags[i] and flags[j]:
+                    continue
                 kj = match_keys[j]
                 if len(kj) < 3:
                     continue
@@ -725,14 +727,9 @@ class LyricSyncEngine:
         if est_ms is None:
             est_ms = playback.get("spotify_progress_ms")
         dur_ms = playback.get("duration_ms")
-        if est_ms is None or dur_ms is None:
-            return None
-        try:
-            est_val = float(est_ms)
-            dur_val = float(dur_ms)
-        except (TypeError, ValueError):
-            return None
-        if dur_val <= 0.0:
+        est_val = _opt_finite_float(est_ms)
+        dur_val = _opt_finite_float(dur_ms)
+        if est_val is None or dur_val is None or dur_val <= 0.0:
             return None
         return min(1.0, max(0.0, est_val / dur_val))
 
@@ -916,15 +913,18 @@ class LyricSyncEngine:
                     if self._playback_estimated_ms_at_poll is not None
                     else prev_sp
                 )
-                dt_ms = (
+                wall_dt_ms = (
                     max(0.0, now - self._playback_polled_at) * 1000.0
-                    if (
-                        self._playback_polled_at is not None
-                        and self._playback_is_playing
-                    )
+                    if self._playback_polled_at is not None
                     else 0.0
                 )
-                expected_est = (prev_base + dt_ms) if prev_base is not None else None
+                playing_dt_ms = wall_dt_ms if self._playback_is_playing else 0.0
+                expected_est = (
+                    (prev_base + playing_dt_ms) if prev_base is not None else None
+                )
+                max_normal_est = (
+                    (prev_base + wall_dt_ms) if prev_base is not None else None
+                )
 
                 seek_type = ""
                 if (
@@ -942,16 +942,15 @@ class LyricSyncEngine:
                         new_est is not None
                         and expected_est is not None
                         and prev_base is not None
-                        and new_est < (prev_base - 1500)
-                        and (expected_est - new_est)
-                        >= max(self._seek_rewind_threshold_ms, 5000)
+                        and new_est <= (prev_base - 250)
+                        and (expected_est - new_est) >= self._seek_rewind_threshold_ms
                     )
                 ):
                     seek_type = "rewind"
                 elif (
                     new_est is not None
-                    and expected_est is not None
-                    and (new_est - expected_est) >= self._seek_forward_threshold_ms
+                    and max_normal_est is not None
+                    and (new_est - max_normal_est) >= self._seek_forward_threshold_ms
                 ):
                     seek_type = "fast_forward"
 
@@ -1007,6 +1006,11 @@ class LyricSyncEngine:
             "is_playing": self._playback_is_playing,
         }
 
+    def get_playback_progress(self) -> dict[str, Any]:
+        """Return a thread-safe snapshot of current playback progress state."""
+        with self._lock:
+            return self._snapshot_playback_progress_locked(self._clock())
+
     def _elapsed_since_success_locked(self, now: float) -> float:
         if self._last_success_at is not None:
             return max(0.0, now - self._last_success_at)
@@ -1034,6 +1038,12 @@ class LyricSyncEngine:
             "elapsed_since_last_success": elapsed_last,
             "elapsed_since_buffer_start": elapsed_buf,
         }
+        if self._seek_reanchor_active:
+            snapshot["seek_reanchor_active"] = True
+            snapshot["seek_type"] = self._seek_type
+            snapshot["seek_ref_index"] = int(self._seek_ref_index)
+            if self._pending_seek_event is not None:
+                snapshot["pending_seek_event"] = dict(self._pending_seek_event)
         if self._alignment_mode == "beam":
             snapshot["beam_pos"] = int(self._beam[0].pos) if self._beam else 0
             snapshot["elapsed_since_beam_buffer"] = (
@@ -1068,11 +1078,24 @@ class LyricSyncEngine:
         beam_pos: int | None = None,
         elapsed_since_beam_buffer: float | None = None,
         beam: list[dict[str, Any]] | None = None,
+        seek_reanchor_active: bool = False,
+        seek_type: str = "",
+        seek_ref_index: int = -1,
+        pending_seek_event: dict[str, Any] | None = None,
     ) -> None:
         """Restore mid-song synchronization state (e.g. from a lazy-opened trace)."""
         with self._lock:
             now = self._clock()
             self._clear_seek_state_locked()
+            if seek_reanchor_active:
+                self._seek_reanchor_active = True
+                self._seek_type = str(seek_type or "")
+                self._seek_ref_index = int(seek_ref_index)
+                self._pending_seek_event = (
+                    dict(pending_seek_event)
+                    if isinstance(pending_seek_event, dict)
+                    else None
+                )
             idx = int(current_index)
             if idx < -1:
                 idx = -1

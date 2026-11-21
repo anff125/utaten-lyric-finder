@@ -218,7 +218,11 @@ def main(
                 f"🎯 [比對成功] 歌詞: '{match_payload['target_original']}' "
                 f"(正規化: '{match_payload['target_normalized']}', 分數: {match_payload['score']:.2f})"
             )
-            if match_payload["is_recovery"]:
+            if match_payload.get("seek_reanchored"):
+                print(
+                    f"🧭 [進度重錨] 已依播放進度重新定位到第 {match_payload['matched_index'] + 1} 行"
+                )
+            elif match_payload["is_recovery"]:
                 print(
                     f"⚠️ [迷失恢復] 成功跨越較大段落，重新定位到第 {match_payload['matched_index'] + 1} 行"
                 )
@@ -327,27 +331,40 @@ def main(
                     if sp is not None:
                         try:
                             sp_track = sp.current_user_playing_track()
-                            if (
-                                sp_track is not None
-                                and sp_track.get("is_playing")
-                                and sp_track.get("item")
-                            ):
+                            if sp_track is not None and sp_track.get("item"):
                                 track = sp_track["item"]
-                                engine.update_playback_progress(
+                                is_playing_now = bool(sp_track.get("is_playing"))
+                                seek_event = engine.update_playback_progress(
                                     sp_track.get("progress_ms"),
                                     track.get("duration_ms"),
                                     song_id=track.get("id"),
-                                    is_playing=True,
+                                    is_playing=is_playing_now,
                                 )
-                                current_track_info = {
-                                    "id": track["id"],
-                                    "song_name": track["name"],
-                                    "artist_name": track["artists"][0]["name"],
-                                    "source": "Spotify",
-                                }
-                                debug_log(
-                                    f"-> 命中 Spotify: {current_track_info['song_name']}"
-                                )
+                                if seek_event:
+                                    seek_label = (
+                                        "倒轉"
+                                        if seek_event.get("type") == "rewind"
+                                        else "快轉"
+                                    )
+                                    win = seek_event.get("window") or [0, 0]
+                                    print(
+                                        f"⏩ [進度跳躍] 偵測到 Spotify 手動{seek_label} "
+                                        f"({int(seek_event.get('from_ms', 0)) // 1000}s -> "
+                                        f"{int(seek_event.get('to_ms', 0)) // 1000}s)，"
+                                        f"搜尋視窗重設至第 {win[0] + 1}~{win[1] + 1} 行"
+                                    )
+                                if is_playing_now:
+                                    current_track_info = {
+                                        "id": track["id"],
+                                        "song_name": track["name"],
+                                        "artist_name": track["artists"][0]["name"],
+                                        "source": "Spotify",
+                                    }
+                                    debug_log(
+                                        f"-> 命中 Spotify: {current_track_info['song_name']}"
+                                    )
+                                else:
+                                    debug_log("-> Spotify 目前暫停中。")
                             else:
                                 engine.update_playback_progress(
                                     None, None, is_playing=False

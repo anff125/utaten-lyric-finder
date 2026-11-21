@@ -161,6 +161,8 @@ class BaselineStrategy(ReplayStrategy):
         self._engine: LyricSyncEngine | None = None
         self._asr_filter_active = False
         self._reconstruct_unfiltered = False
+        self._last_poll_tuple: tuple[Any, Any, bool] | None = None
+        self._last_est_ms: int | None = None
 
     def _resolve_param(
         self, key: str, matcher_cfg: dict[str, Any], legacy_default: Any
@@ -401,6 +403,8 @@ class BaselineStrategy(ReplayStrategy):
             self.spec.name != "baseline"
             or "asr_segment_filter" in self.spec.params
         )
+        self._last_poll_tuple = None
+        self._last_est_ms = None
         self._engine = LyricSyncEngine(**engine_kwargs)
         self._engine.reset_with_lyrics(lyrics)
 
@@ -411,6 +415,7 @@ class BaselineStrategy(ReplayStrategy):
             or init_state.get("buffer")
             or init_state.get("last_success_normalized")
             or init_state.get("last_success_recognized")
+            or init_state.get("seek_reanchor_active")
         ):
             self._engine.restore_state(
                 current_index=int(init_state.get("current_index", -1)),
@@ -432,6 +437,12 @@ class BaselineStrategy(ReplayStrategy):
                     "elapsed_since_beam_buffer"
                 ),
                 beam=init_state.get("beam"),
+                seek_reanchor_active=bool(
+                    init_state.get("seek_reanchor_active", False)
+                ),
+                seek_type=str(init_state.get("seek_type") or ""),
+                seek_ref_index=int(init_state.get("seek_ref_index", -1)),
+                pending_seek_event=init_state.get("pending_seek_event"),
             )
 
     def step(
@@ -474,12 +485,41 @@ class BaselineStrategy(ReplayStrategy):
         est_ms = playback.get("estimated_progress_ms")
         dur_ms = playback.get("duration_ms")
         if sp_ms is None and est_ms is None and dur_ms is None:
+            self._last_poll_tuple = None
+            self._last_est_ms = None
+            self._engine.update_playback_progress(
+                None,
+                None,
+                is_playing=bool(playback.get("is_playing", False)),
+                estimated_progress_ms=None,
+            )
             return
+
+        is_playing = bool(playback.get("is_playing", True))
+        poll_tuple = (sp_ms, dur_ms, is_playing)
+        est_int = int(est_ms) if est_ms is not None else None
+        if (
+            sp_ms is not None
+            and dur_ms is not None
+            and self._last_poll_tuple == poll_tuple
+            and est_int is not None
+            and self._last_est_ms is not None
+            and abs(est_int - int(sp_ms)) <= 7500
+            and est_int >= (self._last_est_ms - 500)
+        ):
+            self._last_est_ms = est_int
+            return
+
+        poll_changed = poll_tuple != self._last_poll_tuple
+        self._last_poll_tuple = poll_tuple
+        self._last_est_ms = est_int
         self._engine.update_playback_progress(
             sp_ms,
             dur_ms,
-            is_playing=bool(playback.get("is_playing", True)),
-            estimated_progress_ms=est_ms,
+            is_playing=is_playing,
+            estimated_progress_ms=(
+                est_int if (sp_ms is None or not poll_changed) else None
+            ),
         )
 
 
@@ -532,6 +572,8 @@ _ISSUE3_LINE_OVERRIDES: dict[str, Any] = {
     "phonological_norm": False,
     "weighted_dakuten": False,
     "adjacent_pair": False,
+    "position_prior_enabled": False,
+    "seek_detection_enabled": False,
 }
 
 

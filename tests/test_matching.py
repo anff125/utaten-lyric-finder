@@ -1283,6 +1283,19 @@ class TestSpotifyPositionPriorAndSeekDetection(unittest.TestCase):
         self.assertEqual(tl.line_for_ratio(0.95), 2)
         self.assertEqual(tl.line_for_ratio(1.5), 2)
 
+        # _current_playback_ratio_locked rejects bools, NaN, inf, and non-positive durations
+        ratio_fn = LyricSyncEngine._current_playback_ratio_locked
+        self.assertIsNone(ratio_fn({"spotify_progress_ms": True, "duration_ms": 1000}))
+        self.assertIsNone(ratio_fn({"spotify_progress_ms": 500, "duration_ms": True}))
+        self.assertIsNone(ratio_fn({"spotify_progress_ms": float("nan"), "duration_ms": 1000}))
+        self.assertIsNone(ratio_fn({"spotify_progress_ms": 500, "duration_ms": float("inf")}))
+        self.assertIsNone(ratio_fn({"spotify_progress_ms": 500, "duration_ms": 0}))
+        self.assertIsNone(ratio_fn({"spotify_progress_ms": 500, "duration_ms": -100}))
+        self.assertAlmostEqual(
+            ratio_fn({"estimated_progress_ms": 60000, "duration_ms": 240000}),
+            0.25,
+        )
+
     def test_soft_position_prior_prevents_false_chorus_jump_in_beam_and_line_modes(
         self,
     ) -> None:
@@ -1528,6 +1541,118 @@ class TestSpotifyPositionPriorAndSeekDetection(unittest.TestCase):
                 )
             )
 
+        # 5. Pause -> seek while paused & pause -> >=12s resume without seek
+        p_clock = _FakeClock(0.0)
+        p_eng = LyricSyncEngine(
+            clock=p_clock,
+            emit_events=False,
+            alignment_mode="beam",
+            phonological_norm=True,
+        )
+        p_eng.reset_with_lyrics(lyrics, track_meta={"song_id": "sp:pause"})
+        p_clock.now = 5.0
+        p_eng.update_playback_progress(150000, 240000, song_id="sp:pause", is_playing=True)
+        # Pausing with track metadata preserves progress history
+        p_clock.now = 8.0
+        self.assertIsNone(
+            p_eng.update_playback_progress(153000, 240000, song_id="sp:pause", is_playing=False)
+        )
+        # Waiting 15s while paused and resuming with same progress must NOT false-trigger fast_forward
+        p_clock.now = 23.0
+        self.assertIsNone(
+            p_eng.update_playback_progress(153000, 240000, song_id="sp:pause", is_playing=True)
+        )
+        # Re-pause, then wait 15s and resume 14s ahead (< wall_dt_ms=15s) -> still NOT fast_forward
+        p_clock.now = 25.0
+        p_eng.update_playback_progress(155000, 240000, song_id="sp:pause", is_playing=False)
+        p_clock.now = 40.0
+        self.assertIsNone(
+            p_eng.update_playback_progress(169000, 240000, song_id="sp:pause", is_playing=True)
+        )
+        # Pause then drag backwards by 90s while paused -> detects rewind immediately!
+        p_clock.now = 42.0
+        p_eng.update_playback_progress(171000, 240000, song_id="sp:pause", is_playing=False)
+        p_clock.now = 44.0
+        pause_drag_ev = p_eng.update_playback_progress(
+            40000, 240000, song_id="sp:pause", is_playing=False
+        )
+        self.assertIsNotNone(pause_drag_ev)
+        assert pause_drag_ev is not None
+        self.assertEqual(pause_drag_ev["type"], "rewind")
+
+        # 6. Short rewind (5s back between 5s Spotify polls) triggers consistently on live & replay
+        sr_clock = _FakeClock(0.0)
+        sr_eng = LyricSyncEngine(
+            clock=sr_clock,
+            emit_events=False,
+            alignment_mode="beam",
+            phonological_norm=True,
+        )
+        sr_eng.reset_with_lyrics(lyrics, track_meta={"song_id": "sp:short_rw"})
+        sr_clock.now = 5.0
+        self.assertIsNone(
+            sr_eng.update_playback_progress(100000, 240000, song_id="sp:short_rw", is_playing=True)
+        )
+        sr_clock.now = 10.0
+        sr_ev = sr_eng.update_playback_progress(
+            99500, 240000, song_id="sp:short_rw", is_playing=True
+        )
+        self.assertIsNotNone(sr_ev)
+        assert sr_ev is not None
+        self.assertEqual(sr_ev["type"], "rewind")
+
+        # 7. Lazy-opened trace during active seek preserves seek_reanchor_active state
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_enabled = False
+            lz_clock = _FakeClock(0.0)
+            lz_rec = MatchTraceRecorder(
+                traces_dir=Path(tmpdir),
+                is_enabled_fn=lambda: trace_enabled,
+                clock=lz_clock,
+            )
+            lz_eng = LyricSyncEngine(
+                trace_recorder=lz_rec,
+                clock=lz_clock,
+                emit_events=False,
+                alignment_mode="beam",
+                phonological_norm=True,
+            )
+            try:
+                lz_eng.reset_with_lyrics(lyrics, track_meta={"song_id": "sp:lazy_seek"})
+                lz_eng.apply_manual_jump(19)
+                lz_clock.now = 10.0
+                lz_eng.update_playback_progress(
+                    185000, 240000, song_id="sp:lazy_seek", is_playing=True
+                )
+                lz_clock.now = 14.0
+                lz_ev = lz_eng.update_playback_progress(
+                    40000, 240000, song_id="sp:lazy_seek", is_playing=True
+                )
+                self.assertIsNotNone(lz_ev)
+                # Enable trace recording while seek re-anchor is still active before matching
+                trace_enabled = True
+                lz_clock.now = 16.0
+                m_lz, _ = lz_eng.evaluate_recognized_text("きみのなまえをなんどもよんだ")
+                self.assertIsNotNone(m_lz)
+                assert m_lz is not None
+                self.assertEqual(m_lz["matched_index"], 3)
+                self.assertTrue(m_lz["seek_reanchored"])
+                lz_path = lz_rec.current_trace_path
+            finally:
+                lz_eng.close_trace_session("done", clear_pending=True)
+
+            assert lz_path is not None
+            lz_trace = load_trace(lz_path)
+            init_state = lz_trace["session_start"]["initial_state"]
+            self.assertTrue(init_state.get("seek_reanchor_active"))
+            self.assertEqual(init_state.get("seek_type"), "rewind")
+            lz_replay = eval_matching.replay_trace(
+                lz_trace, eval_matching.parse_strategy_spec("baseline"), anchor_mode="eval"
+            )
+            self.assertEqual(lz_replay["summary"]["live_parity_rate"], 1.0)
+            self.assertEqual(lz_replay["timeline"][0]["matched_index"], 3)
+            self.assertTrue(lz_replay["timeline"][0]["seek_reanchored"])
+
     def test_eval_matching_beam_pos_prior_reduces_chorus_jumps_and_handles_rewind_trace(
         self,
     ) -> None:
@@ -1568,6 +1693,8 @@ class TestSpotifyPositionPriorAndSeekDetection(unittest.TestCase):
                     "alignment_mode": "beam",
                     "fuzzy_lookahead_lines": 4,
                     "recovery_lookahead_lines": 20,
+                    "position_prior_enabled": True,
+                    "seek_detection_enabled": True,
                 },
                 "initial_state": {"lazy_opened": False, "current_index": -1},
                 "lyrics": lyrics,
@@ -1669,6 +1796,32 @@ class TestSpotifyPositionPriorAndSeekDetection(unittest.TestCase):
 
         tl_text = eval_matching.format_timeline(run_pos)
         self.assertIn("[SEEK:rewind", tl_text)
+
+        # Explicit empty playback dict clears engine playback state in BaselineStrategy replay
+        strat = eval_matching.BaselineStrategy(eval_matching.parse_strategy_spec("beam_pos_prior"))
+        vclock = eval_matching.VirtualClock(0.0)
+        strat.reset(lyrics, trace_data["session_start"], vclock)
+        strat.update_playback_progress(
+            {
+                "spotify_progress_ms": 80000,
+                "estimated_progress_ms": 80000,
+                "duration_ms": 240000,
+                "is_playing": True,
+            }
+        )
+        self.assertEqual(strat._engine.get_playback_progress()["spotify_progress_ms"], 80000)
+        strat.update_playback_progress(
+            {
+                "spotify_progress_ms": None,
+                "estimated_progress_ms": None,
+                "duration_ms": None,
+                "is_playing": False,
+            }
+        )
+        cleared = strat._engine.get_playback_progress()
+        self.assertIsNone(cleared["spotify_progress_ms"])
+        self.assertIsNone(cleared["duration_ms"])
+        self.assertFalse(cleared["is_playing"])
 
 
 if __name__ == "__main__":
