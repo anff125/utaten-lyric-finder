@@ -86,6 +86,10 @@ _BASELINE_PARAM_CASTERS: dict[str, tuple[str, Any]] = {
     "beam_back_slack": ("beam_back_slack", int),
     "beam_buf_chars": ("beam_max_buffer_chars", int),
     "beam_stale_sec": ("beam_buffer_stale_seconds", float),
+    "asr_filter": ("asr_segment_filter", _parse_bool),
+    "min_logprob": ("asr_min_avg_logprob", float),
+    "max_no_speech": ("asr_max_no_speech_prob", float),
+    "max_comp_ratio": ("asr_max_compression_ratio", float),
 }
 
 
@@ -328,6 +332,20 @@ class BaselineStrategy(ReplayStrategy):
                     "beam_buffer_stale_seconds", matcher_cfg, 6.5
                 )
             ),
+            "asr_segment_filter": bool(
+                self._resolve_param("asr_segment_filter", matcher_cfg, False)
+            ),
+            "asr_min_avg_logprob": float(
+                self._resolve_param("asr_min_avg_logprob", matcher_cfg, -0.80)
+            ),
+            "asr_max_no_speech_prob": float(
+                self._resolve_param("asr_max_no_speech_prob", matcher_cfg, 0.60)
+            ),
+            "asr_max_compression_ratio": float(
+                self._resolve_param(
+                    "asr_max_compression_ratio", matcher_cfg, 1.35
+                )
+            ),
             "emit_events": False,
         }
         self._engine = LyricSyncEngine(**engine_kwargs)
@@ -493,6 +511,15 @@ class BeamAlignStrategy(RtReadingStrategy):
     }
 
 
+class BeamAsrOptStrategy(BeamAlignStrategy):
+    """Preset adding ASR segment confidence and interlude hallucination filtering on ``beam_align``."""
+
+    _DEFAULT_OVERRIDES = {
+        **BeamAlignStrategy._DEFAULT_OVERRIDES,
+        "asr_segment_filter": True,
+    }
+
+
 STRATEGIES: dict[str, type[ReplayStrategy]] = {
     "baseline": BaselineStrategy,
     "rt_reading": RtReadingStrategy,
@@ -503,6 +530,7 @@ STRATEGIES: dict[str, type[ReplayStrategy]] = {
     "pair_sync": PairSyncStrategy,
     "phono_pair_sync": PhonoPairSyncStrategy,
     "beam_align": BeamAlignStrategy,
+    "beam_asr_opt": BeamAsrOptStrategy,
 }
 
 
@@ -1178,8 +1206,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Strategy spec to evaluate (repeatable), e.g. 'baseline', 'rt_reading', "
             "'smart_sync', 'rt_smart_sync', 'phono_sync', 'phono_weighted', "
-            "'pair_sync', 'phono_pair_sync', 'beam_align', or "
-            "'beam_align:threshold=0.73,beam_width=4'. "
+            "'pair_sync', 'phono_pair_sync', 'beam_align', 'beam_asr_opt', or "
+            "'beam_asr_opt:min_logprob=-0.75,beam_width=4'. "
             "Defaults to 'baseline'."
         ),
     )

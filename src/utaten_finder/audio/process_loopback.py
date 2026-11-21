@@ -18,15 +18,16 @@ from ctypes import (
     c_wchar_p,
     wintypes,
 )
+import functools
 import math
 import os
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 import uuid
 
 import numpy as np
-from scipy.signal import resample_poly
+from scipy.signal import butter, resample_poly, sosfilt, sosfiltfilt
 
 # Windows COM Constants & Flags
 COINIT_MULTITHREADED = 0x0
@@ -336,6 +337,76 @@ def is_process_loopback_supported() -> bool:
         return hasattr(mmdevapi, "ActivateAudioInterfaceAsync")
     except Exception:
         return False
+
+
+def downmix_to_mono(samples: Any, channels: int = 1) -> np.ndarray:
+    """Downmix mono, stereo, or multi-channel audio using Mid (L + R) / 2."""
+    arr = np.asarray(samples, dtype=np.float32)
+    if arr.size == 0:
+        return np.empty(0, dtype=np.float32)
+
+    if arr.ndim == 2:
+        if arr.shape[1] <= 1:
+            return arr.reshape(-1).astype(np.float32, copy=False)
+        return (0.5 * (arr[:, 0] + arr[:, 1])).astype(np.float32)
+
+    if arr.ndim > 2:
+        arr = arr.reshape(-1)
+
+    ch = int(channels)
+    if ch <= 1:
+        return arr.astype(np.float32, copy=False)
+
+    usable = (arr.size // ch) * ch
+    if usable == 0:
+        return np.empty(0, dtype=np.float32)
+
+    reshaped = arr[:usable].reshape(-1, ch)
+    return (0.5 * (reshaped[:, 0] + reshaped[:, 1])).astype(np.float32)
+
+
+@functools.lru_cache(maxsize=16)
+def _design_vocal_bandpass_sos(
+    sample_rate: int,
+    lowcut_hz: float,
+    highcut_hz: float,
+    order: int = 4,
+) -> Optional[np.ndarray]:
+    """Design and cache a Butterworth SOS bandpass filter for vocal frequencies."""
+    nyquist = 0.5 * float(sample_rate)
+    if nyquist <= 0.0:
+        return None
+    low = float(lowcut_hz) / nyquist
+    high = min(0.99, float(highcut_hz) / nyquist)
+    if low <= 0.0 or high >= 1.0 or low >= high:
+        return None
+    return butter(int(order), [low, high], btype="bandpass", output="sos")
+
+
+def apply_vocal_bandpass(
+    samples: Any,
+    sample_rate: int = 16000,
+    lowcut_hz: float = 80.0,
+    highcut_hz: float = 7600.0,
+    order: int = 4,
+) -> np.ndarray:
+    """Apply lightweight zero-phase vocal bandpass filtering to mono float32 audio."""
+    arr = np.asarray(samples, dtype=np.float32)
+    if arr.size < 32:
+        return np.clip(arr, -1.0, 1.0).astype(np.float32, copy=False)
+
+    sos = _design_vocal_bandpass_sos(
+        int(sample_rate), float(lowcut_hz), float(highcut_hz), int(order)
+    )
+    if sos is None:
+        return np.clip(arr, -1.0, 1.0).astype(np.float32, copy=False)
+
+    try:
+        filtered = sosfiltfilt(sos, arr)
+    except ValueError:
+        filtered = sosfilt(sos, arr)
+
+    return np.clip(filtered, -1.0, 1.0).astype(np.float32)
 
 
 class SpotifyProcessAudioCapture:
@@ -667,7 +738,7 @@ class SpotifyProcessAudioCapture:
 
         data = np.concatenate(raw_samples)
         if self._device_channels > 1:
-            data = data.reshape(-1, self._device_channels)[:, 0]
+            data = downmix_to_mono(data, self._device_channels)
 
         # Resample from _device_sample_rate to target_sample_rate (16kHz)
         if self._device_sample_rate != self.target_sample_rate:

@@ -112,12 +112,12 @@ pip install -r requirements.txt
   - **即時音訊能量條 (Live Audio VU Meter)**：以約 12.5 Hz 節流顯示目前擷取的音訊 RMS/Peak 能量動態與來源裝置（`Spotify.exe` 獨立進程或系統混音）。
   - 顯示目前 ASR 運算裝置徽章（`CUDA GPU`、`CPU 模式` 或 `CPU 降級`）、模型載入/暖身進度條、最新辨識日文字串預覽與比對相似度分數。
 - **滑出式抽屜面板**：
-  - **⚙️ 設定抽屜**：設定 Spotify `Client ID`、`Client Secret`、`Redirect URI` 與一鍵 OAuth 授權、切換音源模式（`Spotify API` / `System Media`）、開關 `Spotify Process Loopback`、啟停 ASR 自動捲動、選擇 Whisper 模型（`turbo`、`kotoba-whisper-v2.0`、`large-v3`、`medium`、`small`、`base`）、運算裝置（`auto` / `cuda` / `cpu`）、Polling / Recognition Debug 日誌開關，以及 **比對過程 Trace 記錄 (`data/traces/*.jsonl`)**。
+  - **⚙️ 設定抽屜**：設定 Spotify `Client ID`、`Client Secret`、`Redirect URI` 與一鍵 OAuth 授權、切換音源模式（`Spotify API` / `System Media`）、開關 `Spotify Process Loopback`、啟停 ASR 自動捲動、選擇 Whisper 模型（`turbo`、`kotoba-whisper-v2.0`、`large-v3`、`medium`、`small`、`base`）、運算裝置（`auto` / `cuda` / `cpu`）、Polling / Recognition Debug 日誌開關、**比對過程 Trace 記錄 (`data/traces/*.jsonl`)**，以及選配 **16kHz 音訊 WAV 錄製 (`data/recordings/*.wav`)**。
   - **📜 即時日誌抽屜**：統一收集 `stdout`、`stderr` 與 Python `logging` 紀錄，支援依等級篩選（全部 / 資訊 / 警告 / 錯誤 / 除錯）、自動捲動、一鍵複製與清空。
 
 ### 離線比對過程檢視與策略評測
 
-在 **⚙️ 設定** 勾選 **「記錄比對過程 Trace (`data/traces/*.jsonl`)」** 後播放歌曲（途中任何手動點擊歌詞定位也會一併記錄為基準錨點），即可離線檢視每步分數或比較不同比對策略／門檻的效果：
+在 **⚙️ 設定** 勾選 **「記錄比對過程 Trace (`data/traces/*.jsonl`)」** 後播放歌曲（途中任何手動點擊歌詞定位也會一併記錄為基準錨點；亦可勾選 **「錄製 16kHz 音訊 WAV (`data/recordings/*.wav`)」** 保存單聲道音檔供離線測試不同 Whisper 模型或音訊前處理），即可離線檢視每步分數或比較不同比對策略／門檻的效果：
 
 ```powershell
 # 檢視單首歌曲的每步 ASR 識別、候選行分數與手動定位時間軸
@@ -126,8 +126,8 @@ pip install -r requirements.txt
 # 針對錄製好的 Trace 並列比較不同參數或策略，並列出決策分歧點
 .\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy baseline:threshold=0.70,recovery=0.55 --diff
 
-# 比較舊版 pykakasi、UtaTen <rt> 振假名、Issue #3 智慧同步，以及 Issue #4 歌唱音韻正規化／加權編輯距離／相鄰跨行／連續字元 Beam 對齊策略
-.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy rt_reading --strategy rt_smart_sync --strategy phono_sync --strategy phono_weighted --strategy pair_sync --strategy phono_pair_sync --strategy beam_align --diff
+# 比較舊版 pykakasi、UtaTen <rt> 振假名、Issue #3 智慧同步、Issue #4 歌唱音韻／Beam 對齊，以及 Issue #5 ASR 信心與幻覺過濾策略
+.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy rt_reading --strategy rt_smart_sync --strategy phono_sync --strategy phono_weighted --strategy pair_sync --strategy phono_pair_sync --strategy beam_align --strategy beam_asr_opt --diff
 ```
 
 ### 自行建立 Release 可攜包
@@ -150,10 +150,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_portable.ps1 -SkipEnvBu
 
 - **PyWebView 單一深色桌面視窗**：將曲目列、純淨振假名歌詞舞台、即時音量 VU Meter、設定抽屜與即時日誌整合為單一現代化視窗。
 - **自動偵測當前歌曲**：支援透過 Windows 系統媒體控制 (SMTC) (`system_media.py`) 或 Spotify Web API (`spotify_api.py`) 獲取正在播放的曲目資訊。
-- **Spotify 獨立進程收音 (Process Loopback)**：在 Windows 11 上原生支援單獨錄製 `Spotify.exe` 音訊 (`process_loopback.py`)，徹底排除遊戲、Discord、瀏覽器等其他系統雜音干擾。
+- **Spotify 獨立進程收音與雙聲道前處理**：在 Windows 11 上原生支援單獨錄製 `Spotify.exe` 音訊 (`process_loopback.py`)，透過雙聲道 `(L + R) / 2` Mid 聲道混音 (`downmix_to_mono`) 強化中央主唱人聲並選配 Butterworth 人聲帶通濾波 (`apply_vocal_bandpass`)，排除遊戲、Discord、瀏覽器等雜音干擾。
 - **GPU 自動加速與智慧 CPU 降級**：自動掛載虛擬環境中的 NVIDIA CUDA (`cublas64_12.dll` / `cudnn`) 路徑並於啟動時進行暖身推理驗證；若 GPU 不可用或發生執行期錯誤，自動無縫切換為 CPU (`int8`) 模式不中斷辨識。
 - **高精準度日文語音辨識與滑動視窗匹配**：
-  - 支援 `kotoba-whisper-v2.0-faster` 與 `turbo` 等模型，使用多相濾波重採樣 (`scipy.signal.resample_poly`) 與滑動視窗收音 (`asr_worker.py`)。
+  - 支援 `kotoba-whisper-v2.0-faster` 與 `turbo` 等模型，使用多相濾波重採樣 (`scipy.signal.resample_poly`)、滑動視窗收音 (`asr_worker.py`)、接下來數行歌詞上下文提示 (`initial_prompt` 搭配 `condition_on_previous_text=False`)，以及 segment 信心度與間奏幻覺過濾（`avg_logprob`、`no_speech_prob`、`compression_ratio`、重複迴圈與詞庫感知語氣詞防護）。
   - 內建連續字元時間軸 Top-K Beam 追蹤與清濁音加權 Smith-Waterman 局部對齊 (`matching.py`、`phonology.py`)，整合日文歌唱音韻正規化（助詞、四假名、長音、促音）、未消耗尾端保留、短句誤觸防護、連續重複句智慧去重、自適應高亮時機與點擊歌詞任意行手動跳轉定位（亦支援 RapidFuzz 單行／相鄰跨行拼接模式）。
 - **無瀏覽器 UtaTen 爬蟲與 `<ruby>` 解析器**：直接由 Python 後端抓取並清洗 UtaTen HTML (`web_scraper.py`、`parser.py`)，優先採用 `<rt>` 振假名讀音（支援義訓／当て字）產生正規化比對目標，並透過本地快取 (`song_cache.py`) 秒開已聽過的歌曲。
 

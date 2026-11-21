@@ -1,15 +1,24 @@
 """Audio capture loop and faster-whisper ASR worker."""
 
+from datetime import datetime
 import functools
 import inspect
 import math
 import os
+from pathlib import Path
 import threading
 import time
-from typing import Any, cast
+from typing import Any, Callable, cast
+import wave
 
 from utaten_finder.audio.cuda_loader import prepare_windows_cuda_dll_paths
+from utaten_finder.audio.process_loopback import (
+    apply_vocal_bandpass,
+    downmix_to_mono,
+)
 from utaten_finder.core import config, events
+from utaten_finder.lyrics.matching import filter_asr_segments
+from utaten_finder.lyrics.trace import sanitize_trace_slug
 
 with config.startup_progress_stage(0.20, 0.30, "載入音訊重採樣模組 (SciPy)..."):
     from scipy.signal import resample_poly
@@ -145,11 +154,219 @@ def _emit_silent_audio_level(source_name: str = "") -> None:
     )
 
 
+class AsrWavRecorder:
+    """Thread-safe 16kHz mono 16-bit PCM WAV recorder for offline ASR evaluation."""
+
+    def __init__(
+        self,
+        recordings_dir: Path | None = None,
+        sample_rate: int | None = None,
+        max_files: int | None = None,
+    ) -> None:
+        self._recordings_dir = (
+            Path(recordings_dir) if recordings_dir is not None else None
+        )
+        self._sample_rate = int(sample_rate) if sample_rate is not None else None
+        self._max_files = max_files
+        self._lock = threading.Lock()
+        self._writer: wave.Wave_write | None = None
+        self._current_path: Path | None = None
+        self._current_slug: str = ""
+
+    @property
+    def current_path(self) -> Path | None:
+        with self._lock:
+            return self._current_path
+
+    @property
+    def is_recording(self) -> bool:
+        with self._lock:
+            return self._writer is not None
+
+    def _resolve_dir(self) -> Path:
+        return (
+            self._recordings_dir
+            if self._recordings_dir is not None
+            else config.RECORDINGS_DIR
+        )
+
+    def _resolve_sample_rate(self) -> int:
+        if self._sample_rate is not None:
+            return max(8000, self._sample_rate)
+        return max(8000, int(getattr(config, "ASR_SAMPLE_RATE", 16000)))
+
+    def _resolve_max_files(self) -> int:
+        if self._max_files is not None:
+            return int(self._max_files)
+        return int(getattr(config, "ASR_RECORD_WAV_MAX_FILES", 20))
+
+    def _prune_old_files_locked(self, rec_dir: Path) -> None:
+        max_files = self._resolve_max_files()
+        if max_files <= 0:
+            return
+        try:
+            wav_files = list(rec_dir.glob("*.wav"))
+        except OSError:
+            return
+        if len(wav_files) <= max_files:
+            return
+
+        def _sort_key(path: Path) -> tuple[float, str]:
+            try:
+                return (path.stat().st_mtime, path.name)
+            except OSError:
+                return (0.0, path.name)
+
+        wav_files.sort(key=_sort_key)
+        excess = len(wav_files) - max_files
+        current_resolved = (
+            self._current_path.resolve() if self._current_path is not None else None
+        )
+        for old_path in wav_files:
+            if excess <= 0:
+                break
+            try:
+                if (
+                    current_resolved is not None
+                    and old_path.resolve() == current_resolved
+                ):
+                    continue
+                old_path.unlink()
+                excess -= 1
+            except OSError:
+                continue
+
+    def _close_locked(self) -> None:
+        if self._writer is not None:
+            try:
+                self._writer.close()
+            except Exception:
+                pass
+            self._writer = None
+        self._current_path = None
+        self._current_slug = ""
+
+    def _open_locked(self, slug: str) -> bool:
+        rec_dir = self._resolve_dir()
+        safe_slug = sanitize_trace_slug(slug or "asr_capture")
+        try:
+            rec_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_name = f"{stamp}_{safe_slug}"
+            candidate = rec_dir / f"{base_name}.wav"
+            suffix = 2
+            while candidate.exists():
+                candidate = rec_dir / f"{base_name}_{suffix}.wav"
+                suffix += 1
+            writer = wave.open(str(candidate), "wb")
+            writer.setnchannels(1)
+            writer.setsampwidth(2)
+            writer.setframerate(self._resolve_sample_rate())
+        except Exception as exc:
+            print(f"⚠️ [AsrWav] 無法建立 WAV 錄音檔: {exc}")
+            self._writer = None
+            self._current_path = None
+            self._current_slug = ""
+            return False
+
+        self._writer = writer
+        self._current_path = candidate
+        self._current_slug = safe_slug
+        self._prune_old_files_locked(rec_dir)
+        print(f"💾 [AsrWav] 開始錄製 16kHz WAV: {candidate}")
+        return True
+
+    def write_step(
+        self,
+        mono_float32: Any,
+        *,
+        track_slug: str = "",
+        enabled: bool | None = None,
+    ) -> bool:
+        """Append mono float32 samples as 16-bit PCM frames to the active WAV file."""
+        is_enabled = (
+            bool(enabled)
+            if enabled is not None
+            else bool(getattr(config, "ASR_RECORD_WAV_ENABLED", False))
+        )
+        with self._lock:
+            if not is_enabled:
+                if self._writer is not None:
+                    self._close_locked()
+                return False
+
+            arr = np.asarray(mono_float32, dtype=np.float32).reshape(-1)
+            if arr.size == 0:
+                return False
+
+            norm_slug = sanitize_trace_slug(track_slug or "asr_capture")
+            if self._writer is None or norm_slug != self._current_slug:
+                self._close_locked()
+                if not self._open_locked(norm_slug):
+                    return False
+
+            clipped = np.clip(
+                np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0),
+                -1.0,
+                1.0,
+            )
+            pcm16 = np.round(clipped * 32767.0).astype("<i2")
+            try:
+                assert self._writer is not None
+                self._writer.writeframes(pcm16.tobytes())
+                return True
+            except Exception as exc:
+                print(f"⚠️ [AsrWav] 寫入 WAV 失敗: {exc}")
+                self._close_locked()
+                return False
+
+    def close(self, reason: str = "stopped") -> None:
+        """Close the active WAV writer cleanly if open."""
+        with self._lock:
+            if self._writer is not None:
+                path = self._current_path
+                self._close_locked()
+                if path is not None:
+                    print(f"💾 [AsrWav] 已關閉錄音檔 ({reason}): {path}")
+
+
+_asr_context_provider: Callable[[], dict[str, Any] | None] | None = None
+_asr_context_lock = threading.Lock()
+_wav_recorder = AsrWavRecorder()
+
+
+def set_asr_context_provider(
+    provider: Callable[[], dict[str, Any] | None] | None,
+) -> None:
+    """Register a thread-safe callback providing live lyrics context for ASR."""
+    global _asr_context_provider
+    with _asr_context_lock:
+        _asr_context_provider = provider
+
+
+def _get_current_asr_context() -> dict[str, Any]:
+    with _asr_context_lock:
+        provider = _asr_context_provider
+    if provider is None:
+        return {}
+    try:
+        ctx = provider()
+        return dict(ctx) if isinstance(ctx, dict) else {}
+    except Exception:
+        return {}
+
+
+def close_asr_wav_recording(reason: str = "stopped") -> None:
+    """Close any active 16kHz WAV recording file cleanly."""
+    _wav_recorder.close(reason=reason)
+
+
 def set_asr_listening(active: bool) -> None:
     """Enable or pause ASR transcription without tearing down the loaded model."""
     global _asr_listening_active
     _asr_listening_active = bool(active)
     if not _asr_listening_active:
+        close_asr_wav_recording("paused")
         _emit_silent_audio_level()
 
 
@@ -158,6 +375,7 @@ def request_asr_stop() -> None:
     global _asr_listening_active
     _asr_listening_active = False
     _asr_stop_event.set()
+    close_asr_wav_recording("stopped")
     _emit_silent_audio_level()
 
 
@@ -426,6 +644,26 @@ def _asr_worker_loop(
     chunk_counter = 0
     level_emitter = AudioLevelEmitter()
 
+    def _record_captured_step(step_samples: Any) -> None:
+        if (
+            not _asr_listening_active
+            or _asr_stop_event.is_set()
+            or not config.ASR_ENABLED
+        ):
+            return
+        if not getattr(config, "ASR_RECORD_WAV_ENABLED", False):
+            if _wav_recorder.is_recording:
+                _wav_recorder.close("disabled")
+            return
+        arr = np.asarray(step_samples, dtype=np.float32)
+        if not _wav_recorder.is_recording and (
+            arr.size == 0 or float(np.max(np.abs(arr))) < 1e-4
+        ):
+            return
+        ctx = _get_current_asr_context()
+        slug = str(ctx.get("track_slug") or "")
+        _wav_recorder.write_step(arr, track_slug=slug, enabled=True)
+
     def _process_audio_chunk(mono_float32):
         nonlocal model, recognition_count, chunk_counter
         global _asr_disabled_logged, _asr_active_device, _asr_fallback_cpu
@@ -442,6 +680,17 @@ def _asr_worker_loop(
         _asr_disabled_logged = False
 
         audio_data = np.clip(mono_float32, -1.0, 1.0).astype(np.float32)
+        if getattr(config, "ASR_VOCAL_BANDPASS_ENABLED", False):
+            audio_data = apply_vocal_bandpass(
+                audio_data,
+                sample_rate=sample_rate,
+                lowcut_hz=float(
+                    getattr(config, "ASR_VOCAL_BANDPASS_LOW_HZ", 80.0)
+                ),
+                highcut_hz=float(
+                    getattr(config, "ASR_VOCAL_BANDPASS_HIGH_HZ", 7600.0)
+                ),
+            )
 
         volume = abs(audio_data).mean()
         if volume < 0.0001:
@@ -452,14 +701,37 @@ def _asr_worker_loop(
         audio_rms, audio_peak, _ = compute_audio_level(audio_data)
 
         try:
-            t0 = time.perf_counter()
-            segments, _ = model.transcribe(
-                audio_data,
-                language=config.ASR_LANGUAGE,
-                vad_filter=False,
-                beam_size=10,
-                best_of=5,
+            asr_ctx = _get_current_asr_context()
+            initial_prompt = ""
+            if getattr(config, "ASR_INITIAL_PROMPT_ENABLED", True):
+                raw_prompt = str(asr_ctx.get("initial_prompt") or "").strip()
+                max_prompt_chars = int(
+                    getattr(config, "ASR_INITIAL_PROMPT_MAX_CHARS", 120)
+                )
+                if raw_prompt and max_prompt_chars > 0:
+                    initial_prompt = raw_prompt[:max_prompt_chars]
+
+            beam_size = int(getattr(config, "ASR_BEAM_SIZE", 5))
+            best_of = int(getattr(config, "ASR_BEST_OF", 5))
+            if _asr_active_device == "cpu":
+                beam_size = min(beam_size, 2)
+                best_of = min(best_of, 2)
+            condition_prev = bool(
+                getattr(config, "ASR_CONDITION_ON_PREVIOUS_TEXT", False)
             )
+
+            transcribe_kwargs: dict[str, Any] = {
+                "language": config.ASR_LANGUAGE,
+                "vad_filter": False,
+                "beam_size": max(1, beam_size),
+                "best_of": max(1, best_of),
+                "condition_on_previous_text": condition_prev,
+            }
+            if initial_prompt:
+                transcribe_kwargs["initial_prompt"] = initial_prompt
+
+            t0 = time.perf_counter()
+            segments, _ = model.transcribe(audio_data, **transcribe_kwargs)
 
             try:
                 seg_list = [
@@ -512,29 +784,31 @@ def _asr_worker_loop(
                 if s["compression_ratio"] is not None
             ]
 
-            raw_text_before_filter = "".join(
-                s["text"] for s in segment_details if s["text"]
-            ).strip()
-
-            hallucinations = [
-                "ご視聴ありがとうございました",
-                "視聴ありがとうございました",
-                "チャンネル登録",
-                "高評価",
-                "よろしくお願いします",
-            ]
-            hallucinations_removed = [
-                h for h in hallucinations if h in raw_text_before_filter
-            ]
-            result_text = raw_text_before_filter
-            for h in hallucinations:
-                result_text = result_text.replace(h, "")
-            result_text = result_text.strip()
+            filter_result = filter_asr_segments(
+                segment_details,
+                lyrics_corpus=str(asr_ctx.get("lyrics_corpus") or ""),
+                min_avg_logprob=float(
+                    getattr(config, "ASR_MIN_AVG_LOGPROB", -0.80)
+                ),
+                max_no_speech_prob=float(
+                    getattr(config, "ASR_MAX_NO_SPEECH_PROB", 0.60)
+                ),
+                max_compression_ratio=float(
+                    getattr(config, "ASR_MAX_COMPRESSION_RATIO", 1.35)
+                ),
+            )
+            raw_text_before_filter = filter_result["raw_text_before_filter"]
+            hallucinations_removed = filter_result["hallucinations_removed"]
+            filtered_segments = filter_result["filtered_segments"]
+            result_text = filter_result["text"]
 
             asr_meta: dict[str, Any] = {
                 "text": result_text,
                 "raw_text_before_filter": raw_text_before_filter,
                 "hallucinations_removed": hallucinations_removed,
+                "filtered_segments": filtered_segments,
+                "segment_filtered": True,
+                "initial_prompt": initial_prompt,
                 "infer_ms": infer_ms,
                 "audio_rms": round(audio_rms, 4),
                 "audio_peak": round(audio_peak, 4),
@@ -650,6 +924,7 @@ def _asr_worker_loop(
                         on_packet=_on_loopback_packet,
                         stop_event=_asr_stop_event,
                     )
+                    _record_captured_step(mono_step)
                     audio_buffer = _advance_sliding_window(
                         audio_buffer, mono_step, step_frames
                     )
@@ -727,7 +1002,7 @@ def _asr_worker_loop(
                     )
                     data = np.frombuffer(raw, dtype=np.float32)
                     if device_channels > 1:
-                        data = data.reshape(-1, device_channels)[:, 0]
+                        data = downmix_to_mono(data, device_channels)
 
                     if _asr_listening_active and not _asr_stop_event.is_set():
                         level_emitter.emit_samples(data, source_name)
@@ -748,6 +1023,7 @@ def _asr_worker_loop(
                     step_collected = int(remainder.size)
 
                     mono = _resample_if_needed(step_data, device_rate, sample_rate)
+                    _record_captured_step(mono)
                     audio_buffer = _advance_sliding_window(
                         audio_buffer, mono, step_frames
                     )
@@ -800,9 +1076,12 @@ def _asr_worker_loop(
             buffered_frames = 0
             step_chunks = []
             step_collected = 0
+            rec_channels = max(
+                1, min(2, int(getattr(loopback_mic, "channels", 1) or 1))
+            )
             with loopback_mic.recorder(
                 samplerate=sample_rate,
-                channels=1,
+                channels=rec_channels,
                 blocksize=meter_frames,
             ) as recorder:
                 while not _asr_stop_event.is_set():
@@ -816,8 +1095,8 @@ def _asr_worker_loop(
                         break
 
                     data = recorder.record(numframes=meter_frames)
-                    if data.ndim > 1:
-                        data = data[:, 0]
+                    if data.ndim > 1 or rec_channels > 1:
+                        data = downmix_to_mono(data, rec_channels)
 
                     if _asr_listening_active and not _asr_stop_event.is_set():
                         level_emitter.emit_samples(data, source_name)
@@ -837,6 +1116,7 @@ def _asr_worker_loop(
                     step_chunks = [remainder] if remainder.size > 0 else []
                     step_collected = int(remainder.size)
 
+                    _record_captured_step(step_data)
                     audio_buffer = _advance_sliding_window(
                         audio_buffer, step_data, step_frames
                     )
@@ -858,6 +1138,7 @@ def _asr_worker_loop(
 
         _asr_stop_event.wait(0.5)
 
+    close_asr_wav_recording("worker_exit")
     _asr_started = False
 
 

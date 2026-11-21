@@ -53,6 +53,20 @@ ASR_COMPUTE_TYPE = "default"
 ASR_LANGUAGE = "ja"
 ASR_SAMPLE_RATE = 16000
 ASR_BLOCK_SECONDS = 4
+ASR_BEAM_SIZE = 5
+ASR_BEST_OF = 5
+ASR_CONDITION_ON_PREVIOUS_TEXT = False
+ASR_INITIAL_PROMPT_ENABLED = True
+ASR_INITIAL_PROMPT_LINES = 4
+ASR_INITIAL_PROMPT_MAX_CHARS = 120
+ASR_MIN_AVG_LOGPROB = -0.80
+ASR_MAX_NO_SPEECH_PROB = 0.60
+ASR_MAX_COMPRESSION_RATIO = 1.35
+ASR_VOCAL_BANDPASS_ENABLED = False
+ASR_VOCAL_BANDPASS_LOW_HZ = 80.0
+ASR_VOCAL_BANDPASS_HIGH_HZ = 7600.0
+ASR_RECORD_WAV_ENABLED = False
+ASR_RECORD_WAV_MAX_FILES = 20
 
 SPOTIFY_POLL_SECONDS = 5
 MAIN_LOOP_SLEEP_SECONDS = 0.5
@@ -71,6 +85,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / "data"
 ASSETS_DIR = PROJECT_ROOT / "assets"
 TRACES_DIR = DATA_DIR / "traces"
+RECORDINGS_DIR = DATA_DIR / "recordings"
 RUNTIME_SETTINGS_FILE = DATA_DIR / "runtime_settings.json"
 SONG_CACHE_FILE = DATA_DIR / "song_cache.json"
 SPOTIFY_TOKEN_CACHE_FILE = DATA_DIR / "spotify_token_cache"
@@ -84,6 +99,7 @@ _PERSISTED_KEYS = {
     "DEBUG_RECOGNITION",
     "DEBUG",
     "MATCH_TRACE_ENABLED",
+    "ASR_RECORD_WAV_ENABLED",
     "AUDIO_SOURCE_MODE",
     "CAPTURE_SPOTIFY_PROCESS_ONLY",
     "ASR_ENABLED",
@@ -175,6 +191,9 @@ def _load_runtime_settings() -> None:
     set_match_trace_enabled(
         data.get("MATCH_TRACE_ENABLED", MATCH_TRACE_ENABLED), persist=False
     )
+    set_asr_record_wav_enabled(
+        data.get("ASR_RECORD_WAV_ENABLED", ASR_RECORD_WAV_ENABLED), persist=False
+    )
     set_asr_enabled(data.get("ASR_ENABLED", ASR_ENABLED), persist=False)
 
     model_size = data.get("ASR_MODEL_SIZE", ASR_MODEL_SIZE)
@@ -230,6 +249,13 @@ def set_debug(enabled: bool, persist: bool = True) -> None:
 def set_match_trace_enabled(enabled: bool, persist: bool = True) -> None:
     global MATCH_TRACE_ENABLED
     MATCH_TRACE_ENABLED = bool(enabled)
+    if persist:
+        _save_runtime_settings()
+
+
+def set_asr_record_wav_enabled(enabled: bool, persist: bool = True) -> None:
+    global ASR_RECORD_WAV_ENABLED
+    ASR_RECORD_WAV_ENABLED = bool(enabled)
     if persist:
         _save_runtime_settings()
 
