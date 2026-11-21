@@ -1823,6 +1823,78 @@ class TestSpotifyPositionPriorAndSeekDetection(unittest.TestCase):
         self.assertIsNone(cleared["duration_ms"])
         self.assertFalse(cleared["is_playing"])
 
+        # Comment 4653186528 regression: poll-to-ASR offsets must cancel out and preserve est_ms
+        # Scenario: poll 1 at t=5s (sp=100_000), ASR step 1 at t=9s (est=104_000),
+        # rewind 5.5s at t=10s (sp=99_500), ASR step 2 at t=11s (est=100_500).
+        offset_trace = {
+            "path": "synthetic_poll_offset_short_rewind.jsonl",
+            "session_start": {
+                "type": "session_start",
+                "schema_version": 1,
+                "track": {
+                    "song_name": "OffsetRewindTest",
+                    "artist_name": "Tester",
+                    "song_id": "sp:offset_rw",
+                },
+                "asr_config": {"block_seconds": 4.0, "step_seconds": 2.0},
+                "matcher_config": {
+                    "alignment_mode": "beam",
+                    "position_prior_enabled": True,
+                    "seek_detection_enabled": True,
+                },
+                "initial_state": {"lazy_opened": True, "current_index": 12},
+                "lyrics": lyrics,
+            },
+            "events": [
+                {
+                    "type": "asr_step",
+                    "seq": 1,
+                    "elapsed_sec": 9.0,
+                    "asr": {"text": "あめあがりのみちにみずたまり"},
+                    "playback": {
+                        "spotify_progress_ms": 100000,
+                        "estimated_progress_ms": 104000,
+                        "duration_ms": 240000,
+                        "is_playing": True,
+                    },
+                    "decision": "matched_phase1",
+                    "matched_index": 13,
+                },
+                {
+                    "type": "asr_step",
+                    "seq": 2,
+                    "elapsed_sec": 11.0,
+                    "asr": {"text": "きえないおもいをそらにとばした"},
+                    "playback": {
+                        "spotify_progress_ms": 99500,
+                        "estimated_progress_ms": 100500,
+                        "duration_ms": 240000,
+                        "is_playing": True,
+                    },
+                    "decision": "matched_phase1",
+                    "matched_index": 7,
+                },
+            ],
+        }
+        offset_run = eval_matching.replay_trace(
+            offset_trace, eval_matching.parse_strategy_spec("beam_pos_prior"), anchor_mode="eval"
+        )
+        self.assertEqual(offset_run["summary"]["seek_reanchors"], 1)
+        self.assertEqual(offset_run["summary"]["rewind_advances"], 1)
+        self.assertEqual(offset_run["timeline"][1]["matched_index"], 7)
+        self.assertIsNotNone(offset_run["timeline"][1]["seek_detected"])
+        self.assertEqual(offset_run["timeline"][1]["seek_detected"]["type"], "rewind")
+
+        # Verify BaselineStrategy preserves engine estimated_progress_ms without sp-lag
+        strat2 = eval_matching.BaselineStrategy(eval_matching.parse_strategy_spec("beam_pos_prior"))
+        vclock2 = eval_matching.VirtualClock(9.0)
+        strat2.reset(lyrics, offset_trace["session_start"], vclock2)
+        strat2.update_playback_progress(offset_trace["events"][0]["playback"])
+        self.assertEqual(strat2._engine.get_playback_progress()["estimated_progress_ms"], 104000)
+        vclock2.now = 11.0
+        strat2.update_playback_progress(offset_trace["events"][1]["playback"])
+        self.assertEqual(strat2._engine.get_playback_progress()["estimated_progress_ms"], 100500)
+
 
 if __name__ == "__main__":
     unittest.main()

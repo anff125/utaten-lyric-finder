@@ -510,16 +510,13 @@ class BaselineStrategy(ReplayStrategy):
             self._last_est_ms = est_int
             return
 
-        poll_changed = poll_tuple != self._last_poll_tuple
         self._last_poll_tuple = poll_tuple
         self._last_est_ms = est_int
         self._engine.update_playback_progress(
             sp_ms,
             dur_ms,
             is_playing=is_playing,
-            estimated_progress_ms=(
-                est_int if (sp_ms is None or not poll_changed) else None
-            ),
+            estimated_progress_ms=est_int,
         )
 
 

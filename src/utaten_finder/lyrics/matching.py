@@ -942,7 +942,11 @@ class LyricSyncEngine:
                         new_est is not None
                         and expected_est is not None
                         and prev_base is not None
-                        and new_est <= (prev_base - 250)
+                        and (
+                            (new_sp <= (prev_sp - 250))
+                            if (new_sp is not None and prev_sp is not None)
+                            else (new_est <= (prev_base - 250))
+                        )
                         and (expected_est - new_est) >= self._seek_rewind_threshold_ms
                     )
                 ):
