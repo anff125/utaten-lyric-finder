@@ -3,11 +3,14 @@
 import ast
 import logging
 import math
+import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
+import wave
 
 import numpy as np
 
@@ -20,7 +23,12 @@ if _SRC_DIR not in sys.path:
 
 import app  # noqa: E402
 from utaten_finder.audio import asr_worker  # noqa: E402
+from utaten_finder.audio.process_loopback import (  # noqa: E402
+    apply_vocal_bandpass,
+    downmix_to_mono,
+)
 from utaten_finder.core import config, events  # noqa: E402
+from utaten_finder.ui.webview_app import AppController  # noqa: E402
 
 
 class TestAudioLevelComputationAndEmitter(unittest.TestCase):
@@ -226,6 +234,189 @@ class TestAppEntryAndPortableManifest(unittest.TestCase):
         self.assertEqual(manifest_files, expected_files)
         self.assertNotIn("src/utaten_finder/ui/legacy_gui.py", manifest_files)
         self.assertNotIn("src/utaten_finder/lyrics/browser_sync.py", manifest_files)
+
+
+class TestAudioPreprocessingAndWavRecorder(unittest.TestCase):
+    def test_downmix_to_mono_preserves_mid_and_cancels_out_of_phase_sides(
+        self,
+    ) -> None:
+        self.assertEqual(downmix_to_mono([], channels=2).size, 0)
+        mono_in = np.array([0.1, -0.2, 0.3], dtype=np.float32)
+        np.testing.assert_allclose(
+            downmix_to_mono(mono_in, channels=1), mono_in, atol=1e-6
+        )
+
+        # Interleaved stereo: center vocal=0.5, side guitar=+0.3/-0.3 -> Mid=(L+R)/2 == 0.5
+        interleaved = np.array(
+            [0.8, 0.2, 0.2, 0.8, 0.5, 0.5], dtype=np.float32
+        )
+        np.testing.assert_allclose(
+            downmix_to_mono(interleaved, channels=2),
+            np.array([0.5, 0.5, 0.5], dtype=np.float32),
+            atol=1e-6,
+        )
+
+        # Odd trailing sample with channels=2 drops only trailing incomplete frame.
+        odd_interleaved = np.array([0.6, 0.4, 0.9], dtype=np.float32)
+        np.testing.assert_allclose(
+            downmix_to_mono(odd_interleaved, channels=2),
+            np.array([0.5], dtype=np.float32),
+            atol=1e-6,
+        )
+
+        # 2D stereo & multi-channel (4ch) use (ch0 + ch1) / 2.
+        stereo_2d = np.array([[0.4, 0.0], [-0.2, 0.6]], dtype=np.float32)
+        np.testing.assert_allclose(
+            downmix_to_mono(stereo_2d),
+            np.array([0.2, 0.2], dtype=np.float32),
+            atol=1e-6,
+        )
+        quad_2d = np.array(
+            [[0.8, 0.4, 0.1, -0.1], [0.2, 0.6, 0.0, 0.0]], dtype=np.float32
+        )
+        np.testing.assert_allclose(
+            downmix_to_mono(quad_2d, channels=4),
+            np.array([0.6, 0.4], dtype=np.float32),
+            atol=1e-6,
+        )
+
+    def test_apply_vocal_bandpass_attenuates_sub_bass_and_keeps_vocals(
+        self,
+    ) -> None:
+        short = np.array([2.0, -2.0, 0.5], dtype=np.float32)
+        np.testing.assert_allclose(
+            apply_vocal_bandpass(short, sample_rate=16000),
+            np.array([1.0, -1.0, 0.5], dtype=np.float32),
+            atol=1e-6,
+        )
+
+        t = np.arange(16000, dtype=np.float32) / 16000.0
+        sub_bass = 0.5 * np.sin(2.0 * math.pi * 20.0 * t)
+        vocal_tone = 0.5 * np.sin(2.0 * math.pi * 440.0 * t)
+
+        filtered_bass = apply_vocal_bandpass(sub_bass, sample_rate=16000)
+        filtered_vocal = apply_vocal_bandpass(vocal_tone, sample_rate=16000)
+
+        bass_rms = float(np.sqrt(np.mean(np.square(filtered_bass))))
+        vocal_rms = float(np.sqrt(np.mean(np.square(filtered_vocal))))
+        self.assertLess(bass_rms, 0.02)
+        self.assertGreater(vocal_rms, 0.30)
+
+    def test_asr_wav_recorder_writes_rotates_prunes_and_closes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rec_dir = Path(tmpdir)
+            recorder = asr_worker.AsrWavRecorder(
+                recordings_dir=rec_dir, sample_rate=16000, max_files=2
+            )
+            samples = np.array([0.0, 0.5, -0.5, 0.25], dtype=np.float32)
+
+            # Disabled write is a clean no-op.
+            self.assertFalse(
+                recorder.write_step(
+                    samples, track_slug="Yorushika_Track1", enabled=False
+                )
+            )
+            self.assertEqual(list(rec_dir.glob("*.wav")), [])
+
+            # Enabled writes 16kHz mono 16-bit PCM WAV.
+            self.assertTrue(
+                recorder.write_step(
+                    samples, track_slug="Yorushika_Track1", enabled=True
+                )
+            )
+            p1 = recorder.current_path
+            self.assertIsNotNone(p1)
+            assert p1 is not None
+            self.assertIn("Yorushika_Track1", p1.name)
+            self.assertTrue(recorder.is_recording)
+
+            # Rotating track slug opens a new WAV file and closes the old one.
+            self.assertTrue(
+                recorder.write_step(
+                    samples, track_slug="Yorushika_Track2", enabled=True
+                )
+            )
+            p2 = recorder.current_path
+            self.assertIsNotNone(p2)
+            assert p2 is not None
+            self.assertNotEqual(p1, p2)
+
+            # Distinct older mtimes ensure deterministic pruning when Track3 opens.
+            os.utime(p1, (1000.0, 1000.0))
+            os.utime(p2, (2000.0, 2000.0))
+
+            self.assertTrue(
+                recorder.write_step(
+                    samples, track_slug="Yorushika_Track3", enabled=True
+                )
+            )
+            p3 = recorder.current_path
+            self.assertIsNotNone(p3)
+            assert p3 is not None
+
+            recorder.close("done")
+            self.assertFalse(recorder.is_recording)
+
+            remaining = sorted(p.name for p in rec_dir.glob("*.wav"))
+            self.assertEqual(len(remaining), 2)
+            self.assertFalse(p1.exists())
+            self.assertTrue(p2.exists())
+            self.assertTrue(p3.exists())
+
+            with wave.open(str(p3), "rb") as wf:
+                self.assertEqual(wf.getnchannels(), 1)
+                self.assertEqual(wf.getsampwidth(), 2)
+                self.assertEqual(wf.getframerate(), 16000)
+                self.assertEqual(wf.getnframes(), 4)
+                pcm = np.frombuffer(wf.readframes(4), dtype="<i2")
+                self.assertEqual(pcm[0], 0)
+                self.assertGreater(pcm[1], 16000)
+                self.assertLess(pcm[2], -16000)
+
+    @patch("utaten_finder.ui.webview_app.has_valid_cached_token", return_value=False)
+    def test_config_and_app_controller_persist_wav_recording_setting(
+        self, _mock_token
+    ) -> None:
+        orig_file = config.RUNTIME_SETTINGS_FILE
+        orig_wav = config.ASR_RECORD_WAV_ENABLED
+        orig_asr = config.ASR_ENABLED
+        self.addCleanup(setattr, config, "RUNTIME_SETTINGS_FILE", orig_file)
+        self.addCleanup(setattr, config, "ASR_RECORD_WAV_ENABLED", orig_wav)
+        self.addCleanup(setattr, config, "ASR_ENABLED", orig_asr)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "runtime_settings.json"
+            config.RUNTIME_SETTINGS_FILE = settings_path
+            config.set_asr_record_wav_enabled(False, persist=False)
+            config.set_asr_enabled(True, persist=False)
+
+            controller = AppController()
+            self.addCleanup(controller.shutdown)
+
+            initial = controller.get_initial_state()
+            self.assertFalse(initial["settings"]["asr_record_wav_enabled"])
+
+            res_on = controller.save_settings({"asr_record_wav_enabled": True})
+            self.assertTrue(res_on["ok"])
+            self.assertTrue(config.ASR_RECORD_WAV_ENABLED)
+
+            with patch.object(
+                asr_worker, "close_asr_wav_recording"
+            ) as mock_close:
+                res_off = controller.save_settings(
+                    {"asr_record_wav_enabled": False}
+                )
+            self.assertTrue(res_off["ok"])
+            self.assertFalse(config.ASR_RECORD_WAV_ENABLED)
+            mock_close.assert_called_once_with("disabled")
+
+            with patch.object(
+                asr_worker, "close_asr_wav_recording"
+            ) as mock_close_asr:
+                res_asr_off = controller.save_settings({"asr_enabled": False})
+            self.assertTrue(res_asr_off["ok"])
+            self.assertFalse(config.ASR_ENABLED)
+            mock_close_asr.assert_called_once_with("asr_disabled")
 
 
 if __name__ == "__main__":

@@ -110,12 +110,12 @@ All runtime configuration and caches are stored centrally under `data/` (`data/r
   - **Live Audio VU Meter** (~12.5 Hz) visualizes incoming RMS/peak energy and active capture source (`Spotify.exe` Process Loopback or system loopback).
   - Displays the active inference device badge (`CUDA GPU`, `CPU Mode`, or `CPU Fallback`), startup/model load progress bar, live recognized Japanese transcript preview, and match score badge.
 - **Slide-over Drawers**:
-  - **⚙️ Settings Drawer**: Configure Spotify `Client ID`, `Client Secret`, `Redirect URI`, one-click Spotify OAuth authorization, Audio Source (`Spotify API` / `System Media`), `Spotify Process Loopback`, ASR auto-scroll toggle, Whisper model (`turbo`, `kotoba-whisper-v2.0`, `large-v3`, `medium`, `small`, `base`), compute device (`auto` / `cuda` / `cpu`), Polling/Recognition debug toggles, and **Match Trace JSONL recording** (`data/traces/*.jsonl`).
+  - **⚙️ Settings Drawer**: Configure Spotify `Client ID`, `Client Secret`, `Redirect URI`, one-click Spotify OAuth authorization, Audio Source (`Spotify API` / `System Media`), `Spotify Process Loopback`, ASR auto-scroll toggle, Whisper model (`turbo`, `kotoba-whisper-v2.0`, `large-v3`, `medium`, `small`, `base`), compute device (`auto` / `cuda` / `cpu`), Polling/Recognition debug toggles, **Match Trace JSONL recording** (`data/traces/*.jsonl`), and optional **16kHz WAV audio recording** (`data/recordings/*.wav`).
   - **📜 Live Logs Drawer**: Captures `stdout`, `stderr`, and Python `logging` events with level filtering (`all`, `info`, `warn`, `error`, `debug`), auto-scroll, copy, and clear actions.
 
 ### Offline Match Evaluation & Strategy Comparison
 
-Enable **Record match trace (`data/traces/*.jsonl`)** in **⚙️ Settings** while playing songs (any manual lyric clicks are also recorded as ground-truth anchors). You can then inspect timelines and compare matcher strategies/thresholds offline:
+Enable **Record match trace (`data/traces/*.jsonl`)** in **⚙️ Settings** while playing songs (any manual lyric clicks are also recorded as ground-truth anchors; optionally enable **Record 16kHz WAV (`data/recordings/*.wav`)** to benchmark different Whisper models or audio preprocessing offline). You can then inspect timelines and compare matcher strategies/thresholds offline:
 
 ```powershell
 # Inspect step-by-step ASR scores and manual jump anchors
@@ -124,8 +124,8 @@ Enable **Record match trace (`data/traces/*.jsonl`)** in **⚙️ Settings** whi
 # Compare multiple strategies or thresholds on recorded traces
 .\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy baseline:threshold=0.70,recovery=0.55 --diff
 
-# Compare baseline pykakasi normalization, <rt> furigana readings, Issue #3 smart sync, and Issue #4 phonological/pair/beam strategies
-.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy rt_reading --strategy rt_smart_sync --strategy phono_sync --strategy phono_weighted --strategy pair_sync --strategy phono_pair_sync --strategy beam_align --diff
+# Compare baseline pykakasi normalization, <rt> furigana readings, Issue #3 smart sync, Issue #4 phonological/pair/beam strategies, and Issue #5 ASR confidence filtering
+.\.venv\Scripts\python.exe scripts\eval_matching.py data\traces\ --strategy baseline --strategy rt_reading --strategy rt_smart_sync --strategy phono_sync --strategy phono_weighted --strategy pair_sync --strategy phono_pair_sync --strategy beam_align --strategy beam_asr_opt --diff
 ```
 
 ### Build your own portable release package
@@ -148,10 +148,10 @@ After completion, the portable folder and ZIP file will be generated under `buil
 
 - **Single-Window PyWebView Desktop UI**: Combines track controls, clean `<ruby>` furigana lyrics, live audio VU meter, settings drawer, and live log viewer in one lightweight dark window.
 - **Automatic current-song detection**: Supports Windows SMTC (`system_media.py`) and Spotify Web API (`spotify_api.py`).
-- **Spotify Process Loopback**: Native Windows 11 WASAPI Process Loopback (`process_loopback.py`) captures audio exclusively from `Spotify.exe`, eliminating game, Discord, and browser noise.
+- **Spotify Process Loopback & Audio Preprocessing**: Native Windows 11 WASAPI Process Loopback (`process_loopback.py`) captures audio exclusively from `Spotify.exe` with stereo Mid-channel `(L + R) / 2` downmixing (`downmix_to_mono`) to emphasize center-panned vocals and optional Butterworth vocal bandpass filtering (`apply_vocal_bandpass`), eliminating game, Discord, and browser noise.
 - **Automatic CUDA DLL Resolution & CPU Fallback**: Preloads pip-installed NVIDIA `cublas64_12.dll` / `cudnn` libraries (`cuda_loader.py`) with startup warm-up verification, and seamlessly falls back to CPU (`int8`) mode if GPU initialization or inference fails.
 - **Enhanced Japanese ASR & Sliding-Window Matching**:
-  - Supports `kotoba-whisper-v2.0-faster` and `turbo` with polyphase resampling (`scipy.signal.resample_poly`) and sliding-window capture (`asr_worker.py`).
+  - Supports `kotoba-whisper-v2.0-faster` and `turbo` with polyphase resampling (`scipy.signal.resample_poly`), sliding-window capture (`asr_worker.py`), rolling upcoming-lyric `initial_prompt` hints (`condition_on_previous_text=False`), and segment confidence/interlude hallucination filtering (`avg_logprob`, `no_speech_prob`, `compression_ratio`, repetitive-loop & context-aware filler guards).
   - Continuous character timeline Top-K Beam alignment with weighted Smith-Waterman local alignment (`matching.py`, `phonology.py`), Japanese singing phonological normalization (particles, yotsugana, long vowels, sokuon, and voiced/unvoiced tolerance), unconsumed tail retention, short-line protection, consecutive repeated-line handling, adaptive highlight timing, and click-to-jump sync (with optional RapidFuzz line-by-line & adjacent-pair mode).
 - **Browserless UtaTen Scraper & Sanitized `<ruby>` Parser**: Fetches and parses UtaTen lyrics directly in Python (`web_scraper.py`, `parser.py`), prioritizing `<rt>` furigana readings (including ateji/gikun) when building normalized sync targets, and caches matches in `song_cache.py`.
 

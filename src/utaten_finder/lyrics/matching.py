@@ -1,6 +1,7 @@
 """Japanese text normalization and multi-mode fuzzy lyric synchronization."""
 
 from dataclasses import dataclass
+import math
 import re
 import threading
 import time
@@ -16,7 +17,7 @@ from utaten_finder.lyrics.phonology import (
     smith_waterman_local_peaks,
     weighted_indel_ratio,
 )
-from utaten_finder.lyrics.trace import MatchTraceRecorder
+from utaten_finder.lyrics.trace import MatchTraceRecorder, sanitize_trace_slug
 
 try:
     from pykakasi import kakasi
@@ -47,6 +48,209 @@ def normalize_to_hiragana(text):
         except Exception:
             return text
     return text
+
+
+UNCONDITIONAL_HALLUCINATIONS: tuple[str, ...] = (
+    "ご視聴ありがとうございました",
+    "視聴ありがとうございました",
+    "チャンネル登録",
+    "高評価",
+    "よろしくお願いします",
+    "字幕作成",
+    "サブタイトル",
+)
+
+INTERLUDE_FILLER_HALLUCINATIONS: frozenset[str] = frozenset(
+    {
+        "ごめん",
+        "ごめんなさい",
+        "ありがとう",
+        "ありがとうございました",
+        "おやすみ",
+        "おやすみなさい",
+        "お疲れ様でした",
+        "おつかれさまでした",
+        "字幕",
+        "拍手",
+        "音楽",
+        "歌詞",
+        "me",
+        "you",
+        "お",
+        "おー",
+        "うん",
+        "うー",
+        "あ",
+        "あー",
+        "え",
+        "えー",
+        "ん",
+        "はい",
+        "ええ",
+    }
+)
+
+_REPETITIVE_LOOP_RE = re.compile(r"(.{1,6}?)\1{2,}")
+_PUNCT_STRIP_KEEP_LONG_RE = re.compile(r"[\s\u3000、。,.!！?？『』「」\\〜~…-]")
+
+
+def _opt_finite_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    return num if math.isfinite(num) else None
+
+
+def has_repetitive_token_loop(text: str) -> bool:
+    """Detect 3+ consecutive repetitions of a 1-6 char token dominating the text."""
+    norm = normalize_match_text(text)
+    if len(norm) < 4:
+        return False
+    covered = sum(m.end() - m.start() for m in _REPETITIVE_LOOP_RE.finditer(norm))
+    return (covered / len(norm)) >= 0.60
+
+
+def _is_token_in_lyrics_corpus(token: str, corpus_lower: str) -> bool:
+    if not token or not corpus_lower:
+        return False
+    if len(token) <= 1:
+        return f"\n{token}\n" in f"\n{corpus_lower}\n"
+    if token.isascii() and any(ch.isalpha() for ch in token):
+        if re.search(rf"(?<![a-z]){re.escape(token)}(?![a-z])", corpus_lower):
+            return True
+        return len(token) >= 6 and token in corpus_lower
+    return token in corpus_lower
+
+
+def filter_asr_segments(
+    segments: list[dict[str, Any]],
+    *,
+    lyrics_corpus: str | None = None,
+    min_avg_logprob: float = -0.80,
+    max_no_speech_prob: float = 0.60,
+    max_compression_ratio: float = 1.35,
+    filter_interlude_fillers: bool = True,
+) -> dict[str, Any]:
+    """Filter low-confidence Whisper segments and instrumental hallucinations."""
+    raw_text_before_filter = "".join(
+        str(seg.get("text") or "")
+        for seg in segments
+        if isinstance(seg, dict)
+    ).strip()
+    corpus_lower = (lyrics_corpus or "").lower()
+
+    hallucinations_removed: list[str] = []
+    kept_segments: list[dict[str, Any]] = []
+    filtered_segments: list[dict[str, Any]] = []
+
+    def _record_removed_phrase(phrase: str) -> None:
+        if phrase and phrase not in hallucinations_removed:
+            hallucinations_removed.append(phrase)
+
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        seg_text = str(seg.get("text") or "")
+        cleaned = seg_text
+        for phrase in UNCONDITIONAL_HALLUCINATIONS:
+            if phrase in cleaned:
+                _record_removed_phrase(phrase)
+                cleaned = cleaned.replace(phrase, "")
+
+        cleaned_stripped = cleaned.strip()
+        if not cleaned_stripped:
+            if seg_text.strip():
+                filtered_segments.append({**seg, "reason": "hallucination_phrase"})
+            continue
+
+        avg_logprob = _opt_finite_float(seg.get("avg_logprob"))
+        no_speech_prob = _opt_finite_float(seg.get("no_speech_prob"))
+        compression_ratio = _opt_finite_float(seg.get("compression_ratio"))
+
+        drop_reason = ""
+        if no_speech_prob is not None and (
+            no_speech_prob > max_no_speech_prob
+            or (
+                no_speech_prob > 0.45
+                and avg_logprob is not None
+                and avg_logprob < -0.50
+            )
+        ):
+            drop_reason = "high_no_speech_prob"
+        elif avg_logprob is not None and avg_logprob < min_avg_logprob:
+            drop_reason = "low_avg_logprob"
+        elif (
+            compression_ratio is not None
+            and compression_ratio > max_compression_ratio
+        ):
+            drop_reason = "high_compression_ratio"
+        else:
+            punct_stripped = _PUNCT_STRIP_KEEP_LONG_RE.sub(
+                "", cleaned_stripped
+            ).lower()
+            norm_seg = normalize_match_text(cleaned_stripped)
+            hira_seg = normalize_match_text(
+                normalize_to_hiragana(cleaned_stripped)
+            )
+            cand_keys = [
+                key
+                for key in (
+                    cleaned_stripped.lower(),
+                    punct_stripped,
+                    norm_seg,
+                    hira_seg,
+                )
+                if key
+            ]
+            present_in_lyrics = any(
+                _is_token_in_lyrics_corpus(key, corpus_lower)
+                for key in cand_keys
+            )
+            if (
+                has_repetitive_token_loop(cleaned_stripped)
+                and not present_in_lyrics
+            ):
+                drop_reason = "repetitive_loop"
+                _record_removed_phrase(cleaned_stripped)
+            elif filter_interlude_fillers and not present_in_lyrics:
+                is_filler = any(
+                    key in INTERLUDE_FILLER_HALLUCINATIONS
+                    for key in cand_keys
+                )
+                is_low_conf_single = (
+                    len(norm_seg) == 1
+                    and avg_logprob is not None
+                    and avg_logprob < -0.45
+                )
+                if is_filler or is_low_conf_single:
+                    drop_reason = "interlude_filler"
+                    _record_removed_phrase(cleaned_stripped)
+
+        if drop_reason:
+            filtered_segments.append(
+                {**seg, "text": cleaned_stripped, "reason": drop_reason}
+            )
+            continue
+
+        kept_segments.append({**seg, "text": cleaned})
+
+    result_text = "".join(str(seg.get("text") or "") for seg in kept_segments)
+    for phrase in UNCONDITIONAL_HALLUCINATIONS:
+        if phrase in result_text:
+            _record_removed_phrase(phrase)
+            result_text = result_text.replace(phrase, "")
+    result_text = result_text.strip()
+
+    return {
+        "text": result_text,
+        "raw_text_before_filter": raw_text_before_filter,
+        "hallucinations_removed": hallucinations_removed,
+        "kept_segments": kept_segments,
+        "filtered_segments": filtered_segments,
+    }
 
 
 def _length_coverage_ratio(source_text, target_text):
@@ -270,6 +474,10 @@ class LyricSyncEngine:
         beam_back_slack: int = 16,
         beam_max_buffer_chars: int = 32,
         beam_buffer_stale_seconds: float = 6.5,
+        asr_segment_filter: bool = False,
+        asr_min_avg_logprob: float = -0.80,
+        asr_max_no_speech_prob: float = 0.60,
+        asr_max_compression_ratio: float = 1.35,
         emit_events: bool = True,
     ) -> None:
         if display_mode not in _VALID_DISPLAY_MODES:
@@ -339,6 +547,12 @@ class LyricSyncEngine:
             _BeamHypothesis(pos=0, score=0.0, last_adv_time=None, last_line=-1)
         ]
         self._beam_buffer_at: float | None = None
+        self._asr_segment_filter = bool(asr_segment_filter)
+        self._asr_min_avg_logprob = float(asr_min_avg_logprob)
+        self._asr_max_no_speech_prob = float(asr_max_no_speech_prob)
+        self._asr_max_compression_ratio = float(asr_max_compression_ratio)
+        self._lyrics_corpus = ""
+        self._track_slug = ""
         self._emit_events = bool(emit_events)
 
         self._playback_song_id: str | None = None
@@ -420,6 +634,10 @@ class LyricSyncEngine:
             "beam_back_slack": self._beam_back_slack,
             "beam_max_buffer_chars": self._beam_max_buffer_chars,
             "beam_buffer_stale_seconds": self._beam_buffer_stale_seconds,
+            "asr_segment_filter": self._asr_segment_filter,
+            "asr_min_avg_logprob": self._asr_min_avg_logprob,
+            "asr_max_no_speech_prob": self._asr_max_no_speech_prob,
+            "asr_max_compression_ratio": self._asr_max_compression_ratio,
         }
 
     def update_playback_progress(
@@ -635,6 +853,40 @@ class LyricSyncEngine:
             ]
             self._beam_buffer_at = None
 
+            corpus_parts: list[str] = []
+            for line in self._lyrics:
+                for key in ("original", "normalized", "reading"):
+                    val = str(line.get(key) or "").strip()
+                    if val:
+                        corpus_parts.append(val.lower())
+                        norm_val = normalize_match_text(val)
+                        if norm_val:
+                            corpus_parts.append(norm_val)
+            self._lyrics_corpus = "\n".join(corpus_parts)
+
+            if self._lyrics and track_meta:
+                artist = str(
+                    track_meta.get("artist_name")
+                    or track_meta.get("artist")
+                    or ""
+                ).strip()
+                title = str(
+                    track_meta.get("song_name")
+                    or track_meta.get("title")
+                    or ""
+                ).strip()
+                if artist and title:
+                    raw_slug = f"{artist}_{title}"
+                elif title or artist:
+                    raw_slug = title or artist
+                else:
+                    raw_slug = str(track_meta.get("song_id") or "unknown_track")
+                self._track_slug = sanitize_trace_slug(raw_slug)
+            elif self._lyrics:
+                self._track_slug = "unknown_track"
+            else:
+                self._track_slug = ""
+
             new_song_id = (track_meta or {}).get("song_id")
             if not self._lyrics or (
                 new_song_id
@@ -655,6 +907,11 @@ class LyricSyncEngine:
                         "block_seconds": config.ASR_BLOCK_SECONDS,
                         "step_seconds": config.ASR_BLOCK_SECONDS / 2,
                         "language": config.ASR_LANGUAGE,
+                        "beam_size": config.ASR_BEAM_SIZE,
+                        "best_of": config.ASR_BEST_OF,
+                        "condition_on_previous_text": config.ASR_CONDITION_ON_PREVIOUS_TEXT,
+                        "initial_prompt_enabled": config.ASR_INITIAL_PROMPT_ENABLED,
+                        "vocal_bandpass_enabled": config.ASR_VOCAL_BANDPASS_ENABLED,
                     }
                     self._trace_recorder.start_session(
                         track_meta or {},
@@ -684,6 +941,69 @@ class LyricSyncEngine:
         """Return the current matched/jumped lyric index, or -1 if none."""
         with self._lock:
             return self._current_index
+
+    def _build_upcoming_prompt_locked(
+        self, max_lines: int | None = None, max_chars: int | None = None
+    ) -> str:
+        if not self._lyrics:
+            return ""
+        limit_lines = (
+            int(max_lines)
+            if max_lines is not None
+            else int(getattr(config, "ASR_INITIAL_PROMPT_LINES", 4))
+        )
+        limit_chars = (
+            int(max_chars)
+            if max_chars is not None
+            else int(getattr(config, "ASR_INITIAL_PROMPT_MAX_CHARS", 120))
+        )
+        if limit_lines <= 0 or limit_chars <= 0:
+            return ""
+
+        start_idx = max(0, self._current_index + 1)
+        if start_idx >= len(self._lyrics):
+            return ""
+
+        parts: list[str] = []
+        total_chars = 0
+        for line in self._lyrics[start_idx:]:
+            orig = str(line.get("original") or "").strip()
+            if not orig:
+                continue
+            sep_len = 1 if parts else 0
+            if parts and (total_chars + sep_len + len(orig)) > limit_chars:
+                break
+            if not parts and len(orig) > limit_chars:
+                parts.append(orig[:limit_chars])
+                break
+            parts.append(orig)
+            total_chars += sep_len + len(orig)
+            if len(parts) >= limit_lines:
+                break
+        return "、".join(parts)
+
+    def get_upcoming_prompt(
+        self, max_lines: int | None = None, max_chars: int | None = None
+    ) -> str:
+        """Return a compact prompt from the next upcoming lyric lines."""
+        with self._lock:
+            return self._build_upcoming_prompt_locked(
+                max_lines=max_lines, max_chars=max_chars
+            )
+
+    def get_asr_context(
+        self, max_lines: int | None = None, max_chars: int | None = None
+    ) -> dict[str, Any]:
+        """Return current lyric context (initial prompt, corpus, track slug) for ASR."""
+        with self._lock:
+            return {
+                "initial_prompt": self._build_upcoming_prompt_locked(
+                    max_lines=max_lines, max_chars=max_chars
+                ),
+                "lyrics_corpus": self._lyrics_corpus,
+                "track_slug": self._track_slug,
+                "current_index": self._current_index,
+            }
 
     def apply_manual_jump(self, lyric_index: int) -> dict[str, Any] | None:
         """Jump synchronization anchor to a user-selected lyric line."""
@@ -2005,6 +2325,43 @@ class LyricSyncEngine:
                 if should_record
                 else None
             )
+
+            if (
+                self._asr_segment_filter
+                and asr_meta is not None
+                and not asr_payload.get("segment_filtered")
+                and isinstance(asr_payload.get("segments"), list)
+                and asr_payload["segments"]
+            ):
+                filtered_res = filter_asr_segments(
+                    asr_payload["segments"],
+                    lyrics_corpus=self._lyrics_corpus,
+                    min_avg_logprob=self._asr_min_avg_logprob,
+                    max_no_speech_prob=self._asr_max_no_speech_prob,
+                    max_compression_ratio=self._asr_max_compression_ratio,
+                )
+                cleaned_text = filtered_res["text"]
+                asr_payload["text"] = cleaned_text
+                asr_payload["raw_text_before_filter"] = filtered_res[
+                    "raw_text_before_filter"
+                ]
+                asr_payload["hallucinations_removed"] = filtered_res[
+                    "hallucinations_removed"
+                ]
+                asr_payload["filtered_segments"] = filtered_res[
+                    "filtered_segments"
+                ]
+                asr_payload["segment_filtered"] = True
+                canonical_recognized = (
+                    normalize_match_text(normalize_to_hiragana(cleaned_text))
+                    if cleaned_text
+                    else ""
+                )
+                match_recognized = (
+                    self._to_match_key(canonical_recognized)
+                    if canonical_recognized
+                    else ""
+                )
 
             if (
                 not cleaned_text

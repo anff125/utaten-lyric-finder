@@ -18,10 +18,10 @@ This document provides context, architecture details, and mandatory verification
   - `orchestrator.py`: Core orchestration loop (polls current track, looks up cache/scraper, loads parsed lyrics into `LyricSyncEngine`, emits `track_updated`/`asr_preview`, and optionally opens matched URLs in the default browser via `open_external_browser` in `--cli` mode).
 - **`src/utaten_finder/audio/`**:
   - `cuda_loader.py`: Dynamically registers pip-installed NVIDIA CUDA DLL directories (`nvidia/cublas/bin`, `nvidia/cudnn/bin`) into both `os.add_dll_directory` and `os.environ["PATH"]` before importing `faster_whisper` / `ctranslate2`, with `SetErrorMode` popup suppression and `WinError 577` preloading retries.
-  - `asr_worker.py`: Audio capture loop + `faster-whisper` (`ctranslate2`) transcription pipeline with 1-second silent warm-up, automatic CPU (`compute_type="int8"`) fallback (tracked via `fallback` flag in `asr_status`), and throttled (~12.5 Hz) real-time RMS/Peak VU meter emission (`compute_audio_level`, `AudioLevelEmitter`).
-  - `process_loopback.py`: Windows 11 native WASAPI Process Loopback (`ActivateAudioInterfaceAsync` via `ctypes`/COM) to capture audio exclusively from `Spotify.exe` without system/game/Discord noise, streaming packet chunks to `on_packet` for live VU meter updates.
+  - `asr_worker.py`: Audio capture loop + `faster-whisper` (`ctranslate2`) transcription pipeline with 1-second silent warm-up, automatic CPU (`compute_type="int8"`) fallback (tracked via `fallback` flag in `asr_status`), rolling upcoming-lyric `initial_prompt` (`condition_on_previous_text=False`), confidence/interlude hallucination filtering (`filter_asr_segments`), optional 16kHz WAV recording (`AsrWavRecorder` -> `data/recordings/`), and throttled (~12.5 Hz) real-time RMS/Peak VU meter emission (`compute_audio_level`, `AudioLevelEmitter`).
+  - `process_loopback.py`: Windows 11 native WASAPI Process Loopback (`ActivateAudioInterfaceAsync` via `ctypes`/COM) to capture audio exclusively from `Spotify.exe` without system/game/Discord noise, plus stereo Mid-channel `(L + R) / 2` downmixing (`downmix_to_mono`) and optional Butterworth vocal bandpass filtering (`apply_vocal_bandpass`), streaming packet chunks to `on_packet` for live VU meter updates.
 - **`src/utaten_finder/lyrics/`**:
-  - `matching.py`: Japanese text normalization (`pykakasi` / `jaconv` to hiragana), `LyricsAgent` two-phase fuzzy matching (local lookahead + lost-position recovery), and `LyricSyncEngine` decoupled state machine.
+  - `matching.py`: Japanese text normalization (`pykakasi` / `jaconv` to hiragana), ASR segment confidence & interlude hallucination filtering (`filter_asr_segments`, `has_repetitive_token_loop`), `LyricsAgent` two-phase fuzzy matching, and `LyricSyncEngine` decoupled state machine (including `get_upcoming_prompt` / `get_asr_context`).
   - `parser.py`: Browserless UtaTen HTML parser (`parse_utaten_lyrics`) producing sanitized `<ruby>/<rt>` lyric lines and normalized matching fields for both `<p>` and `<br>` DOM layouts.
   - `web_scraper.py`: Searches UtaTen / DuckDuckGo (`ddgs`) and fetches UtaTen lyric page HTML (`fetch_utaten_lyrics_html`).
   - `song_cache.py`: Local JSON cache (`data/song_cache.json`) mapping track keys to UtaTen URLs and match quality status.
@@ -37,10 +37,12 @@ This document provides context, architecture details, and mandatory verification
 - **Virtual Environment**: Local Python environment is located at `.venv\` (`.venv\Scripts\python.exe`, `.venv\Scripts\pythonw.exe`, `.venv\Scripts\ruff.exe`).
 - **Git Executable**: If `git` is not on the default PowerShell `PATH`, use `"$env:LOCALAPPDATA\Programs\Git\cmd\git.exe"` or `"C:\Program Files\Git\cmd\git.exe"`.
 - **Shell & Non-Interactive Execution**: Tool shells spawn Windows PowerShell 5.1 by default even when PowerShell 7 (`pwsh`) is installed. Never execute interactive commands that may block waiting for prompts or `stdin`; always pass non-interactive flags (`-NoProfile -NonInteractive`) and explicitly invoke `pwsh -NoProfile -NonInteractive` for PowerShell 7 / `PSScriptAnalyzer` checks.
+  - Never use `stdin`-reading flags like `git commit -F -` or `gh pr create --body-file -`, and never pipe text into `& { ... }` scriptblocks (which can hang waiting for `stdin` EOF). Run `git` / `gh` directly in the shell using multiple `-m "..."` flags or a PowerShell here-string variable (`$body = @' ... '@` with `--body $body`), without wrapping them in an extra `pwsh -Command '...'` string.
 - **File Encodings & Line Endings**:
   - **`*.bat` files (`start.bat`, `update.bat`)**: MUST use Windows **`CRLF` (`\r\n`)** line endings and **UTF-8 without BOM** (or pure ASCII). `cmd.exe` misparses byte offsets if a batch file uses `LF` line endings or UTF-8 BOM without `chcp 65001 >nul`.
   - **`*.ps1` files (`scripts/build_portable.ps1`)**: Must include a **UTF-8 BOM** if it contains non-ASCII characters (such as Traditional Chinese comments), as required by Windows PowerShell 5.1 and `PSScriptAnalyzer`.
   - **`requirements.txt`**: Keep encoded in **UTF-8 without BOM**.
+  - **Python/Text working-copy files (`*.py`, `*.md`, etc.)**: On Windows (`core.autocrlf=true`), preserve **`CRLF` (`\r\n`)** line endings so `git add` does not emit `LF will be replaced by CRLF` warnings.
 
 ---
 

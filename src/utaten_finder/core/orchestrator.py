@@ -171,6 +171,8 @@ def main(
     last_spotify_poll_at = 0.0
 
     set_asr_listening_fn = None
+    close_asr_wav_fn = None
+    set_asr_context_provider_fn = None
     asr_listening_started = False
 
     engine = (
@@ -238,13 +240,18 @@ def main(
             if config.ASR_ENABLED:
                 config.report_startup_progress(0.18, "準備啟動語音辨識引擎 (ASR)...")
                 from utaten_finder.audio.asr_worker import (
+                    close_asr_wav_recording,
                     ensure_asr_worker_started,
                     get_asr_device_mode,
+                    set_asr_context_provider,
                     set_asr_listening,
                 )
 
                 set_asr_listening_fn = set_asr_listening
+                close_asr_wav_fn = close_asr_wav_recording
+                set_asr_context_provider_fn = set_asr_context_provider
                 get_device_fn = get_asr_device_mode
+                set_asr_context_provider(engine.get_asr_context)
                 set_asr_listening(True)
                 asr_listening_started = True
                 ensure_asr_worker_started(asr_callback)
@@ -518,6 +525,10 @@ def main(
         engine.close_trace_session("worker_stopped", clear_pending=True)
         if asr_listening_started and set_asr_listening_fn is not None:
             set_asr_listening_fn(False)
+        if set_asr_context_provider_fn is not None:
+            set_asr_context_provider_fn(None)
+        if close_asr_wav_fn is not None:
+            close_asr_wav_fn("worker_stopped")
 
 
 if __name__ == "__main__":

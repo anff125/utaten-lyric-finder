@@ -102,6 +102,7 @@
     settingDebugPolling: document.getElementById("setting-debug-polling"),
     settingDebugRecognition: document.getElementById("setting-debug-recognition"),
     settingMatchTrace: document.getElementById("setting-match-trace"),
+    settingRecordWav: document.getElementById("setting-record-wav"),
     btnSaveSettings: document.getElementById("btn-save-settings"),
 
     logDrawer: document.getElementById("log-drawer"),
@@ -683,6 +684,7 @@
       debug_polling: els.settingDebugPolling.checked,
       debug_recognition: els.settingDebugRecognition.checked,
       match_trace_enabled: els.settingMatchTrace.checked,
+      asr_record_wav_enabled: els.settingRecordWav.checked,
     };
   }
 
@@ -795,6 +797,7 @@
     els.settingDebugPolling.checked = Boolean(settings.debug_polling);
     els.settingDebugRecognition.checked = Boolean(settings.debug_recognition);
     els.settingMatchTrace.checked = Boolean(settings.match_trace_enabled);
+    els.settingRecordWav.checked = Boolean(settings.asr_record_wav_enabled);
 
     renderWorkerState({
       running: Boolean(initial.worker_running),
@@ -1001,6 +1004,7 @@
       els.settingDebugPolling,
       els.settingDebugRecognition,
       els.settingMatchTrace,
+      els.settingRecordWav,
     ]) {
       control.addEventListener("change", () => {
         persistSettings(true);
