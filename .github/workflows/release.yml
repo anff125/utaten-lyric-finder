@@ -35,7 +35,7 @@ jobs:
         run: |
           # 判斷是否命中快取
           $skip = if ('${{ steps.cache-env.outputs.cache-hit }}' -eq 'true') { $true } else { $false }
-          ./scripts/build_portable.ps1 -SkipEnvBuild $skip
+          ./scripts/build_portable.ps1 -SkipEnvBuild:$skip
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
