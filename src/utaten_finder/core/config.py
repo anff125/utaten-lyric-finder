@@ -59,7 +59,8 @@ ASR_CONDITION_ON_PREVIOUS_TEXT = False
 ASR_INITIAL_PROMPT_ENABLED = True
 ASR_INITIAL_PROMPT_LINES = 4
 ASR_INITIAL_PROMPT_MAX_CHARS = 120
-ASR_MIN_AVG_LOGPROB = -0.80
+DISTILLED_ASR_MODEL_KEYWORDS: tuple[str, ...] = ("kotoba", "distil")
+ASR_MIN_AVG_LOGPROB = -0.90
 ASR_MAX_NO_SPEECH_PROB = 0.60
 ASR_MAX_COMPRESSION_RATIO = 1.35
 ASR_VOCAL_BANDPASS_ENABLED = False
@@ -67,6 +68,23 @@ ASR_VOCAL_BANDPASS_LOW_HZ = 80.0
 ASR_VOCAL_BANDPASS_HIGH_HZ = 7600.0
 ASR_RECORD_WAV_ENABLED = False
 ASR_RECORD_WAV_MAX_FILES = 20
+
+
+def is_distilled_asr_model(model_name: str | None = None) -> bool:
+    """判斷指定的 Whisper 模型是否為蒸餾模型（如 kotoba / distil），需自動停用 initial_prompt。"""
+    raw_target = ASR_MODEL_SIZE if model_name is None else model_name
+    actual_id = get_model_id_from_display(str(raw_target or "").strip())
+    normalized = actual_id.lower()
+    if not normalized:
+        return False
+    return any(keyword in normalized for keyword in DISTILLED_ASR_MODEL_KEYWORDS)
+
+
+def is_initial_prompt_active(model_name: str | None = None) -> bool:
+    """回傳指定（或目前設定的）Whisper 模型實際是否啟用 initial_prompt。"""
+    if not bool(ASR_INITIAL_PROMPT_ENABLED):
+        return False
+    return not is_distilled_asr_model(model_name)
 
 SPOTIFY_POLL_SECONDS = 5
 MAIN_LOOP_SLEEP_SECONDS = 0.5

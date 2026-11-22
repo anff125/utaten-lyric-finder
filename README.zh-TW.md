@@ -115,6 +115,27 @@ pip install -r requirements.txt
   - **⚙️ 設定抽屜**：設定 Spotify `Client ID`、`Client Secret`、`Redirect URI` 與一鍵 OAuth 授權、切換音源模式（`Spotify API` / `System Media`）、開關 `Spotify Process Loopback`、啟停 ASR 自動捲動、選擇 Whisper 模型（`turbo`、`kotoba-whisper-v2.0`、`large-v3`、`medium`、`small`、`base`）、運算裝置（`auto` / `cuda` / `cpu`）、Polling / Recognition Debug 日誌開關、**比對過程 Trace 記錄 (`data/traces/*.jsonl`)**，以及選配 **16kHz 音訊 WAV 錄製 (`data/recordings/*.wav`)**。
   - **📜 即時日誌抽屜**：統一收集 `stdout`、`stderr` 與 Python `logging` 紀錄，支援依等級篩選（全部 / 資訊 / 警告 / 錯誤 / 除錯）、自動捲動、一鍵複製與清空。
 
+### 6. Whisper 模型下載卡住／Hugging Face 限流排解 (`HF_TOKEN`)
+
+首次下載較大型的 Whisper 模型（如 `kotoba-whisper-v2.0-faster`、`turbo`、`large-v3`）時，若處於共享 IP 或頻繁請求的網路環境，可能會遭遇 Hugging Face Hub 匿名下載限流（Rate Limit / `429`），導致模型下載長時間卡住或失敗。
+
+您可以透過設定免費的 Hugging Face `HF_TOKEN` 改以帳號配額下載來避開匿名 IP 限流：
+
+1. **建立免費 Hugging Face Read Token**：
+   - 登入並前往 [Hugging Face Access Tokens](https://huggingface.co/settings/tokens)。
+   - 點擊 **Create new token**，選擇 **Read** 權限，建立後複製該 Token（格式為 `hf_...`）。
+2. **方式 A：於 PowerShell 暫時設定 `HF_TOKEN` 後啟動**：
+   ```powershell
+   $env:HF_TOKEN="你的_hf_token"
+   .\start.bat
+   ```
+3. **方式 B：於 Windows 系統環境變數永久設定 `HF_TOKEN`**：
+   - 在 Windows 開始選單搜尋並開啟 **「編輯系統環境變數」**（或 **「編輯帳戶的環境變數」**）-> 點擊 **「環境變數(N)...」**。
+   - 在「使用者變數」區塊點擊 **「新增(N)...」**，變數名稱填寫 `HF_TOKEN`，變數值貼上您的 `hf_...` Token 後按確定（亦可在 PowerShell 執行 `[Environment]::SetEnvironmentVariable("HF_TOKEN", "你的_hf_token", "User")`）。
+   - 重新開啟終端機或重新執行 `start.bat` 即可永久生效。
+4. **殘缺快取自動檢測與修復**：
+   - 啟動時程式會自動驗證本地快取目錄是否包含非空的 `model.bin` 與 `config.json`；若先前因斷網或強制關閉導致快取殘缺，會自動切換為線上補全下載（`local_files_only=False`）。若補下載仍失敗，可手動刪除 `%USERPROFILE%\.cache\huggingface\hub\` 下對應的模型快取資料夾後重試。
+
 ### 離線比對過程檢視與策略評測
 
 在 **⚙️ 設定** 勾選 **「記錄比對過程 Trace (`data/traces/*.jsonl`)」** 後播放歌曲（途中任何手動點擊歌詞定位也會一併記錄為基準錨點；亦可勾選 **「錄製 16kHz 音訊 WAV (`data/recordings/*.wav`)」** 保存單聲道音檔供離線測試不同 Whisper 模型或音訊前處理），即可離線檢視每步分數或比較不同比對策略／門檻的效果：
@@ -153,7 +174,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_portable.ps1 -SkipEnvBu
 - **Spotify 獨立進程收音與雙聲道前處理**：在 Windows 11 上原生支援單獨錄製 `Spotify.exe` 音訊 (`process_loopback.py`)，透過雙聲道 `(L + R) / 2` Mid 聲道混音 (`downmix_to_mono`) 強化中央主唱人聲並選配 Butterworth 人聲帶通濾波 (`apply_vocal_bandpass`)，排除遊戲、Discord、瀏覽器等雜音干擾。
 - **GPU 自動加速與智慧 CPU 降級**：自動掛載虛擬環境中的 NVIDIA CUDA (`cublas64_12.dll` / `cudnn`) 路徑並於啟動時進行暖身推理驗證；若 GPU 不可用或發生執行期錯誤，自動無縫切換為 CPU (`int8`) 模式不中斷辨識。
 - **高精準度日文語音辨識與滑動視窗匹配**：
-  - 支援 `kotoba-whisper-v2.0-faster` 與 `turbo` 等模型，使用多相濾波重採樣 (`scipy.signal.resample_poly`)、滑動視窗收音 (`asr_worker.py`)、接下來數行歌詞上下文提示 (`initial_prompt` 搭配 `condition_on_previous_text=False`)，以及 segment 信心度與間奏幻覺過濾（`avg_logprob`、`no_speech_prob`、`compression_ratio`、重複迴圈與詞庫感知語氣詞防護）。
+  - 支援 `kotoba-whisper-v2.0-faster` 與 `turbo` 等模型，具備本地模型快取完整性驗證（自動檢查 `model.bin` 與 `config.json` 並於殘缺時自動補下載）、多相濾波重採樣 (`scipy.signal.resample_poly`)、滑動視窗收音 (`asr_worker.py`)、接下來數行歌詞上下文提示（`initial_prompt` 搭配 `condition_on_previous_text=False`，針對 `kotoba` / `distil` 等蒸餾模型自動停用以避免解碼抑制，標準 Whisper 模型維持啟用），以及 segment 信心度與間奏幻覺過濾（`avg_logprob >= -0.90`、`no_speech_prob`、`compression_ratio`、重複迴圈與詞庫感知語氣詞防護）。
   - 內建連續字元時間軸 Top-K Beam 追蹤與清濁音加權 Smith-Waterman 局部對齊 (`matching.py`、`phonology.py`)，整合日文歌唱音韻正規化（助詞、四假名、長音、促音）、未消耗尾端保留、短句誤觸防護、連續重複句智慧去重、自適應高亮時機與點擊歌詞任意行手動跳轉定位（亦支援 RapidFuzz 單行／相鄰跨行拼接模式）。
   - 當 Spotify 播放進度 (`progress_ms` / `duration_ms`) 可用時，會將進度百分比映射至歌詞字元時間軸作為軟性位置先驗（降低副歌重複段誤跳並保留前奏／間奏寬容區間），並在偵測到手動倒轉／快轉時自動重新錨定搜尋視窗（不影響 System Media 模式）。
 - **無瀏覽器 UtaTen 爬蟲與 `<ruby>` 解析器**：直接由 Python 後端抓取並清洗 UtaTen HTML (`web_scraper.py`、`parser.py`)，優先採用 `<rt>` 振假名讀音（支援義訓／当て字）產生正規化比對目標，並透過本地快取 (`song_cache.py`) 秒開已聽過的歌曲。

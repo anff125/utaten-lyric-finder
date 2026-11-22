@@ -953,7 +953,8 @@ class TestAsrSegmentFilterAndInitialPrompt(unittest.TestCase):
             {"text": "バラバラバラバラ", "avg_logprob": -0.35, "no_speech_prob": 0.08, "compression_ratio": 1.41},
             {"text": "おうけ", "avg_logprob": -0.92, "no_speech_prob": 0.05, "compression_ratio": 0.53},
             {"text": "ねむい", "avg_logprob": -0.30, "no_speech_prob": 0.72, "compression_ratio": 0.60},
-            {"text": "やさしいうそ", "avg_logprob": -0.22, "no_speech_prob": 0.04, "compression_ratio": 0.75},
+            {"text": "やさしい", "avg_logprob": -0.85, "no_speech_prob": 0.04, "compression_ratio": 0.72},
+            {"text": "うそ", "avg_logprob": -0.22, "no_speech_prob": 0.04, "compression_ratio": 0.75},
         ]
         res = filter_asr_segments(segments, lyrics_corpus=corpus_without_fillers)
         self.assertEqual(res["text"], "やさしいうそ")
@@ -1119,8 +1120,12 @@ class TestAsrSegmentFilterAndInitialPrompt(unittest.TestCase):
             _line(0, "雲を抜け風下へ私だけ"),
             _line(1, "だから僕は音楽を辞めた"),
         ]
-        # Verify session_start asr_config records decode/preprocess settings.
+        # Verify session_start asr_config records decode/preprocess settings (including distilled model initial_prompt auto-disable).
         with tempfile.TemporaryDirectory() as tmpdir:
+            orig_model = eval_matching.config.ASR_MODEL_SIZE
+            self.addCleanup(setattr, eval_matching.config, "ASR_MODEL_SIZE", orig_model)
+
+            eval_matching.config.ASR_MODEL_SIZE = "turbo"
             rec = MatchTraceRecorder(
                 traces_dir=Path(tmpdir), is_enabled_fn=lambda: True
             )
@@ -1133,7 +1138,22 @@ class TestAsrSegmentFilterAndInitialPrompt(unittest.TestCase):
             self.assertIn("beam_size", loaded_cfg)
             self.assertIn("condition_on_previous_text", loaded_cfg)
             self.assertIn("initial_prompt_enabled", loaded_cfg)
+            self.assertTrue(loaded_cfg["initial_prompt_enabled"])
             self.assertIn("vocal_bandpass_enabled", loaded_cfg)
+
+            eval_matching.config.ASR_MODEL_SIZE = (
+                "kotoba-tech/kotoba-whisper-v2.0-faster"
+            )
+            eng.reset_with_lyrics(
+                lyrics, track_meta={"song_name": "CfgDistilledTest"}
+            )
+            tpath_distil = rec.current_trace_path
+            eng.close_trace_session("done")
+            assert tpath_distil is not None
+            loaded_distil_cfg = load_trace(tpath_distil)["session_start"][
+                "asr_config"
+            ]
+            self.assertFalse(loaded_distil_cfg["initial_prompt_enabled"])
 
         post_pr11_trace = {
             "path": "synthetic_post_pr11.jsonl",

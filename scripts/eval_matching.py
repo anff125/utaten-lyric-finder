@@ -354,7 +354,7 @@ class BaselineStrategy(ReplayStrategy):
                 self._resolve_param("asr_segment_filter", matcher_cfg, False)
             ),
             "asr_min_avg_logprob": float(
-                self._resolve_param("asr_min_avg_logprob", matcher_cfg, -0.80)
+                self._resolve_param("asr_min_avg_logprob", matcher_cfg, -0.90)
             ),
             "asr_max_no_speech_prob": float(
                 self._resolve_param("asr_max_no_speech_prob", matcher_cfg, 0.60)

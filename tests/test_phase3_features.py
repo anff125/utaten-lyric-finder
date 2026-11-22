@@ -419,5 +419,343 @@ class TestAudioPreprocessingAndWavRecorder(unittest.TestCase):
             mock_close_asr.assert_called_once_with("asr_disabled")
 
 
+class TestDistilledInitialPromptAndCacheIntegrity(unittest.TestCase):
+    def test_distilled_vs_standard_model_initial_prompt_and_logprob_threshold(
+        self,
+    ) -> None:
+        self.assertAlmostEqual(config.ASR_MIN_AVG_LOGPROB, -0.90, places=4)
+
+        for distilled_name in (
+            "kotoba-tech/kotoba-whisper-v2.0-faster",
+            "kotoba-whisper-v2.0 (日語專用強化 | VRAM >= 3GB)",
+            "KOTOBA-WHISPER-V2.0",
+            "distil-large-v3",
+            "Systran/faster-distil-whisper-large-v3",
+        ):
+            self.assertTrue(
+                config.is_distilled_asr_model(distilled_name),
+                f"Expected distilled=True for {distilled_name}",
+            )
+            self.assertFalse(
+                config.is_initial_prompt_active(distilled_name),
+                f"Expected initial_prompt_active=False for {distilled_name}",
+            )
+            kwargs, prompt = asr_worker.build_transcribe_kwargs(
+                {"initial_prompt": "雲を抜け風下へ私だけ、だから僕は音楽を辞めた"},
+                device_mode="cuda",
+                model_name=distilled_name,
+            )
+            self.assertEqual(prompt, "")
+            self.assertNotIn("initial_prompt", kwargs)
+
+        for standard_name in ("turbo", "large-v3", "medium", "small", "base"):
+            self.assertFalse(
+                config.is_distilled_asr_model(standard_name),
+                f"Expected distilled=False for {standard_name}",
+            )
+            self.assertTrue(
+                config.is_initial_prompt_active(standard_name),
+                f"Expected initial_prompt_active=True for {standard_name}",
+            )
+            kwargs, prompt = asr_worker.build_transcribe_kwargs(
+                {"initial_prompt": "雲を抜け風下へ私だけ、だから僕は音楽を辞めた"},
+                device_mode="cuda",
+                model_name=standard_name,
+            )
+            self.assertEqual(prompt, "雲を抜け風下へ私だけ、だから僕は音楽を辞めた")
+            self.assertEqual(
+                kwargs.get("initial_prompt"),
+                "雲を抜け風下へ私だけ、だから僕は音楽を辞めた",
+            )
+
+        # CPU mode caps beam_size and best_of at 2 while keeping initial_prompt behavior.
+        cpu_kwargs, cpu_prompt = asr_worker.build_transcribe_kwargs(
+            {"initial_prompt": "春泥棒が風を運ぶ"},
+            device_mode="cpu",
+            model_name="turbo",
+        )
+        self.assertEqual(cpu_prompt, "春泥棒が風を運ぶ")
+        self.assertEqual(cpu_kwargs["beam_size"], 2)
+        self.assertEqual(cpu_kwargs["best_of"], 2)
+
+        # Global ASR_INITIAL_PROMPT_ENABLED=False disables prompt even on standard models.
+        orig_enabled = config.ASR_INITIAL_PROMPT_ENABLED
+        self.addCleanup(
+            setattr, config, "ASR_INITIAL_PROMPT_ENABLED", orig_enabled
+        )
+        config.ASR_INITIAL_PROMPT_ENABLED = False
+        self.assertFalse(config.is_initial_prompt_active("turbo"))
+        disabled_kwargs, disabled_prompt = asr_worker.build_transcribe_kwargs(
+            {"initial_prompt": "春泥棒が風を運ぶ"},
+            device_mode="cuda",
+            model_name="turbo",
+        )
+        self.assertEqual(disabled_prompt, "")
+        self.assertNotIn("initial_prompt", disabled_kwargs)
+
+    def test_asr_worker_loop_populates_or_suppresses_initial_prompt_in_asr_meta(
+        self,
+    ) -> None:
+        class _FakeSegment:
+            def __init__(self, text: str, avg_logprob: float = -0.84) -> None:
+                self.text = text
+                self.start = 0.0
+                self.end = 2.0
+                self.avg_logprob = avg_logprob
+                self.no_speech_prob = 0.03
+                self.compression_ratio = 0.85
+
+        class _FakeCapture:
+            def __init__(self, target_sample_rate: int = 16000) -> None:
+                self._steps = 0
+
+            def is_target_alive(self) -> bool:
+                return not asr_worker._asr_stop_event.is_set()
+
+            def start(self, pid: int) -> bool:
+                return True
+
+            def stop(self) -> None:
+                return None
+
+            def read_audio_step(
+                self,
+                step_frames: int,
+                timeout_ms: int = 1000,
+                on_packet=None,
+                stop_event=None,
+            ):
+                self._steps += 1
+                if self._steps >= 3 and stop_event is not None:
+                    stop_event.set()
+                return np.full(step_frames, 0.25, dtype=np.float32)
+
+        orig_model_size = config.ASR_MODEL_SIZE
+        orig_mode = config.AUDIO_SOURCE_MODE
+        orig_proc_only = config.CAPTURE_SPOTIFY_PROCESS_ONLY
+        orig_asr_enabled = config.ASR_ENABLED
+        orig_wav_enabled = config.ASR_RECORD_WAV_ENABLED
+        self.addCleanup(setattr, config, "ASR_MODEL_SIZE", orig_model_size)
+        self.addCleanup(setattr, config, "AUDIO_SOURCE_MODE", orig_mode)
+        self.addCleanup(
+            setattr, config, "CAPTURE_SPOTIFY_PROCESS_ONLY", orig_proc_only
+        )
+        self.addCleanup(setattr, config, "ASR_ENABLED", orig_asr_enabled)
+        self.addCleanup(
+            setattr, config, "ASR_RECORD_WAV_ENABLED", orig_wav_enabled
+        )
+        self.addCleanup(asr_worker.set_asr_context_provider, None)
+        self.addCleanup(asr_worker._asr_stop_event.clear)
+
+        config.AUDIO_SOURCE_MODE = "spotify"
+        config.CAPTURE_SPOTIFY_PROCESS_ONLY = True
+        config.ASR_ENABLED = True
+        config.ASR_RECORD_WAV_ENABLED = False
+        asr_worker.set_asr_context_provider(
+            lambda: {
+                "initial_prompt": "雲を抜け風下へ私だけ、だから僕は音楽を辞めた",
+                "lyrics_corpus": "くもをぬけかざしもへわたしだけ",
+                "track_slug": "ヨルシカ_テスト",
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir)
+            (model_dir / "model.bin").write_bytes(b"FAKE_CT2_WEIGHTS")
+            (model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+            for model_id, mutate_to, expected_prompt in (
+                ("kotoba-tech/kotoba-whisper-v2.0-faster", "turbo", ""),
+                (
+                    "turbo",
+                    "kotoba-tech/kotoba-whisper-v2.0-faster",
+                    "雲を抜け風下へ私だけ、だから僕は音楽を辞めた",
+                ),
+            ):
+                config.ASR_MODEL_SIZE = model_id
+                transcribe_calls: list[dict] = []
+                callback_results: list[tuple[str, dict]] = []
+
+                class _FakeWhisperModel:
+                    def __init__(self, *args, **kwargs) -> None:
+                        self.model = type("Inner", (), {"device": "cuda"})()
+                        # Simulate user changing config.ASR_MODEL_SIZE in settings drawer while running
+                        config.ASR_MODEL_SIZE = mutate_to
+
+                    def transcribe(self, audio, **kwargs):
+                        transcribe_calls.append(dict(kwargs))
+                        if len(transcribe_calls) == 1:
+                            return ([], None)
+                        return ([_FakeSegment("雲を抜け風下へ私だけ", -0.84)], None)
+
+                def _on_recognized(text: str, meta: dict) -> None:
+                    callback_results.append((text, dict(meta)))
+                    asr_worker._asr_stop_event.set()
+
+                asr_worker._asr_stop_event.clear()
+                asr_worker._asr_listening_active = True
+                asr_worker._asr_callback = None
+
+                with (
+                    patch.object(
+                        asr_worker, "PROCESS_LOOPBACK_AVAILABLE", True
+                    ),
+                    patch.object(
+                        asr_worker,
+                        "SpotifyProcessAudioCapture",
+                        _FakeCapture,
+                    ),
+                    patch.object(
+                        asr_worker, "find_spotify_process_id", return_value=1234
+                    ),
+                    patch.object(
+                        asr_worker,
+                        "resolve_whisper_model_path",
+                        return_value=str(model_dir),
+                    ),
+                    patch.object(
+                        asr_worker, "WhisperModel", _FakeWhisperModel
+                    ),
+                ):
+                    asr_worker._asr_worker_loop(_on_recognized)
+
+                # First call is warmup; second call is real audio chunk inference.
+                self.assertGreaterEqual(len(transcribe_calls), 2)
+                infer_kwargs = transcribe_calls[1]
+                if expected_prompt:
+                    self.assertEqual(
+                        infer_kwargs.get("initial_prompt"), expected_prompt
+                    )
+                else:
+                    self.assertNotIn("initial_prompt", infer_kwargs)
+
+                self.assertEqual(len(callback_results), 1)
+                rec_text, rec_meta = callback_results[0]
+                # Segment with avg_logprob=-0.84 is preserved by ASR_MIN_AVG_LOGPROB=-0.90!
+                self.assertEqual(rec_text, "雲を抜け風下へ私だけ")
+                self.assertEqual(rec_meta["initial_prompt"], expected_prompt)
+                self.assertEqual(rec_meta["model"], model_id)
+
+    def test_whisper_cache_completeness_verification_and_repair_fallback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            incomplete_dir = root / "incomplete_snapshot"
+            incomplete_dir.mkdir()
+            (incomplete_dir / "config.json").write_text("{}", encoding="utf-8")
+            # Missing model.bin -> incomplete!
+            self.assertEqual(
+                asr_worker.find_missing_whisper_model_files(incomplete_dir),
+                ["model.bin"],
+            )
+            self.assertFalse(
+                asr_worker.is_whisper_model_dir_complete(incomplete_dir)
+            )
+
+            # Empty (0-byte) model.bin -> still incomplete!
+            (incomplete_dir / "model.bin").write_bytes(b"")
+            self.assertEqual(
+                asr_worker.find_missing_whisper_model_files(incomplete_dir),
+                ["model.bin"],
+            )
+            self.assertFalse(
+                asr_worker.is_whisper_model_dir_complete(incomplete_dir)
+            )
+
+            complete_dir = root / "complete_snapshot"
+            complete_dir.mkdir()
+            (complete_dir / "model.bin").write_bytes(b"VALID_MODEL_BIN")
+            (complete_dir / "config.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(
+                asr_worker.find_missing_whisper_model_files(complete_dir), []
+            )
+            self.assertTrue(
+                asr_worker.is_whisper_model_dir_complete(complete_dir)
+            )
+
+            # 1. Complete cache: local_files_only=True succeeds without network fallback.
+            calls_complete: list[bool] = []
+
+            def _download_complete(
+                model_size: str, *, local_files_only: bool = False
+            ) -> str:
+                calls_complete.append(local_files_only)
+                return str(complete_dir)
+
+            resolved_ok = asr_worker.resolve_whisper_model_path(
+                "kotoba-tech/kotoba-whisper-v2.0-faster",
+                download_fn=_download_complete,
+            )
+            self.assertEqual(resolved_ok, str(complete_dir))
+            self.assertEqual(calls_complete, [True])
+
+            # 2. Incomplete cache: local_files_only=True returns directory missing model.bin,
+            #    so resolve_whisper_model_path automatically falls back to local_files_only=False.
+            calls_repair: list[bool] = []
+
+            def _download_repair(
+                model_size: str, *, local_files_only: bool = False
+            ) -> str:
+                calls_repair.append(local_files_only)
+                return (
+                    str(incomplete_dir)
+                    if local_files_only
+                    else str(complete_dir)
+                )
+
+            resolved_repaired = asr_worker.resolve_whisper_model_path(
+                "kotoba-tech/kotoba-whisper-v2.0-faster",
+                download_fn=_download_repair,
+            )
+            self.assertEqual(resolved_repaired, str(complete_dir))
+            self.assertEqual(calls_repair, [True, False])
+
+            # 3. Repair download fails (e.g., HF rate limit) -> raises RuntimeError with HF_TOKEN guidance.
+            def _download_fail(
+                model_size: str, *, local_files_only: bool = False
+            ) -> str:
+                if local_files_only:
+                    return str(incomplete_dir)
+                raise RuntimeError("429 Too Many Requests")
+
+            with self.assertRaises(RuntimeError) as ctx:
+                asr_worker.resolve_whisper_model_path(
+                    "kotoba-tech/kotoba-whisper-v2.0-faster",
+                    download_fn=_download_fail,
+                )
+            err_msg = str(ctx.exception)
+            self.assertIn("429 Too Many Requests", err_msg)
+            self.assertIn("HF_TOKEN", err_msg)
+            self.assertIn("https://huggingface.co/settings/tokens", err_msg)
+
+            # 4. Repair download returns a directory that is still incomplete -> raises RuntimeError.
+            with self.assertRaises(RuntimeError) as ctx_still_incomplete:
+                asr_worker.resolve_whisper_model_path(
+                    "turbo",
+                    download_fn=lambda _m, *, local_files_only=False: str(
+                        incomplete_dir
+                    ),
+                )
+            self.assertIn("model.bin", str(ctx_still_incomplete.exception))
+            self.assertIn("HF_TOKEN", str(ctx_still_incomplete.exception))
+
+            # 5. Direct local directory path: complete_dir returns directly without calling download_fn;
+            #    incomplete_dir raises RuntimeError with missing file and HF_TOKEN hint.
+            self.assertEqual(
+                asr_worker.resolve_whisper_model_path(
+                    str(complete_dir),
+                    download_fn=lambda *_a, **_kw: (_ for _ in ()).throw(
+                        AssertionError("download_fn must not be called")
+                    ),
+                ),
+                str(complete_dir),
+            )
+            with self.assertRaises(RuntimeError) as ctx_local_incomplete:
+                asr_worker.resolve_whisper_model_path(str(incomplete_dir))
+            self.assertIn("model.bin", str(ctx_local_incomplete.exception))
+            self.assertIn("HF_TOKEN", str(ctx_local_incomplete.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
