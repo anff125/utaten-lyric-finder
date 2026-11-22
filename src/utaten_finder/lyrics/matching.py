@@ -129,7 +129,7 @@ def filter_asr_segments(
     segments: list[dict[str, Any]],
     *,
     lyrics_corpus: str | None = None,
-    min_avg_logprob: float = -0.80,
+    min_avg_logprob: float = -0.90,
     max_no_speech_prob: float = 0.60,
     max_compression_ratio: float = 1.35,
     filter_interlude_fillers: bool = True,
@@ -475,7 +475,7 @@ class LyricSyncEngine:
         beam_max_buffer_chars: int = 32,
         beam_buffer_stale_seconds: float = 6.5,
         asr_segment_filter: bool = False,
-        asr_min_avg_logprob: float = -0.80,
+        asr_min_avg_logprob: float = -0.90,
         asr_max_no_speech_prob: float = 0.60,
         asr_max_compression_ratio: float = 1.35,
         position_prior_enabled: bool = True,
@@ -1271,7 +1271,9 @@ class LyricSyncEngine:
                         "beam_size": config.ASR_BEAM_SIZE,
                         "best_of": config.ASR_BEST_OF,
                         "condition_on_previous_text": config.ASR_CONDITION_ON_PREVIOUS_TEXT,
-                        "initial_prompt_enabled": config.ASR_INITIAL_PROMPT_ENABLED,
+                        "initial_prompt_enabled": config.is_initial_prompt_active(
+                            config.ASR_MODEL_SIZE
+                        ),
                         "vocal_bandpass_enabled": config.ASR_VOCAL_BANDPASS_ENABLED,
                     }
                     self._trace_recorder.start_session(

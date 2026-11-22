@@ -461,6 +461,177 @@ def _invoke_asr_callback(
         callback(text)
 
 
+WHISPER_REQUIRED_MODEL_FILES: tuple[str, ...] = ("model.bin", "config.json")
+
+
+def find_missing_whisper_model_files(
+    model_dir: str | Path | None,
+) -> list[str]:
+    """Return required faster-whisper model files that are missing or empty in model_dir."""
+    if not model_dir:
+        return list(WHISPER_REQUIRED_MODEL_FILES)
+    base = Path(model_dir)
+    try:
+        if not base.is_dir():
+            return list(WHISPER_REQUIRED_MODEL_FILES)
+    except OSError:
+        return list(WHISPER_REQUIRED_MODEL_FILES)
+
+    missing: list[str] = []
+    for filename in WHISPER_REQUIRED_MODEL_FILES:
+        file_path = base / filename
+        try:
+            if not file_path.is_file() or file_path.stat().st_size <= 0:
+                missing.append(filename)
+        except OSError:
+            missing.append(filename)
+    return missing
+
+
+def is_whisper_model_dir_complete(model_dir: str | Path | None) -> bool:
+    """Verify that a local faster-whisper model directory has non-empty model.bin and config.json."""
+    return len(find_missing_whisper_model_files(model_dir)) == 0
+
+
+def format_model_download_troubleshooting_hint(
+    model_size: str, cache_dir: str | Path | None = None
+) -> str:
+    """Return actionable troubleshooting guidance for Hugging Face download/cache failures."""
+    cache_hint = (
+        f"快取目錄 ({cache_dir})"
+        if cache_dir
+        else "Hugging Face 快取目錄 (%USERPROFILE%\\.cache\\huggingface\\hub)"
+    )
+    return (
+        f"💡 [排解建議] 若下載或載入 Whisper-{model_size} 卡住、逾時或快取損毀：\n"
+        f"   1. 請檢查網路連線，或手動刪除殘缺的 {cache_hint} 後重新啟動。\n"
+        "   2. 若遭遇 Hugging Face 匿名下載限流 (Rate Limit / 429)，請至 https://huggingface.co/settings/tokens 建立免費 Read 權限 Token，\n"
+        '      並於 PowerShell 設定 `$env:HF_TOKEN="hf_..."` 後再執行 `.\\start.bat`，或將 `HF_TOKEN` 加入 Windows 使用者環境變數。'
+    )
+
+
+def resolve_whisper_model_path(
+    model_size_or_path: str,
+    download_fn: Callable[..., str] | None = None,
+) -> str:
+    """Resolve and validate local Whisper model directory, re-downloading if cache is incomplete."""
+    if download_fn is None:
+        import faster_whisper.utils
+
+        download_fn = faster_whisper.utils.download_model
+
+    if os.path.isdir(model_size_or_path):
+        missing_local = find_missing_whisper_model_files(model_size_or_path)
+        if missing_local:
+            hint = format_model_download_troubleshooting_hint(
+                model_size_or_path, model_size_or_path
+            )
+            raise RuntimeError(
+                f"指定的本地 Whisper 模型目錄不完整（缺少或為空: {', '.join(missing_local)}）: "
+                f"{model_size_or_path}\n{hint}"
+            )
+        return model_size_or_path
+
+    cached_path: str | None = None
+    missing_cached: list[str] = []
+    try:
+        cached_path = download_fn(model_size_or_path, local_files_only=True)
+        missing_cached = find_missing_whisper_model_files(cached_path)
+        if not missing_cached:
+            return str(cached_path)
+        print(
+            f"⚠️ 本地 Whisper-{model_size_or_path} 快取不完整"
+            f"（缺少或損毀: {', '.join(missing_cached)}，路徑: {cached_path}），"
+            "正在自動重新補全下載..."
+        )
+    except Exception:
+        cached_path = None
+
+    progress_msg = (
+        f"本地快取不完整，正在補全下載 Whisper-{model_size_or_path} 模型..."
+        if missing_cached
+        else f"首次使用，正在下載 Whisper-{model_size_or_path} 模型..."
+    )
+    config.report_startup_progress(0.68, progress_msg, newline=True)
+
+    try:
+        downloaded_path = download_fn(
+            model_size_or_path, local_files_only=False
+        )
+    except Exception as exc:
+        hint = format_model_download_troubleshooting_hint(
+            model_size_or_path, cached_path
+        )
+        print(hint)
+        raise RuntimeError(
+            f"下載 Whisper-{model_size_or_path} 模型失敗: {exc}\n{hint}"
+        ) from exc
+
+    missing_after = find_missing_whisper_model_files(downloaded_path)
+    if missing_after:
+        hint = format_model_download_troubleshooting_hint(
+            model_size_or_path, downloaded_path
+        )
+        print(hint)
+        raise RuntimeError(
+            f"Whisper-{model_size_or_path} 模型下載後仍缺少必要檔案"
+            f" ({', '.join(missing_after)}): {downloaded_path}\n{hint}"
+        )
+
+    return str(downloaded_path)
+
+
+def build_asr_initial_prompt(
+    asr_ctx: dict[str, Any] | None, model_name: str | None = None
+) -> str:
+    """Build upcoming lyric initial_prompt, automatically disabled on distilled models."""
+    if not getattr(config, "ASR_INITIAL_PROMPT_ENABLED", True):
+        return ""
+    active_model = (
+        config.ASR_MODEL_SIZE if model_name is None else str(model_name)
+    )
+    if config.is_distilled_asr_model(active_model):
+        return ""
+    if not isinstance(asr_ctx, dict):
+        return ""
+    raw_prompt = str(asr_ctx.get("initial_prompt") or "").strip()
+    max_prompt_chars = int(
+        getattr(config, "ASR_INITIAL_PROMPT_MAX_CHARS", 120)
+    )
+    if raw_prompt and max_prompt_chars > 0:
+        return raw_prompt[:max_prompt_chars]
+    return ""
+
+
+def build_transcribe_kwargs(
+    asr_ctx: dict[str, Any] | None = None,
+    *,
+    device_mode: str = "",
+    model_name: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Construct faster-whisper transcribe kwargs and effective initial_prompt string."""
+    initial_prompt = build_asr_initial_prompt(asr_ctx, model_name=model_name)
+    beam_size = int(getattr(config, "ASR_BEAM_SIZE", 5))
+    best_of = int(getattr(config, "ASR_BEST_OF", 5))
+    if device_mode == "cpu":
+        beam_size = min(beam_size, 2)
+        best_of = min(best_of, 2)
+    condition_prev = bool(
+        getattr(config, "ASR_CONDITION_ON_PREVIOUS_TEXT", False)
+    )
+
+    transcribe_kwargs: dict[str, Any] = {
+        "language": config.ASR_LANGUAGE,
+        "vad_filter": False,
+        "beam_size": max(1, beam_size),
+        "best_of": max(1, best_of),
+        "condition_on_previous_text": condition_prev,
+    }
+    if initial_prompt:
+        transcribe_kwargs["initial_prompt"] = initial_prompt
+    return transcribe_kwargs, initial_prompt
+
+
 def _asr_worker_loop(
     on_recognized_text, init_done_event: threading.Event | None = None
 ):
@@ -494,6 +665,7 @@ def _asr_worker_loop(
         _asr_started = False
         return
 
+    model_path = config.ASR_MODEL_SIZE
     try:
         # 開啟 faster-whisper 的下載進度條
         import faster_whisper.utils
@@ -501,21 +673,10 @@ def _asr_worker_loop(
 
         faster_whisper.utils.disabled_tqdm = tqdm
 
-        model_path = config.ASR_MODEL_SIZE
-        if not os.path.isdir(model_path):
-            try:
-                model_path = faster_whisper.utils.download_model(
-                    config.ASR_MODEL_SIZE, local_files_only=True
-                )
-            except Exception:
-                config.report_startup_progress(
-                    0.68,
-                    f"首次使用，正在下載 Whisper-{config.ASR_MODEL_SIZE} 模型...",
-                    newline=True,
-                )
-                model_path = faster_whisper.utils.download_model(
-                    config.ASR_MODEL_SIZE, local_files_only=False
-                )
+        model_path = resolve_whisper_model_path(
+            config.ASR_MODEL_SIZE,
+            download_fn=faster_whisper.utils.download_model,
+        )
 
         with config.startup_progress_stage(
             0.70, 0.85, f"正在加載 Whisper-{config.ASR_MODEL_SIZE} 模型..."
@@ -576,13 +737,20 @@ def _asr_worker_loop(
                 )
                 print(f"✅ Whisper-{config.ASR_MODEL_SIZE} 已以 CPU 模式加載")
             except Exception as cpu_e:
+                cpu_err_text = str(cpu_e)
                 _asr_active_device = ""
                 _asr_fallback_cpu = False
-                _emit_asr_status(False, "", error=str(cpu_e), fallback=False)
+                _emit_asr_status(False, "", error=cpu_err_text, fallback=False)
                 config.report_startup_progress(
                     1.0, "CPU 模式也無法加載 Whisper 模型", newline=True
                 )
                 print(f"❌ CPU 模式也無法加載 Whisper 模型: {cpu_e}")
+                if "HF_TOKEN" not in cpu_err_text:
+                    print(
+                        format_model_download_troubleshooting_hint(
+                            config.ASR_MODEL_SIZE, model_path
+                        )
+                    )
                 if init_done_event is not None:
                     init_done_event.set()
                 _asr_started = False
@@ -595,6 +763,12 @@ def _asr_worker_loop(
                 1.0, "無法加載 Whisper 模型", newline=True
             )
             print(f"❌ 無法加載 Whisper 模型: {e}")
+            if "HF_TOKEN" not in error_text:
+                print(
+                    format_model_download_troubleshooting_hint(
+                        config.ASR_MODEL_SIZE, model_path
+                    )
+                )
             if init_done_event is not None:
                 init_done_event.set()
             _asr_started = False
@@ -713,33 +887,11 @@ def _asr_worker_loop(
 
         try:
             asr_ctx = _get_current_asr_context()
-            initial_prompt = ""
-            if getattr(config, "ASR_INITIAL_PROMPT_ENABLED", True):
-                raw_prompt = str(asr_ctx.get("initial_prompt") or "").strip()
-                max_prompt_chars = int(
-                    getattr(config, "ASR_INITIAL_PROMPT_MAX_CHARS", 120)
-                )
-                if raw_prompt and max_prompt_chars > 0:
-                    initial_prompt = raw_prompt[:max_prompt_chars]
-
-            beam_size = int(getattr(config, "ASR_BEAM_SIZE", 5))
-            best_of = int(getattr(config, "ASR_BEST_OF", 5))
-            if _asr_active_device == "cpu":
-                beam_size = min(beam_size, 2)
-                best_of = min(best_of, 2)
-            condition_prev = bool(
-                getattr(config, "ASR_CONDITION_ON_PREVIOUS_TEXT", False)
+            transcribe_kwargs, initial_prompt = build_transcribe_kwargs(
+                asr_ctx,
+                device_mode=_asr_active_device,
+                model_name=config.ASR_MODEL_SIZE,
             )
-
-            transcribe_kwargs: dict[str, Any] = {
-                "language": config.ASR_LANGUAGE,
-                "vad_filter": False,
-                "beam_size": max(1, beam_size),
-                "best_of": max(1, best_of),
-                "condition_on_previous_text": condition_prev,
-            }
-            if initial_prompt:
-                transcribe_kwargs["initial_prompt"] = initial_prompt
 
             t0 = time.perf_counter()
             segments, _ = model.transcribe(audio_data, **transcribe_kwargs)
@@ -799,7 +951,7 @@ def _asr_worker_loop(
                 segment_details,
                 lyrics_corpus=str(asr_ctx.get("lyrics_corpus") or ""),
                 min_avg_logprob=float(
-                    getattr(config, "ASR_MIN_AVG_LOGPROB", -0.80)
+                    getattr(config, "ASR_MIN_AVG_LOGPROB", -0.90)
                 ),
                 max_no_speech_prob=float(
                     getattr(config, "ASR_MAX_NO_SPEECH_PROB", 0.60)
