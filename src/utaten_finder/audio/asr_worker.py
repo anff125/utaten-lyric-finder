@@ -396,14 +396,20 @@ def _resolve_model_device(model_obj: Any, fallback: str = "cpu") -> str:
 
 
 def _emit_asr_status(
-    ready: bool, device_mode: str, error: str = "", fallback: bool = False
+    ready: bool,
+    device_mode: str,
+    error: str = "",
+    fallback: bool = False,
+    model_name: str | None = None,
 ) -> None:
     events.bus.emit(
         "asr_status",
         {
             "ready": ready,
             "device_mode": device_mode,
-            "model": config.ASR_MODEL_SIZE,
+            "model": config.ASR_MODEL_SIZE
+            if model_name is None
+            else str(model_name),
             "error": error,
             "fallback": bool(fallback),
         },
@@ -562,7 +568,6 @@ def resolve_whisper_model_path(
         hint = format_model_download_troubleshooting_hint(
             model_size_or_path, cached_path
         )
-        print(hint)
         raise RuntimeError(
             f"下載 Whisper-{model_size_or_path} 模型失敗: {exc}\n{hint}"
         ) from exc
@@ -572,7 +577,6 @@ def resolve_whisper_model_path(
         hint = format_model_download_troubleshooting_hint(
             model_size_or_path, downloaded_path
         )
-        print(hint)
         raise RuntimeError(
             f"Whisper-{model_size_or_path} 模型下載後仍缺少必要檔案"
             f" ({', '.join(missing_after)}): {downloaded_path}\n{hint}"
@@ -665,7 +669,9 @@ def _asr_worker_loop(
         _asr_started = False
         return
 
-    model_path = config.ASR_MODEL_SIZE
+    loaded_model_size = config.ASR_MODEL_SIZE
+    model_path: str | None = None
+    model_path_resolved = False
     try:
         # 開啟 faster-whisper 的下載進度條
         import faster_whisper.utils
@@ -674,12 +680,13 @@ def _asr_worker_loop(
         faster_whisper.utils.disabled_tqdm = tqdm
 
         model_path = resolve_whisper_model_path(
-            config.ASR_MODEL_SIZE,
+            loaded_model_size,
             download_fn=faster_whisper.utils.download_model,
         )
+        model_path_resolved = True
 
         with config.startup_progress_stage(
-            0.70, 0.85, f"正在加載 Whisper-{config.ASR_MODEL_SIZE} 模型..."
+            0.70, 0.85, f"正在加載 Whisper-{loaded_model_size} 模型..."
         ):
             model = WhisperModel(
                 model_size_or_path=model_path,
@@ -689,7 +696,7 @@ def _asr_worker_loop(
 
         # 暖身推理以確認 CUDA / cuBLAS 真正可用（若缺少 DLL 或 GPU 異常，在此立即攔截並 fallback）
         with config.startup_progress_stage(
-            0.86, 0.98, f"正在執行 Whisper-{config.ASR_MODEL_SIZE} 暖身推理..."
+            0.86, 0.98, f"正在執行 Whisper-{loaded_model_size} 暖身推理..."
         ):
             dummy_audio = np.zeros(16000, dtype=np.float32)
             warmup_segs, _ = model.transcribe(dummy_audio, language="ja")
@@ -697,20 +704,32 @@ def _asr_worker_loop(
 
         _asr_active_device = _resolve_model_device(model)
         _asr_fallback_cpu = False
-        _emit_asr_status(True, _asr_active_device, fallback=False)
-        config.report_startup_progress(
-            1.0, f"Whisper-{config.ASR_MODEL_SIZE} 模型已就緒！", newline=True
+        _emit_asr_status(
+            True,
+            _asr_active_device,
+            fallback=False,
+            model_name=loaded_model_size,
         )
-        print(f"✅ Whisper-{config.ASR_MODEL_SIZE} 模型已加載 ({_asr_active_device})")
+        config.report_startup_progress(
+            1.0, f"Whisper-{loaded_model_size} 模型已就緒！", newline=True
+        )
+        print(f"✅ Whisper-{loaded_model_size} 模型已加載 ({_asr_active_device})")
     except Exception as e:
         error_text = str(e)
-        # If CUDA runtime/DLL is not available, retry once on CPU to keep ASR usable.
+        resolved_cache_dir = (
+            model_path if (model_path and os.path.isdir(model_path)) else None
+        )
+        # If CUDA runtime/DLL is not available after resolving the model directory, retry once on CPU.
         if (
-            "cublas" in error_text.lower()
-            or "cudnn" in error_text.lower()
-            or "cannot be loaded" in error_text.lower()
-            or "loadlibrary" in error_text.lower()
-            or "cuda" in error_text.lower()
+            model_path_resolved
+            and model_path is not None
+            and (
+                "cublas" in error_text.lower()
+                or "cudnn" in error_text.lower()
+                or "cannot be loaded" in error_text.lower()
+                or "loadlibrary" in error_text.lower()
+                or "cuda" in error_text.lower()
+            )
         ):
             config.report_startup_progress(
                 0.88, "GPU 載入失敗，改用 CPU 模式重試...", newline=True
@@ -720,7 +739,7 @@ def _asr_worker_loop(
                 with config.startup_progress_stage(
                     0.88,
                     0.98,
-                    f"正在以 CPU 模式加載 Whisper-{config.ASR_MODEL_SIZE}...",
+                    f"正在以 CPU 模式加載 Whisper-{loaded_model_size}...",
                 ):
                     model = WhisperModel(
                         model_size_or_path=model_path,
@@ -729,18 +748,26 @@ def _asr_worker_loop(
                     )
                 _asr_active_device = "cpu"
                 _asr_fallback_cpu = True
-                _emit_asr_status(True, "cpu", fallback=True)
+                _emit_asr_status(
+                    True, "cpu", fallback=True, model_name=loaded_model_size
+                )
                 config.report_startup_progress(
                     1.0,
-                    f"Whisper-{config.ASR_MODEL_SIZE} (CPU 模式) 已就緒！",
+                    f"Whisper-{loaded_model_size} (CPU 模式) 已就緒！",
                     newline=True,
                 )
-                print(f"✅ Whisper-{config.ASR_MODEL_SIZE} 已以 CPU 模式加載")
+                print(f"✅ Whisper-{loaded_model_size} 已以 CPU 模式加載")
             except Exception as cpu_e:
                 cpu_err_text = str(cpu_e)
                 _asr_active_device = ""
                 _asr_fallback_cpu = False
-                _emit_asr_status(False, "", error=cpu_err_text, fallback=False)
+                _emit_asr_status(
+                    False,
+                    "",
+                    error=cpu_err_text,
+                    fallback=False,
+                    model_name=loaded_model_size,
+                )
                 config.report_startup_progress(
                     1.0, "CPU 模式也無法加載 Whisper 模型", newline=True
                 )
@@ -748,7 +775,7 @@ def _asr_worker_loop(
                 if "HF_TOKEN" not in cpu_err_text:
                     print(
                         format_model_download_troubleshooting_hint(
-                            config.ASR_MODEL_SIZE, model_path
+                            loaded_model_size, resolved_cache_dir
                         )
                     )
                 if init_done_event is not None:
@@ -758,7 +785,13 @@ def _asr_worker_loop(
         else:
             _asr_active_device = ""
             _asr_fallback_cpu = False
-            _emit_asr_status(False, "", error=error_text, fallback=False)
+            _emit_asr_status(
+                False,
+                "",
+                error=error_text,
+                fallback=False,
+                model_name=loaded_model_size,
+            )
             config.report_startup_progress(
                 1.0, "無法加載 Whisper 模型", newline=True
             )
@@ -766,7 +799,7 @@ def _asr_worker_loop(
             if "HF_TOKEN" not in error_text:
                 print(
                     format_model_download_troubleshooting_hint(
-                        config.ASR_MODEL_SIZE, model_path
+                        loaded_model_size, resolved_cache_dir
                     )
                 )
             if init_done_event is not None:
@@ -890,7 +923,7 @@ def _asr_worker_loop(
             transcribe_kwargs, initial_prompt = build_transcribe_kwargs(
                 asr_ctx,
                 device_mode=_asr_active_device,
-                model_name=config.ASR_MODEL_SIZE,
+                model_name=loaded_model_size,
             )
 
             t0 = time.perf_counter()
@@ -976,7 +1009,7 @@ def _asr_worker_loop(
                 "audio_rms": round(audio_rms, 4),
                 "audio_peak": round(audio_peak, 4),
                 "device_mode": _asr_active_device,
-                "model": config.ASR_MODEL_SIZE,
+                "model": loaded_model_size,
                 "segments": segment_details,
                 "avg_logprob_mean": round(sum(logprobs) / len(logprobs), 4)
                 if logprobs
@@ -1014,7 +1047,12 @@ def _asr_worker_loop(
                     )
                     _asr_active_device = "cpu"
                     _asr_fallback_cpu = True
-                    _emit_asr_status(True, "cpu", fallback=True)
+                    _emit_asr_status(
+                        True,
+                        "cpu",
+                        fallback=True,
+                        model_name=loaded_model_size,
+                    )
                     print("✅ 已切換為 CPU 模式運作")
                 except Exception as cpu_e:
                     print(f"❌ 切換 CPU 模式失敗: {cpu_e}")

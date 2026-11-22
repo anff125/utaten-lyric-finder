@@ -564,9 +564,13 @@ class TestDistilledInitialPromptAndCacheIntegrity(unittest.TestCase):
             (model_dir / "model.bin").write_bytes(b"FAKE_CT2_WEIGHTS")
             (model_dir / "config.json").write_text("{}", encoding="utf-8")
 
-            for model_id, expected_prompt in (
-                ("kotoba-tech/kotoba-whisper-v2.0-faster", ""),
-                ("turbo", "雲を抜け風下へ私だけ、だから僕は音楽を辞めた"),
+            for model_id, mutate_to, expected_prompt in (
+                ("kotoba-tech/kotoba-whisper-v2.0-faster", "turbo", ""),
+                (
+                    "turbo",
+                    "kotoba-tech/kotoba-whisper-v2.0-faster",
+                    "雲を抜け風下へ私だけ、だから僕は音楽を辞めた",
+                ),
             ):
                 config.ASR_MODEL_SIZE = model_id
                 transcribe_calls: list[dict] = []
@@ -575,6 +579,8 @@ class TestDistilledInitialPromptAndCacheIntegrity(unittest.TestCase):
                 class _FakeWhisperModel:
                     def __init__(self, *args, **kwargs) -> None:
                         self.model = type("Inner", (), {"device": "cuda"})()
+                        # Simulate user changing config.ASR_MODEL_SIZE in settings drawer while running
+                        config.ASR_MODEL_SIZE = mutate_to
 
                     def transcribe(self, audio, **kwargs):
                         transcribe_calls.append(dict(kwargs))
@@ -733,6 +739,22 @@ class TestDistilledInitialPromptAndCacheIntegrity(unittest.TestCase):
                 )
             self.assertIn("model.bin", str(ctx_still_incomplete.exception))
             self.assertIn("HF_TOKEN", str(ctx_still_incomplete.exception))
+
+            # 5. Direct local directory path: complete_dir returns directly without calling download_fn;
+            #    incomplete_dir raises RuntimeError with missing file and HF_TOKEN hint.
+            self.assertEqual(
+                asr_worker.resolve_whisper_model_path(
+                    str(complete_dir),
+                    download_fn=lambda *_a, **_kw: (_ for _ in ()).throw(
+                        AssertionError("download_fn must not be called")
+                    ),
+                ),
+                str(complete_dir),
+            )
+            with self.assertRaises(RuntimeError) as ctx_local_incomplete:
+                asr_worker.resolve_whisper_model_path(str(incomplete_dir))
+            self.assertIn("model.bin", str(ctx_local_incomplete.exception))
+            self.assertIn("HF_TOKEN", str(ctx_local_incomplete.exception))
 
 
 if __name__ == "__main__":
